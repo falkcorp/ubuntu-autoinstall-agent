@@ -1,242 +1,223 @@
 <!-- file: DEPLOYMENT_GUIDE.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 2.0.0 -->
 <!-- guid: g8h9i0j1-k2l3-4567-8901-234567ghijkl -->
 
 # Ubuntu AutoInstall Agent - Deployment Guide
 
-This guide explains how to use the Ubuntu AutoInstall Agent for automated Ubuntu server deployment with golden images and LUKS encryption.
+Automated bare-metal Ubuntu 26.04 provisioning via iPXE netboot with cloud-init.  
+Supports AMD64 and ARM64, single disk and RAID1, with a registry-based approval flow and TPM identity binding.
 
-## Overview
+---
 
-The Ubuntu AutoInstall Agent provides:
+## Architecture Overview
 
-- **Golden Image Creation**: Creates custom Ubuntu images with pre-installed packages
-- **LUKS Encryption**: Full disk encryption for security
-- **SSH Deployment**: Remote deployment to target machines
-- **Zero Manual Intervention**: Fully automated installation process
+```
+Machine powers on
+  └─ iPXE (TFTP from provisioning server)
+       └─ boot.ipxe → dispatches by MAC address
+            └─ mac-<hexmac>.ipxe  (per-machine: hostname + menu default)
+                 └─ menu.ipxe     (3-item arch-aware menu)
+                      └─ autoinstall (amd64 or arm64)
+                           └─ cloud-init /cloud-init/<hexmac>/user-data
+                                └─ installs Ubuntu 26.04
+                                     └─ chroot setup (users, rsyslog, CockroachDB)
+                                          └─ POST /api/flip/<hostname> → boot-local-disk
+```
+
+---
 
 ## Prerequisites
 
-Run the system check first:
+- Provisioning server running Ubuntu with:
+  - `dnsmasq` (proxy DHCP + TFTP)
+  - `nginx` (HTTP for ISO + cloud-init)
+  - `python3` (autoinstall-agent)
+  - `cockroach` v25.3.0 binary (for cert generation)
+- Ubuntu 26.04 ISO(s) extracted to web root
+- CockroachDB CA key available on provisioning server
+
+---
+
+## Initial Setup (One-Time)
+
+### 1. Run the setup script
+```bash
+sudo bash /var/www/html/cloud-init/scripts/setup-autoinstall-agent.sh
+```
+
+This creates:
+- `cockroach-autoinstall` system user
+- `/var/lib/cockroach-autoinstall/` — agent + CA certs
+- `/var/log/cockroach-autoinstall/` — events, registry, uploaded logs
+- `/etc/systemd/system/autoinstall-agent.service` — runs on port 25000
+- `/etc/sudoers.d/autoinstall-agent` — passwordless service management
+
+### 2. Verify
+```bash
+systemctl status autoinstall-agent
+curl http://localhost:25000/api/registry
+```
+
+---
+
+## Registering a New Server
+
+### Single-disk server (Lenovo, NUC, etc.)
+```bash
+bash /var/www/html/cloud-init/scripts/register-len-server.sh <hostname> <mac> <ip>
+# Example:
+bash /var/www/html/cloud-init/scripts/register-len-server.sh my-server-004 aa:bb:cc:dd:ee:ff 192.168.1.10
+```
+
+### Dual-disk server with RAID1 (Supermicro, etc.)
+```bash
+bash /var/www/html/cloud-init/scripts/register-len-server.sh <hostname> <mac> <ip> amd64 raid1
+# Example:
+bash /var/www/html/cloud-init/scripts/register-len-server.sh my-supermicro-001 aa:bb:cc:dd:ee:ff 192.168.1.11 amd64 raid1
+```
+
+### ARM64 server
+```bash
+bash /var/www/html/cloud-init/scripts/register-len-server.sh <hostname> <mac> <ip> arm64
+```
+
+The script generates:
+- `/var/www/html/cloud-init/<hostname>/user-data` — autoinstall config
+- `/var/www/html/cloud-init/<hostname>/meta-data`
+- `/var/www/html/cloud-init/scripts/<hostname>-chroot-setup.sh` — post-install config
+- `/var/www/html/ipxe/boot/mac-<hexmac>.ipxe` — per-machine iPXE file
+- Registers MAC in agent registry as `pending`
+
+### Approve the machine
+```bash
+curl http://provisioning-server:25000/api/approve/<mac>
+```
+
+### Power on and monitor
+```bash
+curl http://provisioning-server:25000/api/events
+# Install takes ~5-10 min, then machine reboots into installed OS
+# SSH in during the 15-min sleep window: ssh jdfalk@<ip>
+```
+
+---
+
+## Storage Options
+
+| Option | Description | Use When |
+|--------|-------------|----------|
+| `direct` (default) | Single disk, Ubuntu direct layout | Single NVMe/SSD |
+| `raid1` | mdadm RAID1 across 2 largest disks, separate EFI/boot/root | Dual-disk servers |
+
+The `raid1` layout:
+- Finds the two largest disks automatically via `match: {size: largest}`
+- EFI partition on disk0 (GRUB also installs to disk1 via late-commands)
+- `/boot` and `/` each on separate RAID1 md devices
+- `mdadm` package included automatically
+
+---
+
+## autoinstall-agent API
+
+Running on port 25000 of the provisioning server.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/registry` | GET | All registered machines + status |
+| `/api/events` | GET | Last 50 webhook events |
+| `/api/approve/<mac>` | GET | Approve a pending machine |
+| `/api/flip/<hostname>?target=<boot>` | GET | Flip iPXE default (approved only for reinstall) |
+| `/api/certs/<hostname>?ip=<ip>` | GET | Generate CockroachDB node cert (approved only) |
+| `/api/register` | POST | Register new machine (called by register script) |
+| `/api/checkin` | POST | Machine identity check — binds MAC + TPM EK hash |
+| `/api/webhook` | POST | Install status updates + log file upload |
+| `/api/finalreport` | POST | Final hardware report |
+
+### Security model
+- **Pre-registration required** — unknown MACs get 403
+- **Manual approval** — new machines start as `pending`
+- **TPM EK binding** — first boot sends TPM EK hash; future boots with mismatched TPM are rejected
+- **Reinstall gated** — flipping to `custom-autoinstall` requires `approved` status
+- **Success auto-flip** — install success triggers automatic flip to `boot-local-disk`
+
+---
+
+## iPXE Menu
+
+Three items, auto-detects AMD64 vs ARM64:
+
+| Key | Item | Notes |
+|-----|------|-------|
+| `i` | Install Ubuntu 26.04 | Routes to amd64 or arm64 path |
+| `d` | Boot local disk | Default for installed servers |
+| `l` | Live / diagnostics | Ubuntu live env |
+
+Per-MAC files control `menu-default`:
+- `boot-local-disk` — normal boot (set automatically on install success)  
+- `custom-autoinstall` — trigger reinstall
+
+> **Important:** Never edit the global `isset ${menu-default} ||` fallback in `menu.ipxe`.  
+> Only edit per-machine MAC files in `ipxe/boot/`.
+
+---
+
+## What Gets Installed
+
+Every server gets:
+- Ubuntu 26.04 LTS
+- `jdfalk` as UID 1000 (primary user, zsh, NOPASSWD sudo, SSH keys)
+- rsyslog with RELP forwarding to provisioning server port 2514
+- CockroachDB (arch-aware: amd64 or arm64 binary auto-selected)
+- Timezone: America/New_York
+- Standard package set: git, zsh, tmux, htop, jq, ethtool, prometheus-node-exporter, tpm2-tools, etc.
+- TPM checkin on first boot (binds MAC + TPM EK to registry)
+
+---
+
+## Reinstalling a Server
 
 ```bash
-sudo ./ubuntu-autoinstall-agent check-prereqs
+# Flip iPXE to reinstall mode
+curl "http://provisioning-server:25000/api/flip/<hostname>?target=custom-autoinstall"
+
+# Reboot the server (SSH in and reboot, or physically)
+ssh jdfalk@<ip> "sudo reboot"
 ```
 
-### Required System Tools
-
-On Ubuntu/Debian:
-```bash
-sudo apt update
-sudo apt install qemu-kvm qemu-utils libguestfs-tools genisoimage cryptsetup
-```
-
-On Red Hat/CentOS/Fedora:
-```bash
-sudo dnf install qemu-kvm qemu-img guestfs-tools genisoimage cryptsetup
-```
-
-### System Requirements
-
-- **Memory**: 4GB+ RAM recommended for image building
-- **Storage**: 20GB+ free space for temporary files
-- **KVM**: Hardware virtualization support (optional but recommended)
-- **Root Access**: Required for disk operations and LUKS setup
-
-## Basic Workflow
-
-### 1. Create a Golden Image
-
-```bash
-# Create basic Ubuntu 26.04 image
-sudo ./ubuntu-autoinstall-agent create-image
-
-# Create custom image with specification
-sudo ./ubuntu-autoinstall-agent create-image \
-  --spec examples/specs/ubuntu-26.04-secure.yaml \
-  --output /var/lib/ubuntu-autoinstall/images/secure-web-server.qcow2
-```
-
-### 2. Prepare Target Machine
-
-Boot the target machine into a rescue environment (Ubuntu Live CD, rescue mode, etc.) with SSH access.
-
-### 3. Configure Target
-
-Create or customize a target configuration:
-
-```yaml
-# target-config.yaml
-hostname: web-server-001
-architecture: amd64
-disk_device: /dev/sda
-timezone: UTC
-
-network:
-  interface: eth0
-  dhcp: true
-  dns_servers: [1.1.1.1, 1.0.0.1]
-
-users:
-  - name: admin
-    sudo: true
-    ssh_keys:
-      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIYour_SSH_Key_Here"
-
-luks_config:
-  passphrase: "${LUKS_PASSPHRASE}"
-  cipher: aes-xts-plain64
-  key_size: 512
-  hash: sha256
-
-packages:
-  - openssh-server
-  - curl
-  - htop
-```
-
-### 4. Deploy to Target
-
-```bash
-# Set LUKS passphrase
-export LUKS_PASSPHRASE="your-strong-passphrase"
-
-# Deploy via SSH
-sudo ./ubuntu-autoinstall-agent deploy \
-  --target 192.168.1.100 \
-  --config target-config.yaml \
-  --via-ssh
-```
-
-## Configuration Files
-
-### Image Specifications
-
-Define what goes into your golden images:
-
-```yaml
-# examples/specs/ubuntu-26.04-minimal.yaml
-ubuntu_version: "26.04"
-architecture: amd64
-
-base_packages:
-  - openssh-server
-  - curl
-  - wget
-  - htop
-
-vm_config:
-  memory_mb: 2048
-  disk_size_gb: 20
-  cpu_cores: 2
-```
-
-### Target Configurations
-
-Define how images are deployed:
-
-```yaml
-# examples/configs/production-server.yaml
-hostname: prod-web-001
-architecture: amd64
-disk_device: /dev/nvme0n1
-timezone: America/New_York
-
-network:
-  interface: ens18
-  dhcp: false
-  ip_address: 192.168.1.100/24
-  gateway: 192.168.1.1
-  dns_servers: [1.1.1.1, 1.0.0.1]
-
-users:
-  - name: admin
-    sudo: true
-    ssh_keys:
-      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIYour_Key_Here"
-
-luks_config:
-  passphrase: "${LUKS_PASSPHRASE}"
-  cipher: aes-xts-plain64
-  key_size: 512
-  hash: sha256
-
-packages:
-  - nginx
-  - certbot
-  - fail2ban
-```
-
-## Security Considerations
-
-1. **Environment Variables**: Use environment variables for sensitive data like LUKS passphrases
-2. **SSH Keys**: Always use SSH key authentication
-3. **Network Security**: Ensure secure network communication
-4. **LUKS Passphrases**: Use strong, randomly generated passphrases
+---
 
 ## Troubleshooting
 
-### Common Issues
+### Machine boots local disk instead of netbooting
+BIOS boot order has local disk first. Press **F12** at POST for one-time network boot, or go into BIOS and move network above the local disk.
 
-1. **Missing Dependencies**: Run `check-prereqs` command
-2. **KVM Unavailable**: Ensure virtualization is enabled in BIOS
-3. **SSH Connection Fails**: Verify target is in rescue mode with SSH enabled
-4. **Insufficient Resources**: Ensure adequate memory and disk space
-
-### Logs
-
-- Image creation logs: `/var/log/ubuntu-autoinstall/`
-- System logs: Check `journalctl` and `/var/log/syslog`
-
-### Validation
-
+### "malformed autoinstall" error on screen
+YAML syntax error in `user-data`. Validate:
 ```bash
-# Validate an image
-./ubuntu-autoinstall-agent validate --image /path/to/image.qcow2
-
-# List available images
-./ubuntu-autoinstall-agent list-images
-
-# Test deployment (dry run)
-./ubuntu-autoinstall-agent deploy --target 192.168.1.100 --config config.yaml --via-ssh --dry-run
+python3 -c "import yaml; yaml.safe_load(open('user-data').read().replace('#cloud-config','',1))"
 ```
+Common cause: unquoted `: ` (colon-space) inside a YAML scalar. Always use single-quoted `bash -c '...'` for commands containing colons.
 
-## Production Deployment
+### early-commands fail immediately
+`chpasswd` uses `ubuntu-server:ubuntu` — `jdfalk` doesn't exist yet during early-commands (created by autoinstall identity section during install).
 
-1. **Image Repository**: Set up centralized image storage
-2. **Automation**: Integrate with CI/CD pipelines
-3. **Monitoring**: Monitor deployment success/failure
-4. **Backup**: Maintain backup images and configurations
-5. **Testing**: Test deployments in staging environments
+### CockroachDB won't join cluster
+- Join addresses must use **RPC port** (e.g. 36357), not SQL port (36257)
+- `--listen-addr` must match `--advertise-addr` port
+- Wipe stale store data: `sudo rm -rf /var/lib/cockroach/data/* && sudo systemctl restart cockroach`
+- Verify cert SANs include node IP: `openssl x509 -in /var/lib/cockroach/certs/node.crt -noout -text | grep -A2 "Subject Alt"`
 
-## Advanced Usage
-
-### Custom Scripts
-
-Add custom scripts to image specifications:
-
-```yaml
-custom_scripts:
-  - /path/to/setup-monitoring.sh
-  - /path/to/security-hardening.sh
-```
-
-### ARM64 Support
-
-Create ARM64 images:
-
+### Logs from a failed install
 ```bash
-./ubuntu-autoinstall-agent create-image --arch arm64
+ls /var/log/cockroach-autoinstall/files/   # uploaded by error-commands
+curl http://provisioning-server:25000/api/events  # webhook events
 ```
 
-### Cleanup Old Images
+---
 
-```bash
-# Remove images older than 30 days
-./ubuntu-autoinstall-agent cleanup --older-than-days 30
+## ARM64 Support
 
-# Dry run to see what would be deleted
-./ubuntu-autoinstall-agent cleanup --older-than-days 30 --dry-run
-```
+Ubuntu 26.04 arm64 ISO is pre-extracted at `/var/www/html/ubuntu-arm64/`.  
+`setup_cockroachdb.sh` auto-detects `uname -m` and downloads the correct binary.  
+Register with `arm64` as the 4th argument to `register-len-server.sh`.
 
-This system provides a complete solution for automated Ubuntu server deployment with security and reproducibility.
