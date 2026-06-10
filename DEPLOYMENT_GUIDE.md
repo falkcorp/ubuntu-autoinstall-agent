@@ -221,3 +221,151 @@ Ubuntu 26.04 arm64 ISO is pre-extracted at `/var/www/html/ubuntu-arm64/`.
 `setup_cockroachdb.sh` auto-detects `uname -m` and downloads the correct binary.  
 Register with `arm64` as the 4th argument to `register-len-server.sh`.
 
+---
+
+## Tang Servers (RPI fleet)
+
+Raspberry Pis serve as **tang key servers** — they hold the cryptographic keys that
+allow `clevis` on the main servers to automatically unlock LUKS disk encryption.
+
+### Architecture
+
+```
+Main servers (len-serv-*)
+  └─ LUKS disk encryption
+       └─ clevis SSS unlock (t=2 of 3 tang servers must be reachable)
+            ├─ tang @ rpi-serv-001
+            ├─ tang @ rpi-serv-002
+            └─ tang @ rpi-serv-003
+
+Tang servers (rpi-serv-*)
+  └─ Run tangd (socket-activated HTTP key server)
+  └─ Their own LUKS also locked by 2-of-3 other tang servers (mutual SSS)
+  └─ Tang keys backed up encrypted to registered YubiKeys → Google Drive
+```
+
+**Key property**: No single server can be compromised to unlock everything.
+Two tang servers must cooperate for any disk to unlock. Even with physical access
+to one tang server, the LUKS keys remain protected.
+
+### Registering a New RPI Tang Server
+
+```bash
+# On provisioning server:
+bash /var/www/html/cloud-init/scripts/register-rpi-tang.sh \
+    rpi-serv-001 dc:a6:32:aa:bb:cc 192.168.X.Y
+
+# Approve the registration:
+curl http://provisioning-server:25000/api/approve/dc:a6:32:aa:bb:cc
+
+# PXE boot the RPI — it installs Ubuntu 26.04 ARM64 with tang service
+```
+
+### Post-Install Setup
+
+After all tang servers are installed and `curl http://<rpi-ip>/adv` returns JSON:
+
+```bash
+# 1. Bind LUKS on all tang servers to each other (run once):
+bash /var/www/html/cloud-init/scripts/tang-bind.sh
+
+# 2. Set up Google Drive backup (run on each tang server):
+ssh jdfalk@rpi-serv-001 'bash /usr/local/bin/setup-gdrive.sh'
+
+# 3. Register your YubiKeys (run on admin machine with YubiKey plugged in):
+bash /var/www/html/cloud-init/scripts/register-yubikey.sh "My YubiKey 5 NFC"
+curl http://provisioning-server:25000/api/yubikeys/approve/<fingerprint>
+```
+
+### Cold-Start Recovery
+
+If **all** tang servers are simultaneously powered off:
+
+1. Tang servers cannot auto-unlock via clevis (no peers available)
+2. Run the recovery script from the provisioning server:
+
+```bash
+bash /var/www/html/cloud-init/scripts/tang-cold-start.sh
+```
+
+This downloads + decrypts the tang key backup from Google Drive (YubiKey required),
+starts a temporary tang instance locally, and guides manual unlock of the first 2
+servers. Once 2 are up, the third auto-unlocks via clevis SSS.
+
+### Tang Key Backup
+
+Tang keys are backed up daily at 3 AM via `/etc/cron.d/tang-backup` on each RPI.
+
+- **Encrypted to** all approved YubiKey GPG keys (only your physical keys can decrypt)
+- **Stored in** Google Drive at `gdrive:tang-backups/<hostname>/`
+- **30 backups retained** per server, older ones pruned automatically
+- **Fallback**: If no YubiKeys registered, symmetric GPG passphrase via `/etc/tang/backup-passphrase`
+
+Manual backup:
+
+```bash
+ssh jdfalk@rpi-serv-001 /usr/local/bin/tang-backup.sh
+```
+
+Restore from backup:
+
+```bash
+# From admin machine with YubiKey plugged in:
+bash /var/www/html/cloud-init/scripts/tang-restore.sh rpi-serv-001
+```
+
+---
+
+## YubiKey Management
+
+All YubiKey public keys are centrally managed via the autoinstall-agent.
+Approved keys are used for:
+- **Tang backup encryption** — backups are GPG-encrypted to all approved keys
+- **SSH access** — distributed via `/api/yubikeys/ssh-keys` endpoint
+
+### API Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/yubikeys` | GET | List all registered keys (status, fingerprint, comment) |
+| `/api/yubikeys/register` | POST | Register a YubiKey GPG + SSH public key |
+| `/api/yubikeys/approve/<fingerprint>` | GET | Approve a pending key |
+| `/api/yubikeys/revoke/<fingerprint>` | GET | Revoke an approved key |
+| `/api/yubikeys/ssh-keys` | GET | Get all approved SSH public keys |
+| `/api/yubikeys/<fingerprint>/pubkey` | GET | Get GPG public key (armored) |
+
+### Registering a YubiKey
+
+```bash
+# On any machine with the YubiKey plugged in and gpg configured:
+bash /var/www/html/cloud-init/scripts/register-yubikey.sh "My YubiKey 5 NFC - Personal"
+
+# Admin approves:
+curl http://provisioning-server:25000/api/yubikeys/approve/<fingerprint>
+```
+
+Once approved, the next tang backup automatically encrypts to this key.
+
+### YubiKey Encryption Setup
+
+Your YubiKey needs a GPG key loaded for encryption. Setup (one-time):
+
+```bash
+# Generate or import a GPG key to YubiKey (requires ykman or gnupg):
+gpg --full-generate-key         # choose RSA 4096 or Ed25519
+gpg --edit-key <fingerprint>    # then: key 0 → keytocard → (slot 3 encrypt)
+
+# Verify:
+gpg --card-status
+```
+
+### Decrypting a Backup Manually
+
+With YubiKey plugged in:
+
+```bash
+# Download and decrypt:
+rclone copy gdrive:tang-backups/rpi-serv-001/ /tmp/tang-decrypt/
+gpg --decrypt /tmp/tang-decrypt/*.gpg | tar xzv -C /tmp/
+```
+
