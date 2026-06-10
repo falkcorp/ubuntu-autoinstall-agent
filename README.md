@@ -36,7 +36,7 @@ sudo mv ubuntu-autoinstall-agent /usr/local/bin/
 
 1. **Create a golden image**:
    ```bash
-   ubuntu-autoinstall-agent create-image --arch amd64 --version 24.04
+   ubuntu-autoinstall-agent create-image --arch amd64 --version 26.04
    ```
 
 2. **Deploy to a server** (dry run first):
@@ -74,7 +74,7 @@ ubuntu-autoinstall-agent create-image [OPTIONS]
 
 Options:
   -a, --arch <ARCH>        Architecture [default: amd64] [possible values: amd64, arm64]
-  -v, --version <VERSION>  Ubuntu version [default: 24.04]
+  -v, --version <VERSION>  Ubuntu version [default: 26.04]
   -o, --output <OUTPUT>    Output image path
   -s, --spec <SPEC>        Image specification file
 ```
@@ -165,8 +165,8 @@ packages:
 Define how your golden images should be built:
 
 ```yaml
-# examples/specs/ubuntu-24.04-minimal.yaml
-ubuntu_version: "24.04"
+# examples/specs/ubuntu-26.04-minimal.yaml
+ubuntu_version: "26.04"
 architecture: amd64
 
 base_packages:

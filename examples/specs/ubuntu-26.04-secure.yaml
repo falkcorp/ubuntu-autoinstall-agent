@@ -1,0 +1,26 @@
+# file: examples/specs/ubuntu-26.04-secure.yaml
+# version: 1.0.0
+# guid: 0d60306e-fa7f-43de-9d4a-298b2fb6d21f
+
+# Secure Ubuntu 26.04 image specification
+ubuntu_version: "26.04"
+architecture: amd64
+
+base_packages:
+  - openssh-server
+  - curl
+  - wget
+  - htop
+  - vim
+  - ufw
+  - fail2ban
+  - unattended-upgrades
+  - cryptsetup
+  - lvm2
+
+custom_scripts: []
+
+vm_config:
+  memory_mb: 4096
+  disk_size_gb: 25
+  cpu_cores: 2

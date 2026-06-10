@@ -1,0 +1,35 @@
+# file: examples/specs/ubuntu-26.04-full.yaml
+# version: 1.0.0
+# guid: 9e57cf4e-c8ac-4479-a0e6-3192f9a3f711
+
+# Full-featured Ubuntu 26.04 image specification
+ubuntu_version: "26.04"
+architecture: amd64
+
+base_packages:
+  - openssh-server
+  - curl
+  - wget
+  - htop
+  - vim
+  - git
+  - build-essential
+  - python3
+  - python3-pip
+  - nodejs
+  - npm
+  - docker.io
+  - docker-compose
+  - nginx
+  - ufw
+  - fail2ban
+
+vm_config:
+  memory_mb: 4096
+  disk_size_gb: 50
+  cpu_cores: 4
+
+custom_scripts:
+  - scripts/security-hardening.sh
+  - scripts/performance-tuning.sh
+  - scripts/docker-setup.sh

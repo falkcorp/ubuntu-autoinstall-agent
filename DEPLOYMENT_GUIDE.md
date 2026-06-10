@@ -48,12 +48,12 @@ sudo dnf install qemu-kvm qemu-img guestfs-tools genisoimage cryptsetup
 ### 1. Create a Golden Image
 
 ```bash
-# Create basic Ubuntu 24.04 image
+# Create basic Ubuntu 26.04 image
 sudo ./ubuntu-autoinstall-agent create-image
 
 # Create custom image with specification
 sudo ./ubuntu-autoinstall-agent create-image \
-  --spec examples/specs/ubuntu-24.04-secure.yaml \
+  --spec examples/specs/ubuntu-26.04-secure.yaml \
   --output /var/lib/ubuntu-autoinstall/images/secure-web-server.qcow2
 ```
 
@@ -115,8 +115,8 @@ sudo ./ubuntu-autoinstall-agent deploy \
 Define what goes into your golden images:
 
 ```yaml
-# examples/specs/ubuntu-24.04-minimal.yaml
-ubuntu_version: "24.04"
+# examples/specs/ubuntu-26.04-minimal.yaml
+ubuntu_version: "26.04"
 architecture: amd64
 
 base_packages:

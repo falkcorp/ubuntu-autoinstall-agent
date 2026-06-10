@@ -29,7 +29,7 @@ pub enum Commands {
         #[arg(short, long, value_enum, default_value = "amd64")]
         arch: ArchArg,
 
-        #[arg(long, default_value = "24.04")]
+        #[arg(long, default_value = "26.04")]
         version: String,
 
         #[arg(short, long)]
@@ -220,7 +220,7 @@ mod tests {
                 cache_dir,
             } => {
                 assert!(matches!(arch, ArchArg::Amd64));
-                assert_eq!(version, "24.04");
+                assert_eq!(version, "26.04");
                 assert!(output.is_none());
                 assert!(spec.is_none());
                 assert!(cache_dir.is_none());

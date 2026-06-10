@@ -1,0 +1,22 @@
+# file: examples/specs/ubuntu-26.04-minimal.yaml
+# version: 1.0.0
+# guid: 1e7c4870-95be-4bc3-a204-94a955a46d8c
+
+# Minimal Ubuntu 26.04 image specification
+ubuntu_version: "26.04"
+architecture: amd64
+
+base_packages:
+  - openssh-server
+  - curl
+  - wget
+  - htop
+  - vim
+  - git
+
+vm_config:
+  memory_mb: 2048
+  disk_size_gb: 20
+  cpu_cores: 2
+
+custom_scripts: []

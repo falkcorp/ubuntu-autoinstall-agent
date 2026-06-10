@@ -81,30 +81,15 @@ impl IsoManager {
     /// Get Ubuntu Server ISO download URL
     fn get_ubuntu_server_iso_url(&self, spec: &ImageSpec) -> Result<String> {
         // Ubuntu Server ISO URLs follow this pattern:
-        // https://releases.ubuntu.com/{codename}/ubuntu-{version}-live-server-{arch}.iso
+        // https://releases.ubuntu.com/{version}/ubuntu-{version}-live-server-{arch}.iso
         let arch_suffix = match spec.architecture {
             Architecture::Amd64 => "amd64",
             Architecture::Arm64 => "arm64",
         };
 
-        // Convert version to codename for releases URL
-        let codename = match spec.ubuntu_version.as_str() {
-            "25.04" => "plucky",
-            "24.10" => "oracular",
-            "24.04" => "noble",
-            "23.10" => "mantic",
-            "23.04" => "lunar",
-            _ => {
-                return Err(crate::error::AutoInstallError::ConfigError(format!(
-                    "Unsupported Ubuntu version: {}",
-                    spec.ubuntu_version
-                )));
-            }
-        };
-
         Ok(format!(
             "https://releases.ubuntu.com/{}/ubuntu-{}-live-server-{}.iso",
-            codename, spec.ubuntu_version, arch_suffix
+            spec.ubuntu_version, spec.ubuntu_version, arch_suffix
         ))
     }
 
@@ -237,9 +222,9 @@ mod tests {
         let url = result.unwrap();
         assert_eq!(
             url,
-            "https://releases.ubuntu.com/noble/ubuntu-24.04-live-server-amd64.iso"
+            "https://releases.ubuntu.com/24.04/ubuntu-24.04-live-server-amd64.iso"
         );
-        assert!(url.contains("noble"));
+        assert!(url.contains("/24.04/"));
         assert!(url.contains("amd64"));
         assert!(url.contains("24.04"));
     }
@@ -269,9 +254,9 @@ mod tests {
         let url = result.unwrap();
         assert_eq!(
             url,
-            "https://releases.ubuntu.com/oracular/ubuntu-24.10-live-server-arm64.iso"
+            "https://releases.ubuntu.com/24.10/ubuntu-24.10-live-server-arm64.iso"
         );
-        assert!(url.contains("oracular"));
+        assert!(url.contains("/24.10/"));
         assert!(url.contains("arm64"));
         assert!(url.contains("24.10"));
     }
@@ -282,15 +267,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let iso_manager = IsoManager::new(temp_dir.path().to_path_buf());
 
-        let test_cases = vec![
-            ("25.04", "plucky"),
-            ("24.10", "oracular"),
-            ("24.04", "noble"),
-            ("23.10", "mantic"),
-            ("23.04", "lunar"),
-        ];
+        let test_cases = vec!["26.04", "25.04", "24.10", "24.04", "23.10", "23.04"];
 
-        for (version, expected_codename) in test_cases {
+        for version in test_cases {
             // Arrange
             let spec = ImageSpec {
                 ubuntu_version: version.to_string(),
@@ -311,44 +290,13 @@ mod tests {
             assert!(result.is_ok(), "Failed for version {}", version);
             let url = result.unwrap();
             assert!(
-                url.contains(expected_codename),
-                "URL {} should contain codename {} for version {}",
+                url.contains(&format!("/{}/", version)),
+                "URL {} should contain version path segment for {}",
                 url,
-                expected_codename,
                 version
             );
             assert!(url.contains(version));
             assert!(url.starts_with("https://releases.ubuntu.com/"));
-        }
-    }
-
-    #[test]
-    fn test_get_ubuntu_server_iso_url_unsupported_version() {
-        // Arrange
-        let temp_dir = TempDir::new().unwrap();
-        let iso_manager = IsoManager::new(temp_dir.path().to_path_buf());
-        let spec = ImageSpec {
-            ubuntu_version: "99.99".to_string(),
-            architecture: Architecture::Amd64,
-            base_packages: vec![],
-            vm_config: crate::config::VmConfig {
-                memory_mb: 2048,
-                disk_size_gb: 20,
-                cpu_cores: 2,
-            },
-            custom_scripts: vec![],
-        };
-
-        // Act
-        let result = iso_manager.get_ubuntu_server_iso_url(&spec);
-
-        // Assert
-        assert!(result.is_err());
-        match result {
-            Err(crate::error::AutoInstallError::ConfigError(msg)) => {
-                assert!(msg.contains("Unsupported Ubuntu version: 99.99"));
-            }
-            _ => panic!("Expected ConfigError for unsupported version"),
         }
     }
 
