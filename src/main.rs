@@ -1,6 +1,7 @@
 // file: src/main.rs
-// version: 1.2.0
+// version: 2.0.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
+// last-edited: 2026-06-20
 
 //! Ubuntu AutoInstall Agent - Main entry point
 
@@ -59,10 +60,33 @@ async fn main() -> Result<()> {
                 older_than_days,
                 dry_run,
             } => cleanup_command(older_than_days, dry_run).await,
+            ubuntu_autoinstall_agent::cli::args::Commands::Install {
+                remote,
+                username,
+                config,
+                investigate_only,
+                dry_run,
+                hold_on_failure,
+                pause_after_storage,
+                force,
+            } => {
+                install_command(
+                    remote,
+                    username,
+                    config,
+                    investigate_only,
+                    dry_run,
+                    hold_on_failure,
+                    pause_after_storage,
+                    force,
+                )
+                .await
+            }
             ubuntu_autoinstall_agent::cli::args::Commands::SshInstall {
                 host,
                 hostname,
                 username,
+                config,
                 investigate_only,
                 dry_run,
                 hold_on_failure,
@@ -72,6 +96,7 @@ async fn main() -> Result<()> {
                     &host,
                     hostname,
                     username,
+                    config,
                     investigate_only,
                     dry_run,
                     hold_on_failure,

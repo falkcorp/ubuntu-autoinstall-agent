@@ -8,11 +8,11 @@ use super::config::SystemInfo;
 use crate::Result;
 use tracing::{info, warn};
 
-pub struct SystemInvestigator<'a, T> {
+pub struct SystemInvestigator<'a, T: ?Sized> {
     executor: &'a mut T,
 }
 
-impl<'a, T> SystemInvestigator<'a, T>
+impl<'a, T: ?Sized> SystemInvestigator<'a, T>
 where
     T: crate::network::CommandExecutor,
 {

@@ -1,23 +1,23 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 1.4.1
+// version: 2.0.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
 
 //! ZFS operations for SSH installation
 
 use super::config::InstallationConfig;
-use crate::network::SshClient;
+use crate::network::CommandExecutor;
 use crate::Result;
 use std::collections::HashMap;
 use tracing::{error, info};
 
 pub struct ZfsManager<'a> {
-    ssh: &'a mut SshClient,
+    runner: &'a mut dyn CommandExecutor,
     variables: &'a mut HashMap<String, String>,
 }
 
 impl<'a> ZfsManager<'a> {
-    pub fn new(ssh: &'a mut SshClient, variables: &'a mut HashMap<String, String>) -> Self {
-        Self { ssh, variables }
+    pub fn new(runner: &'a mut dyn CommandExecutor, variables: &'a mut HashMap<String, String>) -> Self {
+        Self { runner, variables }
     }
 
     /// Create ZFS pools and datasets
@@ -34,7 +34,7 @@ impl<'a> ZfsManager<'a> {
 
         // Create bpool if not present
         if !self
-            .ssh
+            .runner
             .check_silent("zpool list -H bpool >/dev/null 2>&1")
             .await
             .unwrap_or(false)
@@ -46,7 +46,7 @@ impl<'a> ZfsManager<'a> {
 
         // Create rpool with encryption if not present
         if !self
-            .ssh
+            .runner
             .check_silent("zpool list -H rpool >/dev/null 2>&1")
             .await
             .unwrap_or(false)
@@ -58,7 +58,7 @@ impl<'a> ZfsManager<'a> {
 
         // Create bpool datasets if not present
         if !self
-            .ssh
+            .runner
             .check_silent("zfs list -H bpool/BOOT >/dev/null 2>&1")
             .await
             .unwrap_or(false)
@@ -70,7 +70,7 @@ impl<'a> ZfsManager<'a> {
 
         // Create rpool datasets if not present
         if !self
-            .ssh
+            .runner
             .check_silent(&format!(
                 "zfs list -H rpool/ROOT/ubuntu_{} >/dev/null 2>&1",
                 uuid
@@ -102,7 +102,7 @@ impl<'a> ZfsManager<'a> {
     /// Generate unique UUID for this installation
     async fn generate_installation_uuid(&mut self) -> Result<String> {
         let uuid_output = self
-            .ssh
+            .runner
             .execute_with_output(
                 "dd if=/dev/urandom bs=1 count=100 2>/dev/null | tr -dc 'a-z0-9' | cut -c-6",
             )
@@ -110,10 +110,10 @@ impl<'a> ZfsManager<'a> {
         let uuid = uuid_output.trim().to_string();
 
         // Write UUID to target
-        self.ssh
+        self.runner
             .execute(&format!("echo 'UUID={}' > /mnt/targetos/uuid", uuid))
             .await?;
-        self.ssh
+        self.runner
             .execute(&format!(
                 "echo 'DISK={}' >> /mnt/targetos/uuid",
                 self.variables.get("DISK").unwrap_or(&"unknown".to_string())
@@ -281,7 +281,7 @@ impl<'a> ZfsManager<'a> {
         info!("Executing: {} -> {}", description, command);
 
         match self
-            .ssh
+            .runner
             .execute_with_error_collection(command, description)
             .await
         {
@@ -300,7 +300,7 @@ impl<'a> ZfsManager<'a> {
                     error!("STDERR: {}", stderr);
 
                     // Don't immediately fail - collect debug info
-                    if let Ok(debug_info) = self.ssh.collect_debug_info().await {
+                    if let Ok(debug_info) = self.runner.collect_debug_info().await {
                         error!("System debug information:\n{}", debug_info);
                     }
 
@@ -314,7 +314,7 @@ impl<'a> ZfsManager<'a> {
                 error!("Failed to execute command '{}': {}", description, e);
 
                 // Try to collect debug info even if the command completely failed
-                if let Ok(debug_info) = self.ssh.collect_debug_info().await {
+                if let Ok(debug_info) = self.runner.collect_debug_info().await {
                     error!("System debug information:\n{}", debug_info);
                 }
 

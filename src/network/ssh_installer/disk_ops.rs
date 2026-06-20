@@ -1,21 +1,21 @@
 // file: src/network/ssh_installer/disk_ops.rs
-// version: 1.4.0
+// version: 2.0.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
 
 //! Disk operations for SSH installation
 
 use super::config::InstallationConfig;
-use crate::network::SshClient;
+use crate::network::CommandExecutor;
 use crate::Result;
 use tracing::info;
 
 pub struct DiskManager<'a> {
-    ssh: &'a mut SshClient,
+    runner: &'a mut dyn CommandExecutor,
 }
 
 impl<'a> DiskManager<'a> {
-    pub fn new(ssh: &'a mut SshClient) -> Self {
-        Self { ssh }
+    pub fn new(runner: &'a mut dyn CommandExecutor) -> Self {
+        Self { runner }
     }
 
     /// Perform complete disk preparation and partitioning
@@ -145,7 +145,7 @@ impl<'a> DiskManager<'a> {
 
         // Unmount any existing mounts on the target disk
         let mounted_parts = self
-            .ssh
+            .runner
             .execute_with_output(&format!(
                 "mount | grep '{}' | awk '{{print $1}}' || true",
                 config.disk_device
@@ -182,7 +182,7 @@ impl<'a> DiskManager<'a> {
         info!("Destroying existing ZFS pools");
 
         let existing_pools = self
-            .ssh
+            .runner
             .execute_with_output("zpool list -H -o name 2>/dev/null || true")
             .await?;
         if !existing_pools.trim().is_empty() {
@@ -340,7 +340,7 @@ impl<'a> DiskManager<'a> {
     /// Helper method to log and execute commands
     async fn log_and_execute(&mut self, description: &str, command: &str) -> Result<()> {
         info!("Executing: {} -> {}", description, command);
-        self.ssh.execute(command).await
+        self.runner.execute(command).await
     }
 
     // --- Test helpers (pure builders) ---

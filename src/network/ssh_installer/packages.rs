@@ -1,20 +1,20 @@
 // file: src/network/ssh_installer/packages.rs
-// version: 1.0.1
+// version: 2.0.0
 // guid: sshpkg01-2345-6789-abcd-ef0123456789
 
 //! Package management for SSH installation
 
-use crate::network::SshClient;
+use crate::network::CommandExecutor;
 use crate::Result;
 use tracing::info;
 
 pub struct PackageManager<'a> {
-    ssh: &'a mut SshClient,
+    runner: &'a mut dyn CommandExecutor,
 }
 
 impl<'a> PackageManager<'a> {
-    pub fn new(ssh: &'a mut SshClient) -> Self {
-        Self { ssh }
+    pub fn new(runner: &'a mut dyn CommandExecutor) -> Self {
+        Self { runner }
     }
 
     /// Install required packages for installation
@@ -22,10 +22,10 @@ impl<'a> PackageManager<'a> {
         info!("Installing required packages");
 
         // Update package lists first
-        self.ssh.execute("apt-get update").await?;
+        self.runner.execute("apt-get update").await?;
 
         // Install ZFS utilities specifically
-        self.ssh
+        self.runner
             .execute("DEBIAN_FRONTEND=noninteractive apt-get install -y zfsutils-linux")
             .await?;
 
@@ -44,7 +44,7 @@ impl<'a> PackageManager<'a> {
             "DEBIAN_FRONTEND=noninteractive apt-get install -y {}",
             packages.join(" ")
         );
-        self.ssh.execute(&install_cmd).await?;
+        self.runner.execute(&install_cmd).await?;
 
         info!("Required packages installed successfully");
         Ok(())
@@ -56,7 +56,7 @@ impl<'a> PackageManager<'a> {
 
         for tool in tools {
             match self
-                .ssh
+                .runner
                 .execute(&format!("command -v {} >/dev/null 2>&1", tool))
                 .await
             {
