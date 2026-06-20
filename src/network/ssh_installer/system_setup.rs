@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-06-20
 
@@ -573,16 +573,54 @@ impl<'a> SystemConfigurator<'a> {
             tang_entries.join(",")
         );
 
-        // The existing LUKS passphrase is needed for clevis to add a new keyslot.
-        // Pass it via stdin to avoid it appearing in /proc/<pid>/environ.
-        let enroll_cmd = format!(
-            "echo '{}' | clevis luks bind -d {} -k - sss '{}'",
-            config.luks_key, luks_part, sss_config
+        // Write the LUKS passphrase to a root-only tempfile so it never appears
+        // in the clevis bind command line (visible in /proc/<pid>/cmdline) or in
+        // any log message.  `shred -u` is called in a finally-style block so the
+        // file is removed even when the bind step fails.
+        //
+        // Security notes:
+        //   - The key is written via a separate command; it still travels over the
+        //     SSH channel but is NOT logged (we explicitly skip log_and_execute).
+        //   - install(1) creates the file with 0600 atomically before content is
+        //     written, so there is no race window where another process could read
+        //     a world-readable file containing the passphrase.
+        //   - `shred` overwrites the file before unlinking; `rm -f` is a fallback
+        //     for filesystems where shred is not installed.
+        let tmp_key_path = "/run/.uaa-tang-enroll.key";
+
+        // Create empty 0600 file
+        let mk_tmp = format!("install -m 0600 /dev/null {}", tmp_key_path);
+        if let Err(e) = self.runner.execute(&mk_tmp).await {
+            warn!("Clevis enrollment: could not create key tempfile ({}); skipping", e);
+            return Ok(());
+        }
+
+        // Write passphrase — NOT logged (no log_and_execute)
+        let write_key = format!(
+            "printf '%s' '{}' > {}",
+            config.luks_key.replace('\'', r"'\''"),
+            tmp_key_path
         );
-        if let Err(e) = self
-            .log_and_execute("Enroll Tang via clevis SSS", &enroll_cmd)
-            .await
-        {
+        if let Err(e) = self.runner.execute(&write_key).await {
+            let _ = self.runner.execute(&format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)).await;
+            warn!("Clevis enrollment: could not write key to tempfile ({}); skipping", e);
+            return Ok(());
+        }
+
+        // Run clevis bind — key path in command, not the key itself
+        let bind_cmd = format!(
+            "clevis luks bind -d {} -k {} sss '{}'",
+            luks_part, tmp_key_path, sss_config
+        );
+        info!("Executing: Enroll Tang via clevis SSS (passphrase via tempfile, redacted)");
+        let bind_result = self.runner.execute(&bind_cmd).await;
+
+        // Always shred the tempfile regardless of outcome
+        let _ = self.runner.execute(
+            &format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)
+        ).await;
+
+        if let Err(e) = bind_result {
             warn!(
                 "Clevis Tang enrollment failed (non-fatal — passphrase fallback remains): {}",
                 e
