@@ -1,6 +1,7 @@
 // file: src/network/ssh.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: t0u1v2w3-x4y5-6789-0123-456789tuvwxy
+// last-edited: 2026-06-20
 
 //! SSH client for remote deployment operations
 
@@ -44,11 +45,31 @@ impl SshClient {
             crate::error::AutoInstallError::SshError(format!("SSH handshake failed: {}", e))
         })?;
 
-        // Try key-based authentication first
-        if session.userauth_agent(username).is_err() {
-            // Fall back to asking for password (in a real implementation)
+        // Try SSH agent first, then fall back to key files.
+        let mut authed = session.userauth_agent(username).is_ok();
+        if !authed {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            for key in &[
+                format!("{}/.ssh/id_ed25519", home),
+                format!("{}/.ssh/id_rsa", home),
+                format!("{}/.ssh/id_ecdsa", home),
+            ] {
+                if !std::path::Path::new(key).exists() {
+                    continue;
+                }
+                if session
+                    .userauth_pubkey_file(username, None, std::path::Path::new(key), None)
+                    .is_ok()
+                {
+                    info!("Authenticated using key file {}", key);
+                    authed = true;
+                    break;
+                }
+            }
+        }
+        if !authed {
             return Err(crate::error::AutoInstallError::SshError(
-                "SSH authentication failed - no valid key found".to_string(),
+                "SSH authentication failed — no agent key or key file worked".to_string(),
             ));
         }
 

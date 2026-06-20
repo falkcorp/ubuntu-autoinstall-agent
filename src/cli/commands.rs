@@ -1,6 +1,7 @@
 // file: src/cli/commands.rs
-// version: 1.4.0
+// version: 2.0.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
+// last-edited: 2026-06-20
 
 //! Command implementations for the CLI
 
@@ -8,7 +9,7 @@ use crate::{
     config::{loader::ConfigLoader, Architecture, ImageSpec},
     image::deployer::ImageDeployer,
     image::{builder::ImageBuilder, manager::ImageManager},
-    network::{InstallationConfig, SshInstaller, SystemInfo},
+    network::{ssh_installer::config::InitramfsType, InstallationConfig, SshInstaller, SystemInfo},
     utils::system::SystemUtils,
     Result,
 };
@@ -266,18 +267,21 @@ pub async fn cleanup_command(older_than_days: u32, dry_run: bool) -> Result<()> 
     Ok(())
 }
 
-/// Install Ubuntu via SSH to a target machine
+/// Install Ubuntu via SSH to a target machine.
+///
+/// If `config_path` is supplied the config is loaded from that YAML file;
+/// otherwise the built-in `for_len_serv_003()` default is used.
 pub async fn ssh_install_command(
     host: &str,
     hostname: Option<String>,
     username: Option<String>,
+    config_path: Option<String>,
     investigate_only: bool,
     dry_run: bool,
     hold_on_failure: bool,
     pause_after_storage: bool,
 ) -> Result<()> {
     let username = username.unwrap_or_else(|| "ubuntu".to_string());
-    let _hostname = hostname.unwrap_or_else(|| "len-serv-003".to_string());
 
     info!(
         "Connecting to {}@{} for Ubuntu installation",
@@ -294,28 +298,27 @@ pub async fn ssh_install_command(
     info!("Investigating target system...");
     let system_info = installer.investigate_system().await?;
 
-    println!("\n=== SYSTEM INVESTIGATION RESULTS ===");
-    println!("Hostname: {}", system_info.hostname);
-    println!("Kernel: {}", system_info.kernel_version);
-    println!("Available tools: {:?}", system_info.available_tools);
-    println!("\n--- OS Release ---");
-    println!("{}", system_info.os_release);
-    println!("\n--- Memory Info ---");
-    println!("{}", system_info.memory_info);
-    println!("\n--- CPU Info ---");
-    println!("{}", system_info.cpu_info);
-    println!("\n--- Disk Information ---");
-    println!("{}", system_info.disk_info);
-    println!("\n--- Network Information ---");
-    println!("{}", system_info.network_info);
+    print_system_info("SYSTEM INVESTIGATION RESULTS", &system_info);
 
     if investigate_only {
         info!("Investigation complete. Exiting as requested.");
         return Ok(());
     }
 
-    // Create installation configuration
-    let config = InstallationConfig::for_len_serv_003();
+    // Load config from file or fall back to built-in default
+    let config = if let Some(ref path) = config_path {
+        info!("Loading installation config from {}", path);
+        InstallationConfig::from_yaml_file(path)?
+    } else {
+        let hn = hostname.unwrap_or_else(|| "len-serv-003".to_string());
+        if hn == "len-serv-003" {
+            InstallationConfig::for_len_serv_003()
+        } else {
+            return Err(crate::error::AutoInstallError::ValidationError(
+                "No --config provided; pass a YAML config file or use the default len-serv-003 hostname".to_string(),
+            ));
+        }
+    };
 
     if dry_run {
         info!("DRY RUN: Would perform full ZFS+LUKS installation with config:");
@@ -406,20 +409,7 @@ pub async fn local_install_command(
     info!("Investigating local system...");
     let system_info = installer.investigate_system().await?;
 
-    println!("\n=== LOCAL SYSTEM INVESTIGATION RESULTS ===");
-    println!("Hostname: {}", system_info.hostname);
-    println!("Kernel: {}", system_info.kernel_version);
-    println!("Available tools: {:?}", system_info.available_tools);
-    println!("\n--- OS Release ---");
-    println!("{}", system_info.os_release);
-    println!("\n--- Memory Info ---");
-    println!("{}", system_info.memory_info);
-    println!("\n--- CPU Info ---");
-    println!("{}", system_info.cpu_info);
-    println!("\n--- Disk Information ---");
-    println!("{}", system_info.disk_info);
-    println!("\n--- Network Information ---");
-    println!("{}", system_info.network_info);
+    print_system_info("LOCAL SYSTEM INVESTIGATION RESULTS", &system_info);
 
     if investigate_only {
         info!("Investigation complete. Exiting as requested.");
@@ -477,6 +467,65 @@ pub async fn local_install_command(
     Ok(())
 }
 
+/// Print system investigation results in a consistent format.
+fn print_system_info(title: &str, info: &SystemInfo) {
+    println!("\n=== {} ===", title);
+    println!("Hostname: {}", info.hostname);
+    println!("Kernel: {}", info.kernel_version);
+    println!("Available tools: {:?}", info.available_tools);
+    println!("\n--- OS Release ---\n{}", info.os_release);
+    println!("\n--- Memory ---\n{}", info.memory_info);
+    println!("\n--- CPU ---\n{}", info.cpu_info);
+    println!("\n--- Disks ---\n{}", info.disk_info);
+    println!("\n--- Network ---\n{}", info.network_info);
+}
+
+/// Unified install subcommand: connects over SSH when `remote` is Some, runs locally otherwise.
+pub async fn install_command(
+    remote: Option<String>,
+    username: Option<String>,
+    config_path: Option<String>,
+    investigate_only: bool,
+    dry_run: bool,
+    hold_on_failure: bool,
+    pause_after_storage: bool,
+    force: bool,
+) -> Result<()> {
+    match remote {
+        Some(ref host) => {
+            ssh_install_command(
+                host,
+                None,
+                username,
+                config_path,
+                investigate_only,
+                dry_run,
+                hold_on_failure,
+                pause_after_storage,
+            )
+            .await
+        }
+        None => {
+            local_install_command(
+                config_path
+                    .as_deref()
+                    .and_then(|p| {
+                        InstallationConfig::from_yaml_file(p)
+                            .ok()
+                            .map(|c| c.hostname)
+                    })
+                    .or_else(|| std::env::var("HOSTNAME").ok()),
+                investigate_only,
+                dry_run,
+                hold_on_failure,
+                pause_after_storage,
+                force,
+            )
+            .await
+        }
+    }
+}
+
 /// Check if we're running in a live environment
 fn is_live_environment() -> bool {
     // Check for common live environment indicators
@@ -515,6 +564,10 @@ fn create_local_installation_config(
         network_nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
         debootstrap_release: Some("plucky".to_string()),
         debootstrap_mirror: Some("http://archive.ubuntu.com/ubuntu/".to_string()),
+        initramfs_type: InitramfsType::default(),
+        tang_servers: vec![],
+        tang_threshold: 2,
+        ssh_authorized_keys: vec![],
     })
 }
 
@@ -787,7 +840,8 @@ users:
 
         // Act
         let result = ssh_install_command(
-            host, hostname, username, true,  // investigate_only
+            host, hostname, username, None,  // config_path
+            true,  // investigate_only
             false, // dry_run
             false, // hold_on_failure
             false, // pause_after_storage
@@ -808,7 +862,8 @@ users:
 
         // Act
         let result = ssh_install_command(
-            host, hostname, username, false, // investigate_only
+            host, hostname, username, None,  // config_path
+            false, // investigate_only
             true,  // dry_run
             false, // hold_on_failure
             false, // pause_after_storage

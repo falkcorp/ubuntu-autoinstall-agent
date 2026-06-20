@@ -1,6 +1,7 @@
 // file: src/cli/args.rs
-// version: 1.4.0
+// version: 2.0.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
+// last-edited: 2026-06-20
 
 //! Command line argument definitions
 
@@ -87,6 +88,33 @@ pub enum Commands {
         dry_run: bool,
     },
 
+    /// Unified install subcommand: local when no --remote, SSH when --remote is given.
+    Install {
+        #[arg(long, help = "SSH into this host and install there (omit for local)")]
+        remote: Option<String>,
+
+        #[arg(short, long, default_value = "ubuntu", help = "SSH username (remote only)")]
+        username: Option<String>,
+
+        #[arg(short, long, help = "Path to YAML installation config file")]
+        config: Option<String>,
+
+        #[arg(long, help = "Only investigate system, don't install")]
+        investigate_only: bool,
+
+        #[arg(long, help = "Show what would be done without executing")]
+        dry_run: bool,
+
+        #[arg(long, help = "Hold on failure for debugging (keep session open)")]
+        hold_on_failure: bool,
+
+        #[arg(long, help = "Pause after storage setup for manual verification")]
+        pause_after_storage: bool,
+
+        #[arg(long, help = "Force local install even outside a live environment")]
+        force: bool,
+    },
+
     /// Install Ubuntu via SSH to target machine
     SshInstall {
         #[arg(short = 'H', long, help = "Target machine IP address or hostname")]
@@ -97,6 +125,9 @@ pub enum Commands {
 
         #[arg(short, long, default_value = "ubuntu", help = "SSH username")]
         username: Option<String>,
+
+        #[arg(short, long, help = "Path to YAML installation config file")]
+        config: Option<String>,
 
         #[arg(long, help = "Only investigate system, don't install")]
         investigate_only: bool,
@@ -411,6 +442,7 @@ mod tests {
                 host,
                 hostname,
                 username,
+                config,
                 investigate_only,
                 dry_run,
                 hold_on_failure,
@@ -419,6 +451,7 @@ mod tests {
                 assert_eq!(host, "10.0.0.5");
                 assert!(hostname.is_none());
                 assert_eq!(username.as_deref(), Some("ubuntu"));
+                assert!(config.is_none());
                 assert!(!investigate_only);
                 assert!(!dry_run);
                 assert!(!hold_on_failure);
@@ -455,6 +488,7 @@ mod tests {
                 host,
                 hostname,
                 username,
+                config,
                 investigate_only,
                 dry_run,
                 hold_on_failure,
@@ -463,6 +497,7 @@ mod tests {
                 assert_eq!(host, "server.example.com");
                 assert_eq!(hostname.as_deref(), Some("prod-web-01"));
                 assert_eq!(username.as_deref(), Some("admin"));
+                assert!(config.is_none());
                 assert!(investigate_only);
                 assert!(dry_run);
                 assert!(hold_on_failure);
