@@ -1,5 +1,5 @@
 // file: src/autoinstall/verify.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
 // last-edited: 2026-06-21
 
@@ -287,7 +287,7 @@ pub async fn verify_host(
 
     // 2. Clevis SSS Tang binding
     let clevis = runner
-        .execute_with_output(&format!("clevis luks list {LUKS_PARTITION}"))
+        .execute_with_output(&format!("sudo -n clevis luks list -d {LUKS_PARTITION}"))
         .await
         .unwrap_or_default();
     checks.push(evaluate_clevis_binding(&clevis));
@@ -307,9 +307,10 @@ pub async fn verify_host(
     checks.push(evaluate_dracut_network(&dracut_conf));
     checks.push(evaluate_dracut_kernel_cmdline(&dracut_conf));
 
-    // 6. GRUB cmdline
+    // 6. GRUB cmdline — check both the main file and the grub.d drop-in written
+    //    by the autoinstall late-command (50-clevis-network.cfg).
     let grub = runner
-        .execute_with_output("cat /etc/default/grub")
+        .execute_with_output("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub")
         .await
         .unwrap_or_default();
     checks.push(evaluate_grub_cmdline(&grub));
@@ -596,10 +597,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
-            ("clevis luks list /dev/nvme0n1p3", CLEVIS_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
-            ("cat /etc/default/grub", GRUB_003),
+            ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
             ("cat /proc/cmdline", PROC_CMDLINE_003),
             ("hostname", "len-serv-003\n"),
             ("ip -br addr show enp1s0f0", "enp1s0f0 UP 172.16.3.96/23 fe80::1/64\n"),
@@ -622,10 +623,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
-            ("clevis luks list /dev/nvme0n1p3", CLEVIS_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
-            ("cat /etc/default/grub", GRUB_003),
+            ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
             ("cat /proc/cmdline", PROC_CMDLINE_003),
             // hostname mismatch
             ("hostname", "len-serv-003\n"),
@@ -648,10 +649,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         let mut mock = MockExecutor::new(&[
             // No crypto_LUKS in output
             ("lsblk -o NAME,TYPE,FSTYPE", "nvme0n1 disk\nnvme0n1p1 part vfat\n"),
-            ("clevis luks list /dev/nvme0n1p3", CLEVIS_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
-            ("cat /etc/default/grub", GRUB_003),
+            ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
             ("cat /proc/cmdline", PROC_CMDLINE_003),
             ("hostname", "len-serv-003\n"),
             ("ip -br addr show enp1s0f0", "enp1s0f0 UP 172.16.3.96/23\n"),

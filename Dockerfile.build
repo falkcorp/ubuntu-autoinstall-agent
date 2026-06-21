@@ -1,0 +1,39 @@
+# file: Dockerfile.build
+# version: 2.0.0
+# guid: e4f5a6b7-c8d9-0e1f-2a3b-4c5d6e7f8a9b
+# last-edited: 2026-06-21
+#
+# Builds a fully static linux binary (musl libc) for ubuntu-autoinstall-agent.
+# Used by scripts/build-all.sh — not meant to be run directly.
+#
+# Pass --platform linux/amd64 or --platform linux/arm64 to select architecture.
+# The output binary at /ubuntu-autoinstall-agent has zero runtime dependencies.
+#
+# All C deps (OpenSSL via ssh2's vendored-openssl, libssh2 via libssh2-sys)
+# are compiled from source and linked statically — no system packages needed
+# at runtime. cmake/make/perl are only required at build time.
+
+FROM rust:alpine AS builder
+
+# Build-time only: cmake+make+perl for vendored libssh2/openssl; musl-dev for headers.
+RUN apk add --no-cache cmake make perl pkgconfig musl-dev
+
+WORKDIR /build
+
+# Pre-compile dependencies with a stub main to speed up incremental builds.
+# A stub failure is non-fatal — the real build step recompiles from scratch.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && printf 'fn main(){}' > src/main.rs \
+    && (cargo build --release 2>&1 | tail -5 || true) \
+    && rm -rf src
+
+# Build the real binary. Pipe through tail for readable output; pipefail
+# ensures a cargo error aborts the image rather than silently shipping
+# a stub or stale binary.
+COPY src ./src
+COPY tests ./tests
+RUN set -o pipefail && touch src/main.rs && cargo build --release 2>&1 | tail -10
+
+# ── Scratch output stage — zero runtime dependencies ──────────────────────────
+FROM scratch
+COPY --from=builder /build/target/release/ubuntu-autoinstall-agent /ubuntu-autoinstall-agent
