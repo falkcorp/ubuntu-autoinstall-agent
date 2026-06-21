@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-06-21
 
@@ -638,6 +638,37 @@ fn prompt_for_root_password() -> Result<String> {
         .map_err(crate::error::AutoInstallError::IoError)?;
 
     Ok(password.trim().to_string())
+}
+
+/// SSH into a deployed host and verify post-install state against the spec.
+///
+/// Prints a per-check PASS/FAIL table. If `strict` is true, returns a non-zero
+/// exit by propagating an error when any check fails.
+pub async fn verify_command(
+    host: &str,
+    hostname: &str,
+    address: &str,
+    username: &str,
+    strict: bool,
+) -> Result<()> {
+    use crate::autoinstall::{verify::verify_host, HostSpec};
+    use crate::network::SshClient;
+
+    let spec = HostSpec::for_lenserv(hostname, address);
+
+    let mut client = SshClient::new();
+    client.connect(host, username).await?;
+
+    let report = verify_host(&mut client, &spec, host).await?;
+    report.print();
+
+    if strict && !report.all_passed() {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            format!("{} check(s) failed on {host}", report.checks.iter().filter(|c| !c.passed).count()),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Render a subiquity autoinstall `user-data` from the template + per-host values.
