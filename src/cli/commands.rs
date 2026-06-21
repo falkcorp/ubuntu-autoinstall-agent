@@ -1,7 +1,7 @@
 // file: src/cli/commands.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-06-20
+// last-edited: 2026-06-21
 
 //! Command implementations for the CLI
 
@@ -638,6 +638,44 @@ fn prompt_for_root_password() -> Result<String> {
         .map_err(crate::error::AutoInstallError::IoError)?;
 
     Ok(password.trim().to_string())
+}
+
+/// Render a subiquity autoinstall `user-data` from the template + per-host values.
+///
+/// Uses the embedded len-serv template unless `--template` points at a custom
+/// file. Output goes to `output_path` if given, else stdout.
+pub async fn render_user_data_command(
+    hostname: &str,
+    address: &str,
+    template_path: Option<&str>,
+    output_path: Option<&str>,
+) -> Result<()> {
+    use crate::autoinstall::{default_template, render_user_data, HostSpec};
+
+    let template = match template_path {
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(crate::error::AutoInstallError::IoError)?
+        }
+        None => default_template().to_string(),
+    };
+
+    let spec = HostSpec::for_lenserv(hostname, address);
+    let rendered = render_user_data(&template, &spec)?;
+
+    match output_path {
+        Some(path) => {
+            std::fs::write(path, &rendered).map_err(crate::error::AutoInstallError::IoError)?;
+            info!("Wrote rendered user-data for {hostname} to {path}");
+        }
+        None => {
+            print!("{rendered}");
+            std::io::stdout()
+                .flush()
+                .map_err(crate::error::AutoInstallError::IoError)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

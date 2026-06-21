@@ -1,0 +1,226 @@
+#cloud-config
+autoinstall:
+  version: 1
+  refresh-installer:
+    update: true
+
+  identity:
+    realname: jdfalk Admin
+    hostname: len-serv-003
+    username: jdfalk
+    password: "$6$rounds=500000$dPBsZ2xT/TgcZTlY$1L93FUt8OsRpcPS2Lg/LT/EKpnOaDvSY1IZ1bTEE70uCVtmI0gH44yYy1y4nMIlw3m0WqM6gd3fUx5aQfCkJ41"
+
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820
+
+  oem:
+    install: false
+
+  packages:
+    - openssh-server
+    - vim
+    - htop
+    - jq
+    - parted
+    - gdisk
+    - cryptsetup
+    - lvm2
+    - dosfstools
+    - curl
+    - debootstrap
+    - clevis
+    - clevis-dracut
+    - clevis-luks
+    - zfs-dracut
+    - zsh
+    - git
+    - tmux
+    - screen
+    - rsync
+    - ethtool
+    - lshw
+    - rsyslog
+    - rsyslog-relp
+    - prometheus-node-exporter
+    - tpm2-tools
+    - zip
+    - unzip
+
+  user-data:
+    chpasswd:
+      expire: false
+    users:
+      - name: jdfalk
+        groups: [adm, sudo, cdrom, dip, lxd, docker]
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        shell: /usr/bin/zsh
+        ssh_authorized_keys:
+          - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan
+          - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local
+          - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820
+
+  storage:
+    layout:
+      name: lvm
+      match:
+        path: /dev/nvme0n1
+      sizing-policy: all
+      password: "TANG_INITIAL_PASSPHRASE_REPLACE_WITH_CLEVIS"
+
+  early-commands:
+    - systemctl start ssh
+    - echo 'ubuntu-server:ubuntu' | chpasswd
+
+  error-commands:
+    - curl -fsSL http://172.16.2.30/cloud-init/reporting.sh -o /tmp/reporting.sh
+    - bash -c 'source /tmp/reporting.sh && send_status_update "failed" 0 "Installation failed on len-serv-003 - uploading crash logs" && upload_logs /var/log/installer/syslog && upload_logs /var/log/installer/debug && upload_logs /var/log/cloud-init-output.log && upload_logs /var/log/cloud-init.log' || true
+
+  late-commands:
+    # Write the entire in-target setup script inline — no external download needed.
+    # YAML strips the leading indentation so the CHROOT_SETUP terminator lands at col 0,
+    # which is required for bash to recognise the end of the heredoc.
+    - |
+      cat > /target/tmp/chroot-setup.sh << 'CHROOT_SETUP'
+      #!/bin/bash
+      set -euo pipefail
+
+      # --- User / SSH ---
+      chown -R jdfalk:jdfalk /home/jdfalk 2>/dev/null || chown -R 1000:1000 /home/jdfalk
+      mkdir -p /home/jdfalk/.ssh
+      chmod 700 /home/jdfalk/.ssh
+      cat > /home/jdfalk/.ssh/authorized_keys << 'KEYS'
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820
+      KEYS
+      chmod 600 /home/jdfalk/.ssh/authorized_keys
+      chown -R jdfalk:jdfalk /home/jdfalk/.ssh
+      usermod -aG adm,sudo,cdrom,dip,lxd,docker jdfalk 2>/dev/null || true
+      echo 'jdfalk ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/jdfalk
+      chmod 440 /etc/sudoers.d/jdfalk
+      chsh -s /usr/bin/zsh jdfalk
+
+      # --- Oh My Zsh ---
+      # stdin is not a tty in the chroot so the installer auto-enters unattended
+      # mode (RUNZSH=no CHSH=no OVERWRITE_CONFIRMATION=no) — no flags needed.
+      # su - sets HOME=/home/jdfalk so omz installs into the right directory.
+      curl -fsSL http://172.16.2.30/cloud-init/scripts/ohmyzsh-install.sh \
+        -o /tmp/ohmyzsh-install.sh
+      su - jdfalk -s /bin/sh -c 'sh /tmp/ohmyzsh-install.sh'
+
+      # --- Timezone / hosts / rsyslog ---
+      ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
+      echo 'America/New_York' > /etc/timezone
+      cat >> /etc/hosts << 'HOSTS'
+      172.16.2.30 unimatrixzero.local unimatrixzero minio-01.local minio-01
+      172.16.2.45 rpi-serv-001.local rpi-serv-001 minio-02.local minio-02
+      172.16.2.46 rpi-serv-002.local rpi-serv-002 minio-03.local minio-03
+      172.16.2.47 rpi-serv-003.local rpi-serv-003 minio-04.local minio-04
+      HOSTS
+      cat > /etc/rsyslog.d/50-remote.conf << 'RSYSLOG'
+      module(load="omrelp")
+      *.*  action(type="omrelp" target="172.16.2.30" port="2514")
+      RSYSLOG
+      systemctl enable rsyslog
+
+      # --- Variables ---
+      cat > /root/variables.sh << 'VARS'
+      #!/bin/bash
+      DISK="/dev/nvme0n1"
+      TIMEZONE="America/New_York"
+      HOSTNAME="len-serv-003"
+      REPORT_STATUS="/usr/local/bin/report-status.sh"
+      NET_ET_INTERFACE="enp1s0f0"
+      NET_ET_ADDRESS="172.16.3.96/23"
+      NET_ET_GATEWAY="172.16.2.1"
+      NET_ET_SEARCH="jf.local"
+      NET_ET_NAMESERVERS=("172.16.2.1" "1.1.1.1" "8.8.8.8")
+      COCKROACH_ADVERTISE="172.16.3.96:36357"
+      COCKROACH_JOIN="172.16.2.30:36357,172.16.3.92:36357,172.16.3.94:36357"
+      COCKROACH_CACHE=".25"
+      COCKROACH_MAX_SQL=".25"
+      COCKROACH_LOCALITY="region=us,cluster-unit=lenovo"
+      TANG_URL1="http://172.16.2.45"
+      TANG_URL2="http://172.16.2.46"
+      TANG_URL3="http://172.16.2.47"
+      VARS
+      chmod +x /root/variables.sh
+
+      # --- report-status.sh and CockroachDB setup script ---
+      curl -fsSL http://172.16.2.30/cloud-init/scripts/report-status.sh \
+        -o /usr/local/bin/report-status.sh
+      chmod +x /usr/local/bin/report-status.sh
+      curl -fsSL http://172.16.2.30/cloud-init/scripts/setup_cockroachdb.sh \
+        -o /root/setup_cockroachdb.sh
+      chmod +x /root/setup_cockroachdb.sh
+
+      # --- rc.local: CockroachDB first-boot + TPM checkin ---
+      cat > /etc/rc.local << 'RCLOCAL'
+      #!/bin/bash
+      /root/setup_cockroachdb.sh >> /var/log/cockroach-setup.log 2>&1
+      HOSTNAME_VAL=$(hostname)
+      MAC=$(cat /sys/class/net/enp1s0f0/address 2>/dev/null || ip link | awk '/ether/{print $2}' | head -1)
+      SOURCE_IP=$(ip route get 1 | awk '{print $7; exit}')
+      TPM_EK=""
+      if command -v tpm2_readpublic &>/dev/null; then
+        TPM_EK=$(tpm2_readpublic -c 0x81010001 -f pem 2>/dev/null | sha256sum | cut -d' ' -f1 || true)
+      fi
+      curl -s -X POST http://172.16.2.30:25000/api/checkin \
+        -H "Content-Type: application/json" \
+        -d "{\"hostname\":\"${HOSTNAME_VAL}\",\"mac\":\"${MAC}\",\"ip\":\"${SOURCE_IP}\",\"tpm_ek\":\"${TPM_EK}\"}" || true
+      exit 0
+      RCLOCAL
+      chmod +x /etc/rc.local
+      systemctl enable rc-local
+
+      # --- Clevis / Tang LUKS binding ---
+      # blkid works here because curtin in-target binds /dev into the chroot.
+      LUKS_DEV=$(blkid -t TYPE=crypto_LUKS -o device | head -n1 || true)
+      if [[ -z "$LUKS_DEV" ]]; then
+        /usr/local/bin/report-status.sh failed 95 "No crypto_LUKS device found" || true
+        echo "ERROR: no crypto_LUKS device found" >&2
+        exit 1
+      fi
+      echo "Found LUKS device: $LUKS_DEV"
+      SSS='{"t":2,"pins":{"tang":[{"url":"http://172.16.2.45"},{"url":"http://172.16.2.46"},{"url":"http://172.16.2.47"}]}}'
+      if ! clevis luks list -d "$LUKS_DEV" 2>/dev/null | grep -qE 'sss|tang'; then
+        printf '%s' 'TANG_INITIAL_PASSPHRASE_REPLACE_WITH_CLEVIS' \
+          | clevis luks bind -y -k - -d "$LUKS_DEV" sss "$SSS"
+        echo "Clevis Tang binding complete"
+      else
+        echo "Clevis binding already present"
+      fi
+      clevis luks list -d "$LUKS_DEV"
+
+      # --- Dracut config for network-based Tang unlock ---
+      # rd.neednet=1 + ip=dhcp tells dracut to bring the NIC up in the initramfs
+      # so the Tang servers are reachable before LUKS is unlocked.
+      mkdir -p /etc/dracut.conf.d /etc/default/grub.d
+      cat > /etc/dracut.conf.d/clevis.conf << 'DRACUT'
+      add_dracutmodules+=" network "
+      kernel_cmdline="rd.neednet=1 ip=dhcp"
+      DRACUT
+      cat > /etc/default/grub.d/50-clevis-network.cfg << 'GRUBCFG'
+      GRUB_CMDLINE_LINUX="rd.neednet=1 ip=dhcp"
+      GRUBCFG
+      update-grub
+      dracut --regenerate-all --force
+      echo "Dracut initramfs rebuild complete"
+
+      /usr/local/bin/report-status.sh finished 100 "Installation complete on len-serv-003" || true
+      CHROOT_SETUP
+
+    # Execute the script inside the installed system.
+    # curtin in-target handles /dev /proc /sys /run bind-mounts automatically.
+    - curtin in-target -- bash /tmp/chroot-setup.sh
+
+    # Reporting, boot-target flip, then idle until curtin reboots the machine.
+    - curl -fsSL http://172.16.2.30/cloud-init/reporting.sh -o /tmp/reporting.sh
+    - bash -c 'source /tmp/reporting.sh && upload_logs /var/log/installer/syslog && upload_logs /var/log/cloud-init-output.log && send_final_report' || true
+    - curl -s http://172.16.2.30:25000/api/flip/len-serv-003 || true
+    - sleep 900 || true
