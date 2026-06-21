@@ -1,5 +1,5 @@
 // file: src/autoinstall/mod.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: a0b1c2d3-e4f5-6a7b-8c9d-0e1f2a3b4c5d
 // last-edited: 2026-06-21
 
@@ -11,9 +11,11 @@
 //! installer (subiquity) then consumes.
 
 pub mod host_spec;
+pub mod place;
 pub mod render;
 pub mod verify;
 
 pub use host_spec::HostSpec;
+pub use place::{place_and_drive, FlipResult, PlaceOpts, PlaceReport};
 pub use render::{default_template, render_user_data};
 pub use verify::{verify_host, CheckResult, VerifyReport};

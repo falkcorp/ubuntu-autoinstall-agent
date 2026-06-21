@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
 // last-edited: 2026-06-21
 
@@ -119,6 +119,30 @@ async fn main() -> Result<()> {
                     hold_on_failure,
                     pause_after_storage,
                     force,
+                )
+                .await
+            }
+            ubuntu_autoinstall_agent::cli::args::Commands::Place {
+                hostname,
+                address,
+                server,
+                server_user,
+                template,
+                flip,
+                reboot,
+                target_user,
+                dry_run,
+            } => {
+                place_command(
+                    &hostname,
+                    &address,
+                    &server,
+                    &server_user,
+                    template.as_deref(),
+                    flip,
+                    reboot,
+                    &target_user,
+                    dry_run,
                 )
                 .await
             }

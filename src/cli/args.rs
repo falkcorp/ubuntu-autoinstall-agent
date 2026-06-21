@@ -1,5 +1,5 @@
 // file: src/cli/args.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
 // last-edited: 2026-06-21
 
@@ -170,6 +170,37 @@ pub enum Commands {
             help = "Force installation even when not in live environment (use with caution)"
         )]
         force: bool,
+    },
+
+    /// Write rendered user-data seed into the netboot server's cloud-init tree,
+    /// optionally flip the boot target to custom-autoinstall, and optionally reboot
+    Place {
+        #[arg(short = 'n', long, help = "Target hostname, e.g. len-serv-003")]
+        hostname: String,
+
+        #[arg(long, help = "Target IP with CIDR, e.g. 172.16.3.96/23")]
+        address: String,
+
+        #[arg(long, default_value = "172.16.2.30", help = "Netboot server host")]
+        server: String,
+
+        #[arg(long, default_value = "jdfalk", help = "SSH user for the netboot server")]
+        server_user: String,
+
+        #[arg(long, help = "Path to custom template file")]
+        template: Option<String>,
+
+        #[arg(long, help = "Flip the iPXE boot target to custom-autoinstall")]
+        flip: bool,
+
+        #[arg(long, help = "SSH into the target host and trigger a reboot")]
+        reboot: bool,
+
+        #[arg(long, default_value = "jdfalk", help = "SSH user for the target (reboot only)")]
+        target_user: String,
+
+        #[arg(long, help = "Print what would happen without writing anything")]
+        dry_run: bool,
     },
 
     /// SSH into a deployed host and verify it matches the expected post-install state
@@ -628,6 +659,69 @@ mod tests {
                 assert!(!force);
             }
             _ => panic!("Expected LocalInstall command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_place_minimal() {
+        let args = vec![
+            "ubuntu-autoinstall-agent",
+            "place",
+            "--hostname",
+            "len-serv-003",
+            "--address",
+            "172.16.3.96/23",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Place {
+                hostname, address, server, server_user, template, flip, reboot, target_user, dry_run,
+            } => {
+                assert_eq!(hostname, "len-serv-003");
+                assert_eq!(address, "172.16.3.96/23");
+                assert_eq!(server, "172.16.2.30");
+                assert_eq!(server_user, "jdfalk");
+                assert!(template.is_none());
+                assert!(!flip);
+                assert!(!reboot);
+                assert_eq!(target_user, "jdfalk");
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected Place command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_place_full() {
+        let args = vec![
+            "ubuntu-autoinstall-agent",
+            "place",
+            "--hostname", "len-serv-001",
+            "--address", "172.16.3.92/23",
+            "--server", "172.16.2.30",
+            "--server-user", "admin",
+            "--template", "/tmp/custom.tmpl",
+            "--flip",
+            "--reboot",
+            "--target-user", "jdfalk",
+            "--dry-run",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Place {
+                hostname, address, server, server_user, template, flip, reboot, target_user, dry_run,
+            } => {
+                assert_eq!(hostname, "len-serv-001");
+                assert_eq!(address, "172.16.3.92/23");
+                assert_eq!(server, "172.16.2.30");
+                assert_eq!(server_user, "admin");
+                assert_eq!(template.as_deref(), Some("/tmp/custom.tmpl"));
+                assert!(flip);
+                assert!(reboot);
+                assert_eq!(target_user, "jdfalk");
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Place command"),
         }
     }
 
