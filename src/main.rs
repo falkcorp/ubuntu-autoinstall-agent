@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
 // last-edited: 2026-06-21
 
@@ -122,6 +122,13 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            ubuntu_autoinstall_agent::cli::args::Commands::Verify {
+                host,
+                hostname,
+                address,
+                username,
+                strict,
+            } => verify_command(&host, &hostname, &address, &username, strict).await,
             ubuntu_autoinstall_agent::cli::args::Commands::RenderUserData {
                 hostname,
                 address,

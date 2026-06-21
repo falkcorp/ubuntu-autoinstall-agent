@@ -1,5 +1,5 @@
 // file: src/cli/args.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
 // last-edited: 2026-06-21
 
@@ -170,6 +170,24 @@ pub enum Commands {
             help = "Force installation even when not in live environment (use with caution)"
         )]
         force: bool,
+    },
+
+    /// SSH into a deployed host and verify it matches the expected post-install state
+    Verify {
+        #[arg(short = 'H', long, help = "Host IP or hostname to SSH into")]
+        host: String,
+
+        #[arg(short = 'n', long, help = "Expected hostname, e.g. len-serv-003")]
+        hostname: String,
+
+        #[arg(long, help = "Host IP with CIDR, e.g. 172.16.3.96/23")]
+        address: String,
+
+        #[arg(short, long, default_value = "jdfalk", help = "SSH username")]
+        username: String,
+
+        #[arg(long, help = "Exit with non-zero status if any check fails")]
+        strict: bool,
     },
 
     /// Render a subiquity autoinstall user-data from the proven template + per-host values
@@ -610,6 +628,59 @@ mod tests {
                 assert!(!force);
             }
             _ => panic!("Expected LocalInstall command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_verify_minimal() {
+        let args = vec![
+            "ubuntu-autoinstall-agent",
+            "verify",
+            "--host",
+            "172.16.3.96",
+            "--hostname",
+            "len-serv-003",
+            "--address",
+            "172.16.3.96/23",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Verify { host, hostname, address, username, strict } => {
+                assert_eq!(host, "172.16.3.96");
+                assert_eq!(hostname, "len-serv-003");
+                assert_eq!(address, "172.16.3.96/23");
+                assert_eq!(username, "jdfalk");
+                assert!(!strict);
+            }
+            _ => panic!("Expected Verify command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_verify_strict() {
+        let args = vec![
+            "ubuntu-autoinstall-agent",
+            "verify",
+            "--host",
+            "172.16.3.92",
+            "--hostname",
+            "len-serv-001",
+            "--address",
+            "172.16.3.92/23",
+            "--username",
+            "admin",
+            "--strict",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Commands::Verify { host, hostname, address, username, strict } => {
+                assert_eq!(host, "172.16.3.92");
+                assert_eq!(hostname, "len-serv-001");
+                assert_eq!(address, "172.16.3.92/23");
+                assert_eq!(username, "admin");
+                assert!(strict);
+            }
+            _ => panic!("Expected Verify command"),
         }
     }
 
