@@ -1,7 +1,7 @@
 // file: src/cli/args.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
-// last-edited: 2026-06-20
+// last-edited: 2026-06-21
 
 //! Command line argument definitions
 
@@ -170,6 +170,24 @@ pub enum Commands {
             help = "Force installation even when not in live environment (use with caution)"
         )]
         force: bool,
+    },
+
+    /// Render a subiquity autoinstall user-data from the proven template + per-host values
+    RenderUserData {
+        #[arg(short = 'n', long, help = "Target hostname, e.g. len-serv-003")]
+        hostname: String,
+
+        #[arg(long, help = "Host IP address with CIDR, e.g. 172.16.3.96/23")]
+        address: String,
+
+        #[arg(
+            long,
+            help = "Path to a custom template file (defaults to the embedded len-serv template)"
+        )]
+        template: Option<String>,
+
+        #[arg(long, help = "Write rendered user-data here (defaults to stdout)")]
+        output: Option<String>,
     },
 }
 
@@ -592,6 +610,42 @@ mod tests {
                 assert!(!force);
             }
             _ => panic!("Expected LocalInstall command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parsing_render_user_data() {
+        // Arrange
+        let args = vec![
+            "ubuntu-autoinstall-agent",
+            "render-user-data",
+            "--hostname",
+            "len-serv-003",
+            "--address",
+            "172.16.3.96/23",
+            "--template",
+            "/tmp/custom.tmpl",
+            "--output",
+            "/tmp/out.user-data",
+        ];
+
+        // Act
+        let cli = Cli::try_parse_from(args).unwrap();
+
+        // Assert
+        match cli.command {
+            Commands::RenderUserData {
+                hostname,
+                address,
+                template,
+                output,
+            } => {
+                assert_eq!(hostname, "len-serv-003");
+                assert_eq!(address, "172.16.3.96/23");
+                assert_eq!(template.as_deref(), Some("/tmp/custom.tmpl"));
+                assert_eq!(output.as_deref(), Some("/tmp/out.user-data"));
+            }
+            _ => panic!("Expected RenderUserData command"),
         }
     }
 }

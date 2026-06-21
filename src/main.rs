@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
-// last-edited: 2026-06-20
+// last-edited: 2026-06-21
 
 //! Ubuntu AutoInstall Agent - Main entry point
 
@@ -119,6 +119,20 @@ async fn main() -> Result<()> {
                     hold_on_failure,
                     pause_after_storage,
                     force,
+                )
+                .await
+            }
+            ubuntu_autoinstall_agent::cli::args::Commands::RenderUserData {
+                hostname,
+                address,
+                template,
+                output,
+            } => {
+                render_user_data_command(
+                    &hostname,
+                    &address,
+                    template.as_deref(),
+                    output.as_deref(),
                 )
                 .await
             }

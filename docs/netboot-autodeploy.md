@@ -1,7 +1,7 @@
 <!-- file: docs/netboot-autodeploy.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 9a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9 -->
-<!-- last-edited: 2026-06-20 -->
+<!-- last-edited: 2026-06-21 -->
 
 # Netboot Autodeploy — Source of Truth & Findings
 
@@ -220,6 +220,58 @@ Concrete starting points when picking this up:
 
 ---
 
+## Renderer (slice one — IMPLEMENTED)
+
+The first slice of the pivot is the **`render-user-data` subcommand**: a pure, data-driven
+renderer that reproduces the proven autoinstall `user-data` per host.
+
+```bash
+# Render to stdout using the embedded (len-serv-003) template:
+ubuntu-autoinstall-agent render-user-data --hostname len-serv-001 --address 172.16.3.92/23
+
+# Use a custom template, write to a file:
+ubuntu-autoinstall-agent render-user-data \
+  --hostname len-serv-002 --address 172.16.3.94/23 \
+  --template ./my-template.user-data.tmpl --output ./out.user-data
+```
+
+How it works:
+- **Template** = the hand-verified len-serv-003 `user-data`, with the per-host bits turned
+  into placeholders. Shipped embedded as the default (`src/autoinstall/templates/
+  len-serv.user-data.tmpl`, `include_str!`); override with `--template <file>`.
+- **Placeholders** (the only things that vary per host — proven by the 001/002/003 diff):
+
+  | Placeholder               | Meaning                          | Example                                   |
+  |---------------------------|----------------------------------|-------------------------------------------|
+  | `{{HOSTNAME}}`            | hostname (×5: identity, msgs, flip, variables) | `len-serv-003`              |
+  | `{{NET_ADDRESS}}`         | IP with CIDR                      | `172.16.3.96/23`                          |
+  | `{{COCKROACH_ADVERTISE}}` | `ip:36357` (derived from address) | `172.16.3.96:36357`                      |
+  | `{{COCKROACH_JOIN}}`      | server first, then other members | `172.16.2.30:36357,172.16.3.92:36357,...` |
+
+- **Cockroach join** is computed by `HostSpec::for_lenserv` (server `172.16.2.30` first,
+  then the other lenserv members excluding self, port `36357`). Members/server/port are
+  constants in `src/autoinstall/host_spec.rs` — edit there to change the fleet.
+- **Safety:** any unfilled `{{...}}` left after substitution is a hard error, so a broken
+  custom template fails loudly instead of shipping a literal placeholder to a machine.
+- **Golden tests** (`src/autoinstall/render.rs`) assert the rendered output is
+  **byte-identical** to `tests/fixtures/golden/len-serv-00{1,2,3}.user-data` (pulled
+  verbatim from the server). This makes silent drift from the known-good impossible.
+
+To change what gets deployed, **edit the template** (or supply your own with `--template`),
+not the Rust. The template is the source of truth.
+
+### Still TODO (later slices)
+- **`verify <host>`** — SSH in and validate a deployed host matches intent (crypto_LUKS,
+  `clevis luks list`, dracut `rd.neednet`, crypttab, services).
+- **Placement & drive** — write the seed into the netboot tree
+  (`/var/www/html/cloud-init/<hexmac>/` + meta-data + `ipxe/boot/mac-*.ipxe`) and flip +
+  reboot (local / remote / "last steps" modes).
+- **Retire `register-gen.py`** once placement/drive lands (it is stale — see above — and is
+  being replaced, not backported to).
+- **arm64 / RPi template variant** (likely another `--template` + a tang HostSpec variant).
+
+---
+
 ## RPi / arm64 — NOT DONE (needs user input)
 
 There are **no rpiserv netboot configs** on the server yet — only the 3 lenservs are
@@ -228,11 +280,20 @@ documented way to create an arm64 host config is:
 ```bash
 bash /var/www/html/cloud-init/scripts/register-len-server.sh <hostname> <mac> <ip> arm64
 ```
-To bring rpiservs onto this system, we need their **MACs and target IPs**. The RPis are
-currently the **Tang servers** (172.16.2.45/.46/.47) and are typically SD-card based, so
-confirm intent before netboot-reinstalling them (reinstalling a Tang server breaks the
-t=2-of-3 unlock for everything until it's re-set-up — see tang-cold-start.sh / tang
-backup-restore scripts on the server).
+To bring rpiservs onto this system, we need their **MACs and target IPs**.
+
+RPi facts (confirmed by user 2026-06-21):
+- The RPis are the **Tang servers** (172.16.2.45/.46/.47) and **run off NVMe drives**
+  (NOT SD card).
+- **All three Tang servers mutually authenticate / depend on each other** — unlocking
+  any one requires the other two to be up (t=2-of-3 across the set). This is a
+  cold-start constraint: never reinstall more than one at a time, and ensure the other
+  two are healthy first. See `tang-cold-start.sh` / `tang-backup.sh` / `tang-restore.sh`
+  on the server.
+- **Intent:** a future **arm64 config for RPis** modeled on the lenserv flow (likely a
+  `--template` variant for the renderer). Current RPis should have **Tang key backups
+  shipped to the server** (verify `tang-backup.sh` is scheduled / has run). Not an
+  immediate task — revisit during/after the tool pivot.
 
 ---
 
