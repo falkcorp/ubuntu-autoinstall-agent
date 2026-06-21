@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-06-20
 
@@ -91,12 +91,16 @@ impl InstallationConfig {
             timezone: "America/New_York".to_string(),
             luks_key: "changeme123!@#".to_string(),
             root_password: "changeme123!@#".to_string(),
-            network_interface: "eno1".to_string(),
+            network_interface: "enp1s0f0".to_string(),
             network_address: "172.16.3.96/23".to_string(),
             network_gateway: "172.16.2.1".to_string(),
-            network_search: "local.jdfalk.com".to_string(),
-            network_nameservers: vec!["172.16.2.1".to_string(), "8.8.8.8".to_string()],
-            debootstrap_release: Some("plucky".to_string()),
+            network_search: "jf.local".to_string(),
+            network_nameservers: vec![
+                "172.16.2.1".to_string(),
+                "1.1.1.1".to_string(),
+                "8.8.8.8".to_string(),
+            ],
+            debootstrap_release: Some("resolute".to_string()),
             debootstrap_mirror: Some("http://archive.ubuntu.com/ubuntu/".to_string()),
             initramfs_type: InitramfsType::Dracut,
             tang_servers: vec![
@@ -111,7 +115,11 @@ impl InstallationConfig {
                 },
             ],
             tang_threshold: 2,
-            ssh_authorized_keys: vec![],
+            ssh_authorized_keys: vec![
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan".to_string(),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local".to_string(),
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820".to_string(),
+            ],
         }
     }
 }
@@ -166,6 +174,6 @@ mod tests {
     fn test_for_len_serv_003_network() {
         let cfg = InstallationConfig::for_len_serv_003();
         assert_eq!(cfg.network_address, "172.16.3.96/23");
-        assert_eq!(cfg.network_interface, "eno1");
+        assert_eq!(cfg.network_interface, "enp1s0f0");
     }
 }
