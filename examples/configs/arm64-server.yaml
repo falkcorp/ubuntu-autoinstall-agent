@@ -1,38 +1,31 @@
 # file: examples/configs/arm64-server.yaml
-# version: 1.0.0
+# version: 2.0.0
 # guid: e5f6g7h8-i9j0-1234-5678-901234efghij
+# last-edited: 2026-06-20
 
-# ARM64 server configuration example
 hostname: arm64-server-001
-architecture: arm64
 disk_device: /dev/mmcblk0
 timezone: America/New_York
 
-network:
-  interface: eth0
-  dhcp: false
-  ip_address: 192.168.1.100/24
-  gateway: 192.168.1.1
-  dns_servers:
-    - 192.168.1.1
-    - 8.8.8.8
+luks_key: "change-me"
+root_password: "change-me"
 
-users:
-  - name: pi
-    sudo: true
-    shell: /bin/bash
-    ssh_keys:
-      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIArmKeyExample"
+network_interface: eth0
+network_address: "192.168.1.10/24"
+network_gateway: "192.168.1.1"
+network_search: local
+network_nameservers:
+  - "192.168.1.1"
+  - "1.1.1.1"
+  - "8.8.8.8"
 
-luks_config:
-  passphrase: "${LUKS_PASSPHRASE}"
-  cipher: aes-xts-plain64
-  key_size: 256
-  hash: sha256
+debootstrap_release: resolute
+debootstrap_mirror: "http://archive.ubuntu.com/ubuntu/"
 
-packages:
-  - openssh-server
-  - htop
-  - curl
-  - wget
-  - vim
+initramfs_type: dracut
+
+tang_servers: []
+tang_threshold: 2
+
+ssh_authorized_keys:
+  - "ssh-ed25519 AAAA... your-key-here"

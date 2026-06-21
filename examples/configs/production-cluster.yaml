@@ -1,55 +1,34 @@
 # file: examples/configs/production-cluster.yaml
-# version: 1.0.0
+# version: 2.0.0
 # guid: m8n9o0p1-q2r3-4567-8901-234567mnopqr
+# last-edited: 2026-06-20
 
-# Production cluster node configuration
-hostname: production-node-01
-ip_address: 10.1.1.100
-netmask: 255.255.255.0
-gateway: 10.1.1.1
-dns_servers:
-  - 8.8.8.8
-  - 8.8.4.4
+hostname: prod-node-001
+disk_device: /dev/nvme0n1
+timezone: UTC
 
-# Production-grade encryption
-luks_config:
-  cipher: aes-xts-plain64
-  key_size: 512
-  hash: sha256
-  pbkdf_iterations: 4000
+luks_key: "change-me"
+root_password: "change-me"
 
-# Admin user for production
-user_config:
-  username: admin
-  full_name: Production Administrator
-  groups:
-    - sudo
-    - docker
-    - adm
-  ssh_key: ${PRODUCTION_SSH_KEY}
+network_interface: enp1s0f0
+network_address: "10.1.1.100/24"
+network_gateway: "10.1.1.1"
+network_search: cluster.internal
+network_nameservers:
+  - "10.1.1.1"
+  - "1.1.1.1"
+  - "8.8.8.8"
 
-# Production package set
-packages:
-  - openssh-server
-  - docker.io
-  - nginx
-  - fail2ban
-  - ufw
-  - htop
-  - vim
-  - curl
-  - wget
-  - monitoring-agent
+debootstrap_release: resolute
+debootstrap_mirror: "http://archive.ubuntu.com/ubuntu/"
 
-# Security hardening
-security:
-  disable_password_auth: true
-  enable_firewall: true
-  fail2ban_enabled: true
-  auto_updates: true
+initramfs_type: dracut
 
-# Production post-install
-post_install_scripts:
-  - production-security.sh
-  - monitoring-setup.sh
-  - backup-config.sh
+tang_servers:
+  - url: "http://tang1.cluster.internal"
+  - url: "http://tang2.cluster.internal"
+  - url: "http://tang3.cluster.internal"
+tang_threshold: 2
+
+ssh_authorized_keys:
+  - "ssh-ed25519 AAAA... admin@management"
