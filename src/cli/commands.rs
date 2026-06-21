@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-06-21
 
@@ -638,6 +638,68 @@ fn prompt_for_root_password() -> Result<String> {
         .map_err(crate::error::AutoInstallError::IoError)?;
 
     Ok(password.trim().to_string())
+}
+
+/// Write the rendered seed into the netboot server's cloud-init tree, then
+/// optionally flip the boot target and/or reboot the target host.
+pub async fn place_command(
+    hostname: &str,
+    address: &str,
+    server: &str,
+    server_user: &str,
+    template: Option<&str>,
+    flip: bool,
+    reboot: bool,
+    target_user: &str,
+    dry_run: bool,
+) -> Result<()> {
+    use crate::autoinstall::{
+        host_spec::HostSpec,
+        place::{place_and_drive, PlaceOpts},
+    };
+    use crate::network::SshClient;
+
+    let spec = HostSpec::for_lenserv(hostname, address);
+
+    // Connect to netboot server (always needed, even for dry-run, to resolve hexmac)
+    let mut server_conn = SshClient::new();
+    server_conn.connect(server, server_user).await?;
+
+    // Connect to target host only when a reboot is requested
+    let mut target_opt: Option<SshClient> = None;
+    if reboot && !dry_run {
+        let ip = HostSpec::ip_without_cidr(address).to_string();
+        let mut t = SshClient::new();
+        t.connect(&ip, target_user).await?;
+        target_opt = Some(t);
+    }
+
+    let opts = PlaceOpts {
+        netboot_server: server,
+        template,
+        flip,
+        reboot,
+        dry_run,
+    };
+
+    let report = place_and_drive(
+        &mut server_conn,
+        target_opt.as_mut().map(|t| t as &mut dyn crate::network::executor::CommandExecutor),
+        &spec,
+        &opts,
+    )
+    .await?;
+
+    report.print();
+
+    if !report.dry_run {
+        info!(
+            "Seed written for {} → hexmac {}",
+            hostname, report.hexmac
+        );
+    }
+
+    Ok(())
 }
 
 /// SSH into a deployed host and verify post-install state against the spec.
