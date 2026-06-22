@@ -95,6 +95,27 @@ mod tests {
     }
 
     #[test]
+    fn regen_golden_fixtures() {
+        // Run with REGEN_GOLDEN=1 to overwrite the golden files.
+        if std::env::var("REGEN_GOLDEN").as_deref() != Ok("1") {
+            return;
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let golden_dir = root.join("tests/fixtures/golden");
+        for (hostname, addr) in [
+            ("len-serv-001", "172.16.3.92/23"),
+            ("len-serv-002", "172.16.3.94/23"),
+            ("len-serv-003", "172.16.3.96/23"),
+        ] {
+            let spec = HostSpec::for_lenserv(hostname, addr);
+            let out = render_user_data(default_template(), &spec).unwrap();
+            let path = golden_dir.join(format!("{hostname}.user-data"));
+            std::fs::write(&path, &out).unwrap();
+            println!("wrote {}", path.display());
+        }
+    }
+
+    #[test]
     fn unfilled_placeholder_is_an_error() {
         let custom = "hostname: {{HOSTNAME}}\nmystery: {{NOT_A_REAL_FIELD}}\n";
         let spec = HostSpec::for_lenserv("x", "10.0.0.1/24");

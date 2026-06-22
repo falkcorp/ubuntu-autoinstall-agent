@@ -114,17 +114,17 @@ autoinstall:
       su - jdfalk -s /bin/sh -c 'sh /tmp/ohmyzsh-install.sh'
 
       # --- Dotfiles (public-scratch) ---
-      # Clone falkcorp/public-scratch and wire up server.zsh.inc so all servers
+      # Clone jdfalk/public-scratch and wire up server.zsh.inc so all servers
       # share the same shell config (PAGER=cat, aliases, etc.).
       su - jdfalk -s /bin/sh -c '
-        mkdir -p $HOME/repos/github.com/falkcorp
-        git clone https://github.com/falkcorp/public-scratch.git \
-          $HOME/repos/github.com/falkcorp/public-scratch 2>/dev/null || \
-          git -C $HOME/repos/github.com/falkcorp/public-scratch pull --ff-only
+        mkdir -p $HOME/repos/github.com/jdfalk
+        git clone https://github.com/jdfalk/public-scratch.git \
+          $HOME/repos/github.com/jdfalk/public-scratch 2>/dev/null || \
+          git -C $HOME/repos/github.com/jdfalk/public-scratch pull --ff-only
         grep -qF "server.zsh.inc" $HOME/.zshrc 2>/dev/null || cat >> $HOME/.zshrc << '"'"'ZSHEOF'"'"'
 
-# --- falkcorp/public-scratch server config ---
-SCRATCH="$HOME/repos/github.com/falkcorp/public-scratch"
+# --- jdfalk/public-scratch server config ---
+SCRATCH="$HOME/repos/github.com/jdfalk/public-scratch"
 [ -f "$SCRATCH/server.zsh.inc" ] && source "$SCRATCH/server.zsh.inc"
 ZSHEOF
       '

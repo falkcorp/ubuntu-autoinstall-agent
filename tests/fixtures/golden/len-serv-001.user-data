@@ -113,6 +113,22 @@ autoinstall:
         -o /tmp/ohmyzsh-install.sh
       su - jdfalk -s /bin/sh -c 'sh /tmp/ohmyzsh-install.sh'
 
+      # --- Dotfiles (public-scratch) ---
+      # Clone jdfalk/public-scratch and wire up server.zsh.inc so all servers
+      # share the same shell config (PAGER=cat, aliases, etc.).
+      su - jdfalk -s /bin/sh -c '
+        mkdir -p $HOME/repos/github.com/jdfalk
+        git clone https://github.com/jdfalk/public-scratch.git \
+          $HOME/repos/github.com/jdfalk/public-scratch 2>/dev/null || \
+          git -C $HOME/repos/github.com/jdfalk/public-scratch pull --ff-only
+        grep -qF "server.zsh.inc" $HOME/.zshrc 2>/dev/null || cat >> $HOME/.zshrc << '"'"'ZSHEOF'"'"'
+
+# --- jdfalk/public-scratch server config ---
+SCRATCH="$HOME/repos/github.com/jdfalk/public-scratch"
+[ -f "$SCRATCH/server.zsh.inc" ] && source "$SCRATCH/server.zsh.inc"
+ZSHEOF
+      '
+
       # --- Timezone / hosts / rsyslog ---
       ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
       echo 'America/New_York' > /etc/timezone
