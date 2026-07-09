@@ -1,6 +1,7 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
+// last-edited: 2026-07-09
 
 //! ZFS operations for SSH installation
 
@@ -155,11 +156,19 @@ impl<'a> ZfsManager<'a> {
         )
     }
 
-    /// Build the zpool create command for bpool (grub-compatible)
+    /// Build the zpool create command for bpool (GRUB-readable).
+    ///
+    /// `compatibility=grub2` MUST be the sole feature control: it restricts the
+    /// pool to the feature set GRUB's zfs reader understands. Do NOT also pass
+    /// explicit `-o feature@...=enabled` flags — mixing them with
+    /// `compatibility=` defeats the restriction and the pool comes up with modern
+    /// features (block_cloning, log_spacemap, zilsaxattr, livelist, …) that make
+    /// GRUB fail with "unknown filesystem" at grub-install time. Matches Ubuntu's
+    /// own bpool creation.
     fn build_bpool_create_command(disk: &str) -> String {
         format!(
             "zpool create -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
-             -o compatibility=grub2 -o feature@livelist=enabled -o feature@zpool_checkpoint=enabled \
+             -o compatibility=grub2 \
              -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
              -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
              -m none -R /mnt/targetos bpool {}p3",
