@@ -40,9 +40,30 @@ Reuse the already-proven ZFS+LUKS recipe in `src/network/ssh_installer/{disk_ops
 
 ---
 
-## KEY DECISION (needs your approval before code)
+## DECISION (2026-07-09): Option 2 — custom installer image, iPXE-triggered
 
-Two ways to make the autoinstall emit ZFS-on-LUKS. **Pick one:**
+**Chosen:** a purpose-built installer image (not subiquity). iPXE boots a custom
+kernel/initrd/rootfs and passes kernel boot options (e.g. `uaa.config=<url>`) that
+point the image at its per-host config; the image auto-starts the agent, which runs
+the full ZFS-on-LUKS install, then powers off / reboots. No subiquity, no curtin —
+a single install path.
+
+Boot-time flow:
+1. PXE → iPXE serves the custom installer kernel+initrd+rootfs with a cmdline that
+   carries the per-host config URL.
+2. A boot-time `uaa-autoinstall.service` in the image reads `uaa.config=` from
+   `/proc/cmdline`, fetches the YAML, runs `uaa install --config`, reports status,
+   then powers off (loop-safe) or reboots.
+3. Next boot → local disk → first-boot TPM2 enrollment → done.
+
+Open sub-decision — HOW to build the image (see AskUserQuestion): (a) overlay the
+Ubuntu 26.04 live-server squashfs already extracted on the server with the static
+agent + a systemd unit; (b) build a minimal image from scratch (mkosi/debootstrap)
+carrying agent + debootstrap/zfs/cryptsetup/gdisk/clevis/tpm2 tools; (c) extend the
+existing `src/image/builder` machinery + `create-image` command.
+
+Superseded (kept for reference): the two ways below.
+
 
 ### Option A — Drive the proven imperative installer from the netboot live env  ⭐ recommended
 `ssh_installer` (Path B) already does a full ZFS-on-LUKS install end-to-end (`sgdisk` →
@@ -65,7 +86,22 @@ Replace `layout: name: lvm` with a hand-written curtin storage-v2 block (ESP + b
 
 ---
 
-## Affected files (Option A)
+## Affected files (Option 2 — custom installer image)
+
+- `installer-image/uaa-autoinstall.sh` — boot-time wrapper: parse `uaa.config=` from
+  /proc/cmdline, fetch per-host YAML, run `uaa install --config`, report, poweroff (loop-safe). ✅ done
+- `installer-image/uaa-autoinstall.service` — oneshot unit gated on
+  `ConditionKernelCommandLine=uaa.autoinstall`; conflicts with subiquity. ✅ done
+- `scripts/build-installer-image.sh` — overlay the 26.04 live-server squashfs with the
+  static agent + service, mask stock installer autostart, re-squash. ✅ done (2 VERIFY-ON-VM markers)
+- Per-host config: `examples/configs/<host>.yaml` served from
+  `172.16.2.30/cloud-init/<host>.yaml` (the `uaa.config=` target). Add len-serv-00{1,2,3} + unimatrixone.
+- Server iPXE per-MAC files: add `uaa.autoinstall uaa.config=<url>` + point at the overlaid squashfs.
+  (Server-side; do during VM/first-host bring-up.)
+- The old subiquity template (`len-serv.user-data.tmpl`) + host_spec/render/goldens become dead for
+  installs (kept only if a subiquity fallback is still wanted) — verify.rs stays (post-install checks).
+
+### Superseded plan (Option A internals — kept for reference)
 
 ### Rust — installer core
 - `src/network/ssh_installer/system_setup.rs` — add `enroll_tpm2_pin_clevis` (clevis tpm2 w/ PIN)

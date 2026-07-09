@@ -1,0 +1,27 @@
+# file: installer-image/uaa-autoinstall.service
+# version: 1.0.0
+# guid: 7c1a9e44-2b58-4d90-8f6c-3e2b7a10d955
+# last-edited: 2026-07-09
+#
+# Boot-time automation unit for the custom ZFS-on-LUKS installer image (Option 2).
+# Only fires when the kernel cmdline carries `uaa.autoinstall`, so the same overlaid
+# squashfs is inert on a normal boot. Installed + enabled by build-installer-image.sh.
+
+[Unit]
+Description=UAA automated ZFS-on-LUKS install (boot-time)
+Documentation=https://github.com/jdfalk/ubuntu-autoinstall-agent
+ConditionKernelCommandLine=uaa.autoinstall
+After=network-online.target
+Wants=network-online.target
+# Do not let the stock Ubuntu live installer race us.
+Conflicts=subiquity-server.service snapd.seeded.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/uaa-autoinstall.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
