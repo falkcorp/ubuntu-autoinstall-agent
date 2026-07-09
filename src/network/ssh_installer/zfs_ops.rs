@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -151,27 +151,28 @@ impl<'a> ZfsManager<'a> {
         String::from(
             "zpool create -o ashift=12 -o autotrim=on \
              -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
-             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
-             -m none -R /mnt/targetos rpool /dev/mapper/luks",
+             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=/ \
+             -R /mnt/targetos rpool /dev/mapper/luks",
         )
     }
 
-    /// Build the zpool create command for bpool (GRUB-readable).
+    /// Build the zpool create command for bpool — VERBATIM from the OpenZFS
+    /// "Ubuntu Root on ZFS" HOWTO (the known-good GRUB-bootable layout).
     ///
-    /// `compatibility=grub2` MUST be the sole feature control: it restricts the
-    /// pool to the feature set GRUB's zfs reader understands. Do NOT also pass
-    /// explicit `-o feature@...=enabled` flags — mixing them with
-    /// `compatibility=` defeats the restriction and the pool comes up with modern
-    /// features (block_cloning, log_spacemap, zilsaxattr, livelist, …) that make
-    /// GRUB fail with "unknown filesystem" at grub-install time. Matches Ubuntu's
-    /// own bpool creation.
+    /// Two things are load-bearing and were previously wrong:
+    /// - The pool root carries `-O mountpoint=/boot` (with `canmount=off`), NOT
+    ///   `mountpoint=none`. With `none`, `grub-probe /boot` mis-resolves the boot
+    ///   device to the rpool/LUKS mapper and grub-install dies "unknown
+    ///   filesystem"; with `/boot` it resolves the bpool vdev correctly.
+    /// - `compatibility=grub2` PLUS `feature@livelist`/`feature@zpool_checkpoint`
+    ///   (which modern GRUB supports) — the HOWTO enables both explicitly.
     fn build_bpool_create_command(disk: &str) -> String {
         format!(
             "zpool create -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
-             -o compatibility=grub2 \
+             -o compatibility=grub2 -o feature@livelist=enabled -o feature@zpool_checkpoint=enabled \
              -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
-             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
-             -m none -R /mnt/targetos bpool {}p3",
+             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=/boot \
+             -R /mnt/targetos bpool {}p3",
             disk
         )
     }
