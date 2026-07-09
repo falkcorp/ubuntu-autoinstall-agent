@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-06-20
+// last-edited: 2026-07-09
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -91,7 +91,7 @@ impl<'a> SystemConfigurator<'a> {
         )
         .await?;
 
-        let release = config.debootstrap_release.as_deref().unwrap_or("plucky");
+        let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
         let mirror = config
             .debootstrap_mirror
             .as_deref()
@@ -150,7 +150,7 @@ impl<'a> SystemConfigurator<'a> {
             ))
             .await?;
 
-        let release = config.debootstrap_release.as_deref().unwrap_or("plucky");
+        let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
         let ubuntu_sources = Self::build_apt_deb822_sources(release);
         self.runner
             .execute("mkdir -p /mnt/targetos/etc/apt/sources.list.d")
@@ -529,9 +529,21 @@ impl<'a> SystemConfigurator<'a> {
             crypttab_entry
         )).await;
 
+        // Ensure the initramfs carries BOTH unlock subsystems before any regen:
+        //   - clevis  → Tang (network) unlock
+        //   - crypt/tpm2/fido2 → systemd-cryptenroll TPM2+PIN and YubiKey keyslots
+        self.configure_dracut_crypt_modules(config).await?;
+
         // Enroll Tang servers via Clevis SSS when configured
         if !config.tang_servers.is_empty() {
             self.enroll_tang_clevis(config, &part).await?;
+        }
+
+        // Stage TPM2+PIN enrollment for first boot (binds the *installed*
+        // system's PCRs, which the live installer cannot produce). FIDO2/YubiKey
+        // is enrolled manually post-install via register-fido2-luks.sh.
+        if config.enroll_tpm2 && config.tpm2_pin.as_deref().is_some_and(|p| !p.is_empty()) {
+            self.setup_tpm2_firstboot_enrollment(config, if uuid.is_empty() { None } else { Some(uuid) }).await?;
         }
 
         // Regenerate initramfs after crypttab + Tang enrollment
@@ -628,6 +640,130 @@ impl<'a> SystemConfigurator<'a> {
         } else {
             info!("Tang/Clevis SSS enrollment complete");
         }
+
+        Ok(())
+    }
+
+    /// Build the `/etc/dracut.conf.d` fragment that pulls both LUKS unlock
+    /// subsystems into the initramfs.
+    ///
+    /// - `clevis`  satisfies the Tang (network) keyslot.
+    /// - `crypt` + `tpm2-tss` + the cryptsetup token plugins let
+    ///   systemd-cryptsetup satisfy the TPM2+PIN and FIDO2/YubiKey keyslots at
+    ///   the boot prompt.
+    ///
+    /// NOTE: the exact module/plugin set is confirmed on the QEMU+swtpm VM
+    /// before any real host is installed (see PLAN test strategy).
+    fn build_dracut_crypt_conf(include_clevis: bool) -> String {
+        let clevis = if include_clevis { " clevis" } else { "" };
+        format!(
+            "# Managed by ubuntu-autoinstall-agent — do not edit by hand.\n\
+             # Both LUKS unlock subsystems must live in the initramfs so any\n\
+             # enrolled keyslot can be satisfied at the boot prompt:\n\
+             #   clevis    -> Tang (network) unlock\n\
+             #   crypt/tpm2/fido2 -> systemd-cryptsetup for TPM2+PIN and YubiKey\n\
+             add_dracutmodules+=\" crypt tpm2-tss{clevis} \"\n\
+             # cryptsetup token plugins + libfido2 so TPM2/FIDO2 slots resolve in initrd\n\
+             install_optional_items+=\" /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-tpm2.so /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-fido2.so /usr/lib/*/libfido2.so* \"\n"
+        )
+    }
+
+    /// Write the dracut crypt-module config into the target.
+    async fn configure_dracut_crypt_modules(&mut self, config: &InstallationConfig) -> Result<()> {
+        if config.initramfs_type != InitramfsType::Dracut {
+            return Ok(());
+        }
+        info!("Configuring dracut modules for clevis + systemd-cryptsetup (TPM2/FIDO2)");
+        let conf = Self::build_dracut_crypt_conf(!config.tang_servers.is_empty());
+        let cmd = format!(
+            "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
+            conf
+        );
+        let _ = self.log_and_execute("Write dracut crypt-module config", &cmd).await;
+        Ok(())
+    }
+
+    /// Build the EnvironmentFile seed consumed by the first-boot TPM2 unit.
+    /// `systemd-cryptenroll` reads `$PASSWORD` (existing) and `$NEWPIN` (new PIN)
+    /// from the environment automatically.
+    fn build_tpm2_enroll_seed(password: &str, pin: &str, pcr_ids: &str, luksdev: &str) -> String {
+        // Quoted-heredoc delivery means no shell interpolation, so raw values are
+        // safe here. systemd EnvironmentFile treats the rest of the line as the
+        // value; wrap in double quotes so a value with spaces is preserved.
+        format!(
+            "# Managed by ubuntu-autoinstall-agent — first-boot TPM2 enrollment.\n\
+             # 0600, shredded by the unit after a successful enrollment.\n\
+             PASSWORD=\"{password}\"\n\
+             NEWPIN=\"{pin}\"\n\
+             PCRS=\"{pcr_ids}\"\n\
+             LUKSDEV=\"{luksdev}\"\n"
+        )
+    }
+
+    /// Build the one-shot, self-removing systemd unit that enrolls the TPM2+PIN
+    /// keyslot on first boot (binding the *installed* system's real PCRs).
+    fn build_tpm2_enroll_unit() -> String {
+        "# Managed by ubuntu-autoinstall-agent — one-shot, self-removing.\n\
+         [Unit]\n\
+         Description=First-boot TPM2+PIN LUKS enrollment\n\
+         After=local-fs.target\n\
+         ConditionPathExists=/etc/uaa-tpm2-enroll.env\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         EnvironmentFile=/etc/uaa-tpm2-enroll.env\n\
+         ExecStart=/usr/bin/systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=yes --tpm2-pcrs=${PCRS} ${LUKSDEV}\n\
+         ExecStartPost=/usr/bin/systemctl disable uaa-tpm2-enroll.service\n\
+         ExecStartPost=-/bin/sh -c 'command -v shred >/dev/null && shred -u /etc/uaa-tpm2-enroll.env || rm -f /etc/uaa-tpm2-enroll.env'\n\
+         ExecStartPost=-/bin/rm -f /etc/systemd/system/uaa-tpm2-enroll.service\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+            .to_string()
+    }
+
+    /// Stage first-boot TPM2+PIN enrollment: write the secret seed (0600) and the
+    /// one-shot unit into the target, then enable it. The unit shreds the seed
+    /// and deletes itself after the first successful run.
+    async fn setup_tpm2_firstboot_enrollment(
+        &mut self,
+        config: &InstallationConfig,
+        uuid_opt: Option<&str>,
+    ) -> Result<()> {
+        let pin = match config.tpm2_pin.as_deref() {
+            Some(p) if !p.is_empty() => p,
+            _ => return Ok(()),
+        };
+        info!("Staging first-boot TPM2+PIN LUKS enrollment (self-removing unit)");
+
+        let luksdev = match uuid_opt {
+            Some(u) if !u.trim().is_empty() => format!("/dev/disk/by-uuid/{}", u.trim()),
+            _ => format!("{}p4", config.disk_device),
+        };
+
+        // Seed contains the passphrase + PIN — write via unlogged execute + a
+        // quoted heredoc so the secrets are neither logged nor interpolated.
+        let seed = Self::build_tpm2_enroll_seed(&config.luks_key, pin, &config.tpm2_pcr_ids, &luksdev);
+        let write_seed = format!(
+            "install -m 0600 /dev/null /mnt/targetos/etc/uaa-tpm2-enroll.env && cat > /mnt/targetos/etc/uaa-tpm2-enroll.env <<'UAA_TPM2_SEED_EOF'\n{}UAA_TPM2_SEED_EOF",
+            seed
+        );
+        if let Err(e) = self.runner.execute(&write_seed).await {
+            warn!("TPM2 enrollment: could not write seed ({}); skipping TPM2 slot", e);
+            return Ok(());
+        }
+
+        // Unit body has no secrets — safe to log.
+        let unit = Self::build_tpm2_enroll_unit();
+        let write_unit = format!(
+            "cat > /mnt/targetos/etc/systemd/system/uaa-tpm2-enroll.service <<'UAA_TPM2_UNIT_EOF'\n{}UAA_TPM2_UNIT_EOF",
+            unit
+        );
+        let _ = self.log_and_execute("Write first-boot TPM2 enrollment unit", &write_unit).await;
+        let _ = self.log_and_execute(
+            "Enable first-boot TPM2 enrollment unit",
+            "chroot /mnt/targetos bash -lc 'systemctl enable uaa-tpm2-enroll.service'",
+        ).await;
 
         Ok(())
     }
@@ -751,5 +887,70 @@ mod tests {
     fn test_build_crypttab_entry_with_empty_uuid() {
         let e = SystemConfigurator::build_crypttab_entry("/dev/sda", Some("  "));
         assert_eq!(e, "luks /dev/sdap4 none luks,discard,initramfs");
+    }
+
+    /// Extract the enabled dracut module list (the value of `add_dracutmodules+=`).
+    fn dracut_modules_line(conf: &str) -> String {
+        conf.lines()
+            .find(|l| l.trim_start().starts_with("add_dracutmodules+="))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn test_dracut_crypt_conf_includes_both_subsystems() {
+        let conf = SystemConfigurator::build_dracut_crypt_conf(true);
+        let modules = dracut_modules_line(&conf);
+        // Both unlock subsystems must be enabled in the initramfs module list.
+        assert!(modules.contains("clevis"), "Tang unlock (clevis) missing: {modules}");
+        assert!(modules.contains("crypt"), "systemd-cryptsetup (crypt) missing: {modules}");
+        assert!(modules.contains("tpm2-tss"), "TPM2 support missing: {modules}");
+        // FIDO2 token plugin is pulled via install_optional_items, not a module.
+        assert!(
+            conf.contains("libcryptsetup-token-systemd-fido2.so"),
+            "FIDO2 token plugin missing"
+        );
+    }
+
+    #[test]
+    fn test_dracut_crypt_conf_omits_clevis_module_without_tang() {
+        let conf = SystemConfigurator::build_dracut_crypt_conf(false);
+        let modules = dracut_modules_line(&conf);
+        assert!(
+            !modules.contains("clevis"),
+            "clevis module should be absent with no Tang servers: {modules}"
+        );
+        // TPM2/FIDO2 support still present for the non-Tang keyslots.
+        assert!(modules.contains("crypt"));
+        assert!(modules.contains("tpm2-tss"));
+    }
+
+    #[test]
+    fn test_tpm2_enroll_seed_carries_password_pin_and_device() {
+        let seed = SystemConfigurator::build_tpm2_enroll_seed(
+            "s3cret pass",
+            "1234",
+            "7",
+            "/dev/disk/by-uuid/abcd-1234",
+        );
+        // systemd-cryptenroll reads $PASSWORD (existing) and $NEWPIN (new pin).
+        assert!(seed.contains("PASSWORD=\"s3cret pass\""));
+        assert!(seed.contains("NEWPIN=\"1234\""));
+        assert!(seed.contains("PCRS=\"7\""));
+        assert!(seed.contains("LUKSDEV=\"/dev/disk/by-uuid/abcd-1234\""));
+    }
+
+    #[test]
+    fn test_tpm2_enroll_unit_is_oneshot_and_self_removing() {
+        let unit = SystemConfigurator::build_tpm2_enroll_unit();
+        assert!(unit.contains("Type=oneshot"));
+        assert!(unit.contains("--tpm2-with-pin=yes"));
+        assert!(unit.contains("--tpm2-pcrs=${PCRS}"));
+        assert!(unit.contains("ConditionPathExists=/etc/uaa-tpm2-enroll.env"));
+        // Must disable itself and shred the secret seed after first run.
+        assert!(unit.contains("systemctl disable uaa-tpm2-enroll.service"));
+        assert!(unit.contains("shred -u /etc/uaa-tpm2-enroll.env"));
+        assert!(unit.contains("rm -f /etc/systemd/system/uaa-tpm2-enroll.service"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 }

@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-06-20
+// last-edited: 2026-07-09
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -244,7 +244,7 @@ impl SshInstaller {
             ));
         }
 
-        let release = config.debootstrap_release.as_deref().unwrap_or("plucky");
+        let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
         let mirror = config
             .debootstrap_mirror
             .as_deref()
@@ -525,7 +525,7 @@ impl Default for SshInstaller {
 /// Used by pause-after-storage and tests.
 pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> Vec<String> {
     let esp_part = format!("{}p1", config.disk_device);
-    let release = config.debootstrap_release.as_deref().unwrap_or("plucky");
+    let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
     vec![
         "mkdir -p /mnt/targetos/boot/efi".to_string(),
         format!("mount {} /mnt/targetos/boot/efi", esp_part),
@@ -557,7 +557,9 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         format!("bash -lc 'ESP_UUID=$(blkid -s UUID -o value {e} 2>/dev/null || true); if [ -n \"$ESP_UUID\" ]; then echo \"UUID=$ESP_UUID /boot/efi vfat umask=0077 0 1\" >> /mnt/targetos/etc/fstab; fi'", e=esp_part),
         "chroot /mnt/targetos bash -lc '[ -d /sys/firmware/efi/efivars ] || mkdir -p /sys/firmware/efi/efivars; mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true'".to_string(),
         "chroot /mnt/targetos bash -lc 'apt update'".to_string(),
-        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-initramfs zfsutils-linux efibootmgr cryptsetup dosfstools clevis clevis-tang clevis-luks clevis-dracut'".to_string(),
+        // TPM2+PIN and FIDO2/YubiKey keyslots are unlocked by systemd-cryptsetup,
+        // so the target needs the tpm2 stack + libfido2 alongside the clevis/Tang set.
+        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-initramfs zfsutils-linux efibootmgr cryptsetup dosfstools clevis clevis-tang clevis-luks clevis-dracut clevis-tpm2 tpm2-tools libtss2-tcti-device0 libfido2-1'".to_string(),
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
         format!("bash -lc 'UUID=$(blkid -s UUID -o value {d}p4 2>/dev/null || true); DEV=\"{d}p4\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'", d=config.disk_device),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),
@@ -590,6 +592,10 @@ mod tests {
             tang_servers: vec![],
             tang_threshold: 2,
             ssh_authorized_keys: vec![],
+            enroll_tpm2: true,
+            tpm2_pin: None,
+            tpm2_pcr_ids: "7".into(),
+            expect_fido2: true,
         }
     }
 
@@ -597,7 +603,7 @@ mod tests {
     fn test_build_next_commands_contains_core_steps() {
         let cfg = sample_config();
         let cmds = build_next_commands_after_storage(&cfg);
-        assert!(cmds.iter().any(|c| c.contains("debootstrap plucky")));
+        assert!(cmds.iter().any(|c| c.contains("debootstrap resolute")));
         assert!(cmds.iter().any(|c| c.contains("dracut --regenerate-all")));
         assert!(cmds.iter().any(|c| c.contains("grub-install")));
         assert!(cmds.iter().any(|c| c.contains("update-grub")));
