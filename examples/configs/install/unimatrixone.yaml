@@ -35,10 +35,10 @@ timezone: America/New_York
 luks_key: REPLACE_AT_PLACE_TIME
 root_password: REPLACE_AT_PLACE_TIME
 
-# NIC name of the 82599 on the installed OS is NOT yet confirmed. Read it off the
-# live target (`ip -o link` / `lsblk`) and replace before serving; a plausible-but-wrong
-# name fails silently, so this loud placeholder is intentional.
-network_interface: CONFIRM_ON_LIVE_TARGET
+# NIC confirmed on the live target 2026-07-09: the 82599 port with 172.16.2.35 +
+# MAC ac:1f:6b:40:fc:e2 is `ens5f0` (systemd predictable name, PCI-path based, so
+# stable into the installed system). ens5f1 is the second, unused port.
+network_interface: ens5f0
 network_address: 172.16.2.35/23
 network_gateway: 172.16.2.1
 network_search: jf.local

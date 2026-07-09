@@ -1,6 +1,7 @@
 // file: src/network/ssh_installer/packages.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshpkg01-2345-6789-abcd-ef0123456789
+// last-edited: 2026-07-09
 
 //! Package management for SSH installation
 
@@ -29,7 +30,14 @@ impl<'a> PackageManager<'a> {
             .execute("DEBIAN_FRONTEND=noninteractive apt-get install -y zfsutils-linux")
             .await?;
 
-        // Install other required packages
+        // Install other required packages.
+        // NOTE (live environment, not the target): clevis + clevis-luks are
+        // required HERE because `clevis luks bind` for Tang enrollment runs on the
+        // live host against the LUKS partition (the mapper isn't visible in the
+        // chroot). The 26.04 live-server ISO does NOT ship clevis, so without this
+        // Tang enrollment silently skips. mdadm is needed to assemble/query IMSM
+        // (BIOS fake-RAID) volumes like unimatrixone's /dev/md126; harmless on
+        // hosts without md devices.
         let packages = [
             "cryptsetup",
             "parted",
@@ -38,6 +46,9 @@ impl<'a> PackageManager<'a> {
             "dosfstools",
             "xfsprogs",
             "util-linux",
+            "clevis",
+            "clevis-luks",
+            "mdadm",
         ];
 
         let install_cmd = format!(
