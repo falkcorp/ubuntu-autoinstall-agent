@@ -1,7 +1,7 @@
 // file: src/autoinstall/verify.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-06-21
+// last-edited: 2026-07-09
 
 //! Post-install verification for Lenovo fleet hosts.
 //!
@@ -38,7 +38,10 @@ use crate::{
 // ── Fleet-wide constants used only for verification ──────────────────────────
 
 /// The LUKS partition on all Lenovo NVMe hosts.
-const LUKS_PARTITION: &str = "/dev/nvme0n1p3";
+///
+/// ZFS-on-LUKS layout (Path B): p1 ESP, p2 RESET, p3 bpool, **p4 LUKS** (holds
+/// rpool). The old LVM layout put LUKS on p3 — retargeted to p4 here.
+const LUKS_PARTITION: &str = "/dev/nvme0n1p4";
 
 /// The NIC used on all Lenovo fleet hosts.
 const LENSERV_NIC: &str = "enp1s0f0";
@@ -115,6 +118,123 @@ pub fn evaluate_luks_partition(lsblk_output: &str) -> CheckResult {
             "luks_partition",
             format!("no crypto_LUKS device found — lsblk output: {lsblk_output:?}"),
         )
+    }
+}
+
+/// Both ZFS pools (`rpool` + `bpool`) are imported.
+///
+/// Expects output of `zpool list -H -o name`.
+pub fn evaluate_zfs_pools(zpool_output: &str) -> CheckResult {
+    let has_rpool = zpool_output.lines().any(|l| l.trim() == "rpool");
+    let has_bpool = zpool_output.lines().any(|l| l.trim() == "bpool");
+    if has_rpool && has_bpool {
+        CheckResult::pass("zfs_pools", "rpool + bpool imported")
+    } else {
+        let mut missing = vec![];
+        if !has_rpool { missing.push("rpool"); }
+        if !has_bpool { missing.push("bpool"); }
+        CheckResult::fail("zfs_pools", format!("missing pool(s): {}", missing.join(", ")))
+    }
+}
+
+/// Root filesystem is a ZFS dataset on `rpool/ROOT/…` (not LVM/ext4).
+///
+/// Expects output of `findmnt -n -o FSTYPE,SOURCE /`.
+pub fn evaluate_zfs_root(findmnt_root: &str) -> CheckResult {
+    let is_zfs = findmnt_root.contains("zfs");
+    let on_rpool = findmnt_root.contains("rpool/ROOT/");
+    if is_zfs && on_rpool {
+        CheckResult::pass("zfs_root", "/ is a ZFS dataset on rpool/ROOT")
+    } else {
+        CheckResult::fail(
+            "zfs_root",
+            format!("/ is not ZFS-on-rpool — findmnt: {findmnt_root:?}"),
+        )
+    }
+}
+
+/// `/boot` is a ZFS dataset on `bpool/BOOT/…`.
+///
+/// Expects output of `findmnt -n -o FSTYPE,SOURCE /boot`.
+pub fn evaluate_boot_on_bpool(findmnt_boot: &str) -> CheckResult {
+    let is_zfs = findmnt_boot.contains("zfs");
+    let on_bpool = findmnt_boot.contains("bpool/BOOT/");
+    if is_zfs && on_bpool {
+        CheckResult::pass("boot_on_bpool", "/boot is a ZFS dataset on bpool/BOOT")
+    } else {
+        CheckResult::fail(
+            "boot_on_bpool",
+            format!("/boot is not on bpool — findmnt: {findmnt_boot:?}"),
+        )
+    }
+}
+
+/// Regression guard: NO LVM present. The old installer produced LUKS+LVM+ext4;
+/// the correct layout is LUKS+ZFS with no LVM anywhere.
+///
+/// Expects output of `lsblk -o NAME,TYPE,FSTYPE`.
+pub fn evaluate_no_lvm(lsblk_output: &str) -> CheckResult {
+    let has_lvm = lsblk_output
+        .lines()
+        .any(|l| l.split_whitespace().any(|f| f == "lvm"));
+    if has_lvm {
+        CheckResult::fail(
+            "no_lvm",
+            format!("LVM present — expected ZFS-on-LUKS, not LVM: {lsblk_output:?}"),
+        )
+    } else {
+        CheckResult::pass("no_lvm", "no LVM devices (ZFS-on-LUKS as intended)")
+    }
+}
+
+/// A TPM2 keyslot is enrolled (via `systemd-cryptenroll --tpm2-with-pin`).
+///
+/// Expects output of `cryptsetup luksDump <dev>` — systemd-cryptenroll records a
+/// `systemd-tpm2` token. NOTE: enrolled on FIRST BOOT, so this only passes after
+/// the target has booted at least once.
+pub fn evaluate_tpm2_keyslot(luksdump_output: &str) -> CheckResult {
+    if luksdump_output.contains("systemd-tpm2") {
+        CheckResult::pass("tpm2_keyslot", "systemd-tpm2 keyslot present")
+    } else {
+        CheckResult::fail(
+            "tpm2_keyslot",
+            "no systemd-tpm2 token (first-boot enrollment not yet run?)",
+        )
+    }
+}
+
+/// A FIDO2/YubiKey keyslot is enrolled (via `systemd-cryptenroll --fido2-device`).
+///
+/// Expects output of `cryptsetup luksDump <dev>` — records a `systemd-fido2`
+/// token. NOTE: enrolled MANUALLY post-install with the physical key, so this is
+/// expected to fail until `register-fido2-luks.sh` has been run.
+pub fn evaluate_fido2_keyslot(luksdump_output: &str) -> CheckResult {
+    if luksdump_output.contains("systemd-fido2") {
+        CheckResult::pass("fido2_keyslot", "systemd-fido2 keyslot present")
+    } else {
+        CheckResult::fail(
+            "fido2_keyslot",
+            "no systemd-fido2 token (run register-fido2-luks.sh with the YubiKey)",
+        )
+    }
+}
+
+/// The signed shim bootloader is installed so Secure Boot can be enabled.
+///
+/// Expects output of `ls -1 /boot/efi/EFI/ubuntu/`. We require `shimx64.efi`
+/// (the signed first-stage loader) and `grubx64.efi` (the signed grub it
+/// chainloads). Secure Boot may still be OFF in firmware — this only checks the
+/// chain is in place so it CAN be turned on.
+pub fn evaluate_shim_present(esp_listing: &str) -> CheckResult {
+    let has_shim = esp_listing.lines().any(|l| l.trim() == "shimx64.efi");
+    let has_grub = esp_listing.lines().any(|l| l.trim() == "grubx64.efi");
+    if has_shim && has_grub {
+        CheckResult::pass("shim_present", "shimx64.efi + grubx64.efi installed (Secure Boot ready)")
+    } else {
+        let mut missing = vec![];
+        if !has_shim { missing.push("shimx64.efi"); }
+        if !has_grub { missing.push("grubx64.efi"); }
+        CheckResult::fail("shim_present", format!("missing: {}", missing.join(", ")))
     }
 }
 
@@ -278,12 +398,37 @@ pub async fn verify_host(
 ) -> Result<VerifyReport> {
     let mut checks = Vec::with_capacity(12);
 
-    // 1. LUKS partition
+    // 1. LUKS partition (+ no-LVM regression guard from the same lsblk)
     let lsblk = runner
         .execute_with_output("lsblk -o NAME,TYPE,FSTYPE")
         .await
         .unwrap_or_default();
     checks.push(evaluate_luks_partition(&lsblk));
+    checks.push(evaluate_no_lvm(&lsblk));
+
+    // 1b. ZFS layout: rpool+bpool imported, / on rpool/ROOT, /boot on bpool/BOOT
+    let zpools = runner
+        .execute_with_output("zpool list -H -o name")
+        .await
+        .unwrap_or_default();
+    checks.push(evaluate_zfs_pools(&zpools));
+    let findmnt_root = runner
+        .execute_with_output("findmnt -n -o FSTYPE,SOURCE /")
+        .await
+        .unwrap_or_default();
+    checks.push(evaluate_zfs_root(&findmnt_root));
+    let findmnt_boot = runner
+        .execute_with_output("findmnt -n -o FSTYPE,SOURCE /boot")
+        .await
+        .unwrap_or_default();
+    checks.push(evaluate_boot_on_bpool(&findmnt_boot));
+
+    // 1c. Signed shim chain present so Secure Boot can be enabled.
+    let esp_listing = runner
+        .execute_with_output("ls -1 /boot/efi/EFI/ubuntu/")
+        .await
+        .unwrap_or_default();
+    checks.push(evaluate_shim_present(&esp_listing));
 
     // 2. Clevis SSS Tang binding
     let clevis = runner
@@ -291,6 +436,14 @@ pub async fn verify_host(
         .await
         .unwrap_or_default();
     checks.push(evaluate_clevis_binding(&clevis));
+
+    // 2b. TPM2 (first-boot) + FIDO2 (manual) keyslots from luksDump
+    let luksdump = runner
+        .execute_with_output(&format!("sudo -n cryptsetup luksDump {LUKS_PARTITION}"))
+        .await
+        .unwrap_or_default();
+    checks.push(evaluate_tpm2_keyslot(&luksdump));
+    checks.push(evaluate_fido2_keyslot(&luksdump));
 
     // 3. crypttab
     let crypttab = runner
@@ -425,14 +578,25 @@ mod tests {
 
     // ── Live-probe fixture strings (verbatim from len-serv-003) ──────────────
 
+    // ZFS-on-LUKS layout: p1 ESP, p2 RESET, p3 bpool (zfs_member), p4 LUKS →
+    // luks mapper (holds rpool). NO LVM anywhere.
     const LSBLK_003: &str = "\
 NAME        TYPE  FSTYPE
 nvme0n1     disk
 nvme0n1p1   part  vfat
 nvme0n1p2   part  ext4
-nvme0n1p3   part  crypto_LUKS
-dm-0        lvm
-ubuntu-lv   lvm   ext4";
+nvme0n1p3   part  zfs_member
+nvme0n1p4   part  crypto_LUKS
+luks        crypt zfs_member";
+
+    const ESP_LISTING_003: &str = "BOOTX64.CSV\ngrub.cfg\ngrubx64.efi\nmmx64.efi\nshimx64.efi\n";
+    const ZPOOL_003: &str = "bpool\nrpool\n";
+    const FINDMNT_ROOT_003: &str = "zfs   rpool/ROOT/ubuntu_3pvepx\n";
+    const FINDMNT_BOOT_003: &str = "zfs   bpool/BOOT/ubuntu_3pvepx\n";
+    // luksDump of a fully-provisioned host: clevis (Tang) + systemd-tpm2 (PIN) +
+    // systemd-fido2 (YubiKey) tokens all enrolled.
+    const LUKSDUMP_003: &str = "\
+LUKS header information\nVersion:        2\nTokens:\n  0: clevis\n  1: systemd-tpm2\n  2: systemd-fido2\nKeyslots:\n  0: luks2\n";
 
     const CLEVIS_003: &str =
         "1: sss '{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}'";
@@ -597,7 +761,12 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
+            ("zpool list -H -o name", ZPOOL_003),
+            ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
+            ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
+            ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
             ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
@@ -610,7 +779,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         ]);
 
         let report = verify_host(&mut mock, &spec, "len-serv-003").await.unwrap();
-        assert_eq!(report.checks.len(), 12);
+        assert_eq!(report.checks.len(), 19);
         for c in &report.checks {
             assert!(c.passed, "check '{}' failed: {}", c.name, c.detail);
         }
@@ -623,7 +792,12 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
+            ("zpool list -H -o name", ZPOOL_003),
+            ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
+            ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
+            ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
             ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
@@ -649,7 +823,12 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         let mut mock = MockExecutor::new(&[
             // No crypto_LUKS in output
             ("lsblk -o NAME,TYPE,FSTYPE", "nvme0n1 disk\nnvme0n1p1 part vfat\n"),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p3", CLEVIS_003),
+            ("zpool list -H -o name", ZPOOL_003),
+            ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
+            ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
+            ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
+            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
             ("cat /etc/default/grub /etc/default/grub.d/50-clevis-network.cfg 2>/dev/null || cat /etc/default/grub", GRUB_003),
@@ -665,5 +844,89 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         assert!(!report.all_passed());
         let luks_check = report.checks.iter().find(|c| c.name == "luks_partition").unwrap();
         assert!(!luks_check.passed);
+    }
+
+    // ── New ZFS / multikey evaluator tests ──────────────────────────────────
+
+    #[test]
+    fn zfs_pools_passes_with_both() {
+        assert!(evaluate_zfs_pools(ZPOOL_003).passed);
+    }
+
+    #[test]
+    fn zfs_pools_fails_missing_bpool() {
+        let r = evaluate_zfs_pools("rpool\n");
+        assert!(!r.passed);
+        assert!(r.detail.contains("bpool"));
+    }
+
+    #[test]
+    fn zfs_root_passes_on_rpool_dataset() {
+        assert!(evaluate_zfs_root(FINDMNT_ROOT_003).passed);
+    }
+
+    #[test]
+    fn zfs_root_fails_on_lvm_ext4() {
+        // The old broken layout: root on an ext4 LVM LV.
+        let r = evaluate_zfs_root("ext4  /dev/mapper/ubuntu--vg-ubuntu--lv");
+        assert!(!r.passed);
+    }
+
+    #[test]
+    fn boot_on_bpool_passes() {
+        assert!(evaluate_boot_on_bpool(FINDMNT_BOOT_003).passed);
+    }
+
+    #[test]
+    fn boot_on_bpool_fails_on_ext4_boot() {
+        assert!(!evaluate_boot_on_bpool("ext4  /dev/nvme0n1p2").passed);
+    }
+
+    #[test]
+    fn no_lvm_passes_on_zfs_fixture() {
+        assert!(evaluate_no_lvm(LSBLK_003).passed);
+    }
+
+    #[test]
+    fn no_lvm_fails_when_lvm_present() {
+        // The exact regression we're guarding against (old len-serv-003 output).
+        let lvm = "nvme0n1p4 part crypto_LUKS\ndm-0 crypt LVM2_member\nubuntu--lv lvm ext4";
+        let r = evaluate_no_lvm(lvm);
+        assert!(!r.passed);
+        assert!(r.detail.contains("LVM"));
+    }
+
+    #[test]
+    fn tpm2_keyslot_passes_when_token_present() {
+        assert!(evaluate_tpm2_keyslot(LUKSDUMP_003).passed);
+    }
+
+    #[test]
+    fn tpm2_keyslot_fails_before_first_boot() {
+        // Only clevis enrolled — TPM2 first-boot unit hasn't run yet.
+        assert!(!evaluate_tpm2_keyslot("Tokens:\n  0: clevis\n").passed);
+    }
+
+    #[test]
+    fn fido2_keyslot_passes_when_token_present() {
+        assert!(evaluate_fido2_keyslot(LUKSDUMP_003).passed);
+    }
+
+    #[test]
+    fn fido2_keyslot_fails_before_manual_enroll() {
+        assert!(!evaluate_fido2_keyslot("Tokens:\n  0: clevis\n  1: systemd-tpm2\n").passed);
+    }
+
+    #[test]
+    fn shim_present_passes_with_shim_and_grub() {
+        assert!(evaluate_shim_present(ESP_LISTING_003).passed);
+    }
+
+    #[test]
+    fn shim_present_fails_without_shim() {
+        // grub installed directly with no shim → Secure Boot can't be enabled.
+        let r = evaluate_shim_present("grub.cfg\ngrubx64.efi\n");
+        assert!(!r.passed);
+        assert!(r.detail.contains("shimx64.efi"));
     }
 }

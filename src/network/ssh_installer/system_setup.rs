@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -483,18 +483,24 @@ impl<'a> SystemConfigurator<'a> {
             let _ = self.log_and_execute("Set GRUB_CMDLINE_LINUX for dracut+Tang", &set_cmdline).await;
         }
 
-        // GRUB install with fallbacks
+        // GRUB install with fallbacks.
+        //
+        // `--uefi-secure-boot` (the Ubuntu default, made explicit here) lays down
+        // the SIGNED shim chain: shimx64.efi as the first-stage loader chainloading
+        // the signed grubx64.efi. Secure Boot can then be turned on in firmware
+        // without reinstalling. NOTE: the generic kernel's zfs.ko is Canonical-signed,
+        // so ZFS root still loads under enforced Secure Boot.
         if let Err(_e) = self.log_and_execute(
-            "Installing GRUB to ESP",
-            "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck'",
+            "Installing GRUB+shim to ESP (Secure Boot ready)",
+            "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck'",
         ).await {
             if let Err(_e2) = self.log_and_execute(
-                "Installing GRUB to ESP (no-nvram fallback)",
-                "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck --no-nvram'",
+                "Installing GRUB+shim to ESP (no-nvram fallback)",
+                "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck --no-nvram'",
             ).await {
                 self.log_and_execute(
-                    "Installing GRUB to ESP (removable fallback)",
-                    "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck --removable'",
+                    "Installing GRUB+shim to ESP (removable fallback)",
+                    "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck --removable'",
                 ).await?;
             }
         }
