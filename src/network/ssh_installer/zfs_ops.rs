@@ -57,19 +57,14 @@ impl<'a> ZfsManager<'a> {
             info!("rpool already exists; skipping pool creation");
         }
 
-        // Create bpool datasets if not present
-        if !self
-            .runner
-            .check_silent("zfs list -H bpool/BOOT >/dev/null 2>&1")
-            .await
-            .unwrap_or(false)
-        {
-            self.create_bpool_datasets(&uuid).await?;
-        } else {
-            info!("bpool datasets already present; skipping dataset creation");
-        }
-
-        // Create rpool datasets if not present
+        // ORDER IS LOAD-BEARING: create the rpool ROOT datasets (mount `/`)
+        // BEFORE the bpool BOOT datasets (mount `/boot`). Datasets auto-mount at
+        // creation under the `-R /mnt/targetos` altroot, so if bpool `/boot` is
+        // mounted first, the subsequent rpool `/` mount lands ON TOP and SHADOWS
+        // it — then grub-probe resolves `/boot` to the rpool/LUKS device and
+        // grub-install dies "unknown filesystem". Mounting `/` first, then
+        // `/boot` on top (the OpenZFS HOWTO order), makes grub-probe resolve
+        // `/boot` to the bpool vdev. This was THE grub-install blocker.
         if !self
             .runner
             .check_silent(&format!(
@@ -82,6 +77,18 @@ impl<'a> ZfsManager<'a> {
             self.create_rpool_datasets(&uuid).await?;
         } else {
             info!("rpool datasets already present; skipping dataset creation");
+        }
+
+        // bpool datasets AFTER rpool root, so /boot mounts on top of / (not shadowed).
+        if !self
+            .runner
+            .check_silent("zfs list -H bpool/BOOT >/dev/null 2>&1")
+            .await
+            .unwrap_or(false)
+        {
+            self.create_bpool_datasets(&uuid).await?;
+        } else {
+            info!("bpool datasets already present; skipping dataset creation");
         }
 
         info!("ZFS pools and datasets created successfully");
