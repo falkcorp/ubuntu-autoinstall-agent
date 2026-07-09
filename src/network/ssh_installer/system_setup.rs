@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -301,18 +301,41 @@ impl<'a> SystemConfigurator<'a> {
             "chroot /mnt/targetos bash -lc '[ -d /sys/firmware/efi/efivars ] || mkdir -p /sys/firmware/efi/efivars; mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true'"
         ).await;
 
-        // Core packages — dracut or initramfs-tools based
+        // Package set matched to the clean direct 26.04 install on len-serv-003
+        // (the reference host). That install uses **dracut**, never initramfs-tools.
         let initramfs_pkg = match config.initramfs_type {
             InitramfsType::Dracut => "dracut dracut-network",
             InitramfsType::InitramfsTools => "initramfs-tools cryptsetup-initramfs",
         };
 
-        // clevis packages needed for Tang enrollment
+        // ZFS support MUST match the generator. On dracut it's zfs-dracut (+ the
+        // signed linux-main-modules-zfs-* module pulled via the kernel, which is
+        // what lets ZFS root load under Secure Boot). NOT zfs-initramfs — that is
+        // the initramfs-tools hook and depends on initramfs-tools, which both
+        // fails to import rpool under dracut and drags the second generator back
+        // in (the dual-generator mess seen on len-serv-002).
+        let zfs_pkg = match config.initramfs_type {
+            InitramfsType::Dracut => "zfs-dracut zfsutils-linux zfs-zed",
+            InitramfsType::InitramfsTools => "zfs-initramfs zfsutils-linux",
+        };
+
+        // clevis for Tang. 26.04 bundles the tang/tpm2 PINS into base `clevis`;
+        // there is no separate clevis-tang package (installing it fails).
         let clevis_pkgs = if !config.tang_servers.is_empty() {
             match config.initramfs_type {
-                InitramfsType::Dracut => " clevis clevis-tang clevis-luks clevis-dracut",
-                InitramfsType::InitramfsTools => " clevis clevis-tang clevis-luks clevis-initramfs",
+                InitramfsType::Dracut => " clevis clevis-luks clevis-dracut clevis-systemd",
+                InitramfsType::InitramfsTools => " clevis clevis-luks clevis-initramfs",
             }
+        } else {
+            ""
+        };
+
+        // TPM2+PIN and FIDO2 keyslots are unlocked by systemd-cryptsetup (its own
+        // package, which ships the cryptsetup tpm2/fido2 token plugins). tpm2-tools
+        // pulls the libtss2 stack; tpm-udev creates the TPM device nodes;
+        // libfido2-1 backs FIDO2. Matches the 003 reference set.
+        let crypt_extra = if config.enroll_tpm2 || config.expect_fido2 {
+            " systemd-cryptsetup tpm2-tools tpm-udev libfido2-1"
         } else {
             ""
         };
@@ -320,8 +343,8 @@ impl<'a> SystemConfigurator<'a> {
         let chroot_commands = vec![
             "apt update".to_string(),
             format!(
-                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} zfs-initramfs zfsutils-linux efibootmgr cryptsetup dosfstools{}",
-                initramfs_pkg, clevis_pkgs
+                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}",
+                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra
             ),
             "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-generic".to_string(),
             "DEBIAN_FRONTEND=noninteractive apt install -y openssh-server vim htop curl".to_string(),
