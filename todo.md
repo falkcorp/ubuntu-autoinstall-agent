@@ -1,5 +1,5 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.4.0
+# version: 1.5.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-09
 
@@ -61,6 +61,21 @@
   post-install configuration (GRUB, LUKS crypttab, dracut, Tang).
 
 ## Known Issues / Tech Debt
+
+- [ ] **Installer not idempotent over a prior install (disk busy on re-run).** Found on
+  unimatrixone 2026-07-09: a first clean install ran 5/6 phases; re-running the installer over
+  the resulting disk failed at Phase 2 `wipefs -a /dev/md126` with "Device or resource busy"
+  because a pre-existing **rpool was still imported** (and its LUKS mapper open) holding the md
+  device. `destroy_existing_zfs_pools` only handles *imported* pools via `zpool list`, and does
+  not force-export/`zpool labelclear`/close-luks/kill-holders before wiping. Fix: before wipe,
+  `zpool export -f` any pool on the target disk (or `fuser -mk` the target mount, `cryptsetup
+  close`, `zpool labelclear -f` each partition). Until fixed, re-runs need a manual clean or a
+  reboot of the live env. First (clean-disk) run wiped fine — this only bites re-installs.
+- [x] **bpool not GRUB-readable (fixed 297a49e).** `build_bpool_create_command` mixed
+  `compatibility=grub2` with explicit `feature@livelist/zpool_checkpoint=enabled`, enabling
+  modern features (block_cloning, log_spacemap, …) GRUB can't read → grub-install "unknown
+  filesystem". Now uses compatibility=grub2 alone. (Validated only in unit tests — the U1
+  re-run to confirm end-to-end was blocked by the idempotency bug above + lab network loss.)
 
 - [ ] **`is_live_environment()` heuristic is weak** — checks `/run/live`, `/lib/live`, or `boot=live` in
   cmdline. On Ubuntu Server live ISO this is correct, but on iPXE-netbooted live environments it may
