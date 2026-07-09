@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.2.1
+// version: 2.3.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -132,6 +132,19 @@ impl<'a> ZfsManager<'a> {
         let bpool_cmd = Self::build_bpool_create_command(&config.disk_device);
         self.log_and_execute("Creating bpool", &bpool_cmd).await?;
 
+        // Set the pool-root mountpoint to /boot AFTER creation. The OpenZFS HOWTO
+        // sets it at create time, but that only works with a pristine altroot;
+        // this installer reuses /mnt/targetos across runs, so a create-time
+        // `mountpoint=/boot` fails with "mountpoint exists and is not empty".
+        // Setting it afterward just writes the property (canmount=off → nothing
+        // mounts). grub-probe reads this pool-root mountpoint to resolve /boot to
+        // the bpool vdev instead of mis-resolving to the rpool/LUKS device.
+        self.log_and_execute(
+            "Set bpool mountpoint=/boot",
+            "zfs set mountpoint=/boot bpool",
+        )
+        .await?;
+
         Ok(())
     }
 
@@ -162,23 +175,22 @@ impl<'a> ZfsManager<'a> {
         )
     }
 
-    /// Build the zpool create command for bpool — VERBATIM from the OpenZFS
-    /// "Ubuntu Root on ZFS" HOWTO (the known-good GRUB-bootable layout).
+    /// Build the zpool create command for bpool. Feature set matches the OpenZFS
+    /// "Ubuntu Root on ZFS" HOWTO (grub2 compat + livelist/zpool_checkpoint,
+    /// which modern GRUB reads).
     ///
-    /// Two things are load-bearing and were previously wrong:
-    /// - The pool root carries `-O mountpoint=/boot` (with `canmount=off`), NOT
-    ///   `mountpoint=none`. With `none`, `grub-probe /boot` mis-resolves the boot
-    ///   device to the rpool/LUKS mapper and grub-install dies "unknown
-    ///   filesystem"; with `/boot` it resolves the bpool vdev correctly.
-    /// - `compatibility=grub2` PLUS `feature@livelist`/`feature@zpool_checkpoint`
-    ///   (which modern GRUB supports) — the HOWTO enables both explicitly.
+    /// Created with `mountpoint=none -m none` so `zpool create` never tries to
+    /// mount over this installer's non-pristine `/mnt/targetos` altroot; the
+    /// pool-root mountpoint is set to `/boot` immediately afterward (see
+    /// `create_bpool`), which is what grub-probe keys on to resolve /boot to the
+    /// bpool vdev.
     fn build_bpool_create_command(disk: &str) -> String {
         format!(
             "zpool create -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
              -o compatibility=grub2 -o feature@livelist=enabled -o feature@zpool_checkpoint=enabled \
              -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
-             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=/boot \
-             -R /mnt/targetos bpool {}p3",
+             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
+             -m none -R /mnt/targetos bpool {}p3",
             disk
         )
     }

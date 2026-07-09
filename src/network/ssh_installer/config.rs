@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.3.0
+// version: 2.3.1
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -238,7 +238,7 @@ mod tests {
             ("len-serv-001", "/dev/nvme0n1", "172.16.3.92/23"),
             ("len-serv-002", "/dev/nvme0n1", "172.16.3.94/23"),
             ("len-serv-003", "/dev/nvme0n1", "172.16.3.96/23"),
-            ("unimatrixone", "/dev/md126", "172.16.2.35/23"),
+            ("unimatrixone", "/dev/md/Volume0_0", "172.16.2.35/23"),
         ];
         for (host, disk, addr) in cases {
             let path = format!(

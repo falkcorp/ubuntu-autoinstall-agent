@@ -1,5 +1,5 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 1.0.0
+# version: 1.1.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
 # last-edited: 2026-07-09
 #
@@ -28,7 +28,9 @@
 # per-host secret before serving. Never commit real luks_key/root_password/tpm2_pin.
 
 hostname: unimatrixone
-disk_device: /dev/md126
+# Stable IMSM volume name (udev symlink -> /dev/md126), so it survives the
+# md126/md127 kernel-name swap across boots. Partitions: /dev/md/Volume0_0p1..p4.
+disk_device: /dev/md/Volume0_0
 timezone: America/New_York
 
 # --- secrets: injected per-host at place-time ---
