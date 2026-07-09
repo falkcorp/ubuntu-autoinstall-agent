@@ -1,7 +1,7 @@
 // file: src/cli/args.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
-// last-edited: 2026-07-08
+// last-edited: 2026-07-09
 
 //! Command line argument definitions
 
@@ -113,6 +113,12 @@ pub enum Commands {
 
         #[arg(long, help = "Force local install even outside a live environment")]
         force: bool,
+
+        #[arg(
+            long,
+            help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook); remote installs only"
+        )]
+        report_url: Option<String>,
     },
 
     /// Install Ubuntu via SSH to target machine
@@ -146,6 +152,12 @@ pub enum Commands {
             help = "Pause after storage setup (partitioning, formatting, LUKS, ZFS pools/datasets) and print next commands to run manually"
         )]
         pause_after_storage: bool,
+
+        #[arg(
+            long,
+            help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook)"
+        )]
+        report_url: Option<String>,
     },
 
     /// Install Ubuntu locally (on current live system)
@@ -514,6 +526,7 @@ mod tests {
                 dry_run,
                 hold_on_failure,
                 pause_after_storage,
+                report_url: _,
             } => {
                 assert_eq!(host, "10.0.0.5");
                 assert!(hostname.is_none());
@@ -560,6 +573,7 @@ mod tests {
                 dry_run,
                 hold_on_failure,
                 pause_after_storage,
+                report_url: _,
             } => {
                 assert_eq!(host, "server.example.com");
                 assert_eq!(hostname.as_deref(), Some("prod-web-01"));

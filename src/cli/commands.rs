@@ -271,6 +271,7 @@ pub async fn cleanup_command(older_than_days: u32, dry_run: bool) -> Result<()> 
 ///
 /// If `config_path` is supplied the config is loaded from that YAML file;
 /// otherwise the built-in `for_len_serv_003()` default is used.
+#[allow(clippy::too_many_arguments)]
 pub async fn ssh_install_command(
     host: &str,
     hostname: Option<String>,
@@ -280,6 +281,7 @@ pub async fn ssh_install_command(
     dry_run: bool,
     hold_on_failure: bool,
     pause_after_storage: bool,
+    report_url: Option<String>,
 ) -> Result<()> {
     let username = username.unwrap_or_else(|| "ubuntu".to_string());
 
@@ -289,6 +291,7 @@ pub async fn ssh_install_command(
     );
 
     let mut installer = SshInstaller::new();
+    installer.set_report_url(report_url);
 
     // Connect to the target
     installer.connect(host, &username).await?;
@@ -481,6 +484,7 @@ fn print_system_info(title: &str, info: &SystemInfo) {
 }
 
 /// Unified install subcommand: connects over SSH when `remote` is Some, runs locally otherwise.
+#[allow(clippy::too_many_arguments)]
 pub async fn install_command(
     remote: Option<String>,
     username: Option<String>,
@@ -490,6 +494,7 @@ pub async fn install_command(
     hold_on_failure: bool,
     pause_after_storage: bool,
     force: bool,
+    report_url: Option<String>,
 ) -> Result<()> {
     match remote {
         Some(ref host) => {
@@ -502,6 +507,7 @@ pub async fn install_command(
                 dry_run,
                 hold_on_failure,
                 pause_after_storage,
+                report_url,
             )
             .await
         }
@@ -982,6 +988,7 @@ users:
             false, // dry_run
             false, // hold_on_failure
             false, // pause_after_storage
+            None,  // report_url
         )
         .await;
 
@@ -1004,6 +1011,7 @@ users:
             true,  // dry_run
             false, // hold_on_failure
             false, // pause_after_storage
+            None,  // report_url
         )
         .await;
 

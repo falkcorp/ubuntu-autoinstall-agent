@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -27,6 +27,8 @@ pub struct SshInstaller {
     runner: Box<dyn CommandExecutor>,
     connected: bool,
     variables: HashMap<String, String>,
+    /// When set, POST per-phase status updates to this webhook URL. Advisory.
+    report_url: Option<String>,
 }
 
 impl SshInstaller {
@@ -36,6 +38,27 @@ impl SshInstaller {
             runner: Box::new(LocalClient::new()),
             connected: false,
             variables: HashMap::new(),
+            report_url: None,
+        }
+    }
+
+    /// Enable per-phase status reporting to the given webhook URL (e.g.
+    /// `http://172.16.2.30:25000/api/webhook`). `None` disables reporting.
+    pub fn set_report_url(&mut self, url: Option<String>) {
+        self.report_url = url;
+    }
+
+    /// Best-effort status report; no-op unless `--report-url` was set.
+    async fn report(&self, config: &InstallationConfig, status: &str, progress: u8, message: &str) {
+        if let Some(url) = &self.report_url {
+            let src_ip = config
+                .network_address
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            super::status::post_status(url, &config.hostname, &src_ip, status, progress, message)
+                .await;
         }
     }
 
@@ -159,8 +182,12 @@ impl SshInstaller {
         let mut failed_phases: Vec<String> = Vec::new();
         let mut successful_phases: Vec<&str> = Vec::new();
 
+        self.report(config, "running", 5, "Installation starting").await;
+
         macro_rules! run_phase {
-            ($label:expr, $fut:expr) => {{
+            ($label:expr, $progress:expr, $fut:expr) => {{
+                self.report(config, "running", $progress, &format!("{} — starting", $label))
+                    .await;
                 match $fut.await {
                     Ok(_) => {
                         info!("✓ Phase completed: {}", $label);
@@ -170,6 +197,8 @@ impl SshInstaller {
                         error!("✗ Phase failed — {}: {}", $label, e);
                         failed_phases.push(format!("{}: {}", $label, e));
                         self.collect_and_log_debug_info().await;
+                        self.report(config, "failed", $progress, &format!("{}: {}", $label, e))
+                            .await;
                     }
                 }
             }};
@@ -183,16 +212,17 @@ impl SshInstaller {
             }
         }
 
-        run_phase!("Phase 0: Setup variables", self.setup_installation_variables(config));
-        run_phase!("Phase 1: Package installation", self.phase_1_package_installation());
-        run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config));
-        run_phase!("Phase 3: ZFS creation", self.phase_3_zfs_creation(config));
-        run_phase!("Phase 4: Base system", self.phase_4_base_system(config));
+        run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
+        run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation());
+        run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config));
+        run_phase!("Phase 3: ZFS creation", 50, self.phase_3_zfs_creation(config));
+        run_phase!("Phase 4: Base system", 75, self.phase_4_base_system(config));
         run_phase!(
             "Phase 5: System configuration",
+            90,
             self.phase_5_system_configuration(config)
         );
-        run_phase!("Phase 6: Final setup", self.phase_6_final_setup(config));
+        run_phase!("Phase 6: Final setup", 95, self.phase_6_final_setup(config));
 
         self.generate_installation_report(&successful_phases, &failed_phases)
             .await;
@@ -202,12 +232,21 @@ impl SshInstaller {
                 "🎉 Installation completed successfully for {}",
                 config.hostname
             );
+            self.report(config, "success", 100, &format!("{} installed", config.hostname))
+                .await;
             Ok(())
         } else {
             error!(
                 "❌ Installation completed with {} failed phases",
                 failed_phases.len()
             );
+            self.report(
+                config,
+                "failed",
+                100,
+                &format!("{} install failed: {} phase(s)", config.hostname, failed_phases.len()),
+            )
+            .await;
             Err(crate::error::AutoInstallError::InstallationError(format!(
                 "Installation failed: {} phases failed",
                 failed_phases.len()

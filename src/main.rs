@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
                 hold_on_failure,
                 pause_after_storage,
                 force,
+                report_url,
             } => {
                 install_command(
                     remote,
@@ -79,6 +80,7 @@ async fn main() -> Result<()> {
                     hold_on_failure,
                     pause_after_storage,
                     force,
+                    report_url,
                 )
                 .await
             }
@@ -91,6 +93,7 @@ async fn main() -> Result<()> {
                 dry_run,
                 hold_on_failure,
                 pause_after_storage,
+                report_url,
             } => {
                 ssh_install_command(
                     &host,
@@ -101,6 +104,7 @@ async fn main() -> Result<()> {
                     dry_run,
                     hold_on_failure,
                     pause_after_storage,
+                    report_url,
                 )
                 .await
             }
