@@ -1,0 +1,35 @@
+#cloud-config
+# file: installer-image/nocloud/user-data
+# version: 1.0.0
+# guid: 7c1a9e40-2b56-4d81-9f3a-6e0c2d4b8a10
+# last-edited: 2026-07-09
+#
+# Baked into a re-mastered Ubuntu Server ISO by make-ssh-ready-iso.sh so the
+# LIVE installer session comes up SSH-ready with ZERO manual steps:
+#   - openssh-server enabled,
+#   - user `ubuntu-server` with a known password + operator SSH keys,
+#   - NOPASSWD sudo (so `uaa install` can run every command as root over SSH
+#     without needing root login enabled).
+# This is a live-session cloud-config (NO `autoinstall:` key) — it configures
+# the running installer environment; it does NOT trigger subiquity/curtin.
+
+ssh_pwauth: true
+
+users:
+  - name: ubuntu-server
+    lock_passwd: false
+    shell: /bin/bash
+    groups: [sudo, adm]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDmLM5QkF0hQiebBV/P7ogMXatVKfywwNNpVE5/XRgpm8ipjMpYn8cUBMnAelPyljezUDX4PsXlNobsWZH87lMsXT7X1RVdFP2IXMUbgCJ1nPIGnWzldRSq7NX0wQOkwPXa8crXdgyTuHeDlJzBQ45GurMzh17BuN93WnssrqXAlCIfjszwhN1/BTzOdy/wIBXaSwkSt75dxdgHGz3Yw5qOg8gPUdtvL1vP3hOkNkOFI52NEVg65deJil8+DgH9kIitiPF83+IQ75dGpk6yHgXX7uf4a8ExeJ8agZ1mwr28bdEGtSpfqYOaHM2FOCh6ZOU868tQMVQuItSXCfAmy4jT johnathan.falk@gmail.com"
+
+# Throwaway live-session password (not a target secret). Override with
+# UAA_LIVE_PASSWORD when running make-ssh-ready-iso.sh.
+chpasswd:
+  expire: false
+  users:
+    - {name: ubuntu-server, password: default, type: text}
+
+runcmd:
+  - [systemctl, enable, --now, ssh]

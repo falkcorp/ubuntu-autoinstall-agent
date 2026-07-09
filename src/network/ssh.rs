@@ -1,7 +1,7 @@
 // file: src/network/ssh.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: t0u1v2w3-x4y5-6789-0123-456789tuvwxy
-// last-edited: 2026-06-20
+// last-edited: 2026-07-09
 
 //! SSH client for remote deployment operations
 
@@ -14,6 +14,25 @@ use tracing::{debug, error, info};
 pub struct SshClient {
     session: Option<Session>,
     host: String,
+    /// When true, every command is run through `sudo -n bash -c` so a non-root
+    /// login user (e.g. `ubuntu-server` in a live installer env with NOPASSWD
+    /// sudo) can execute the root-only install steps. Set automatically in
+    /// `connect()` based on the login username.
+    sudo: bool,
+}
+
+/// Wrap a command so it runs as root via passwordless sudo when `sudo` is set.
+///
+/// The command is passed as a single-quoted argument to `bash -c`; embedded
+/// single quotes are escaped as `'\''` so any content — pipes, heredocs, nested
+/// `bash -lc '...'` — is reconstructed verbatim by the outer shell and executed
+/// unchanged. `sudo -n` never prompts (fails fast if sudo would need a password).
+fn wrap_sudo(sudo: bool, command: &str) -> String {
+    if sudo {
+        format!("sudo -n bash -c '{}'", command.replace('\'', "'\\''"))
+    } else {
+        command.to_string()
+    }
 }
 
 impl SshClient {
@@ -22,6 +41,7 @@ impl SshClient {
         Self {
             session: None,
             host: String::new(),
+            sudo: false,
         }
     }
 
@@ -81,6 +101,12 @@ impl SshClient {
 
         self.session = Some(session);
         self.host = host.to_string();
+        // A non-root login user must escalate to run the install steps; the
+        // live installer env grants NOPASSWD sudo to that user. Root needs none.
+        self.sudo = username != "root";
+        if self.sudo {
+            info!("Non-root login '{}': commands will run via sudo -n", username);
+        }
 
         info!("SSH connection established to {}", host);
         Ok(())
@@ -98,7 +124,7 @@ impl SshClient {
             crate::error::AutoInstallError::SshError(format!("Failed to create SSH channel: {}", e))
         })?;
 
-        channel.exec(command).map_err(|e| {
+        channel.exec(&wrap_sudo(self.sudo, command)).map_err(|e| {
             crate::error::AutoInstallError::SshError(format!("Failed to execute command: {}", e))
         })?;
 
@@ -152,7 +178,7 @@ impl SshClient {
             crate::error::AutoInstallError::SshError(format!("Failed to create SSH channel: {}", e))
         })?;
 
-        channel.exec(command).map_err(|e| {
+        channel.exec(&wrap_sudo(self.sudo, command)).map_err(|e| {
             crate::error::AutoInstallError::SshError(format!("Failed to execute command: {}", e))
         })?;
 
@@ -209,7 +235,7 @@ impl SshClient {
             crate::error::AutoInstallError::SshError(format!("Failed to create SSH channel: {}", e))
         })?;
 
-        channel.exec(command).map_err(|e| {
+        channel.exec(&wrap_sudo(self.sudo, command)).map_err(|e| {
             crate::error::AutoInstallError::SshError(format!("Failed to execute command: {}", e))
         })?;
 
@@ -260,7 +286,7 @@ impl SshClient {
             crate::error::AutoInstallError::SshError(format!("Failed to create SSH channel: {}", e))
         })?;
 
-        channel.exec(command).map_err(|e| {
+        channel.exec(&wrap_sudo(self.sudo, command)).map_err(|e| {
             crate::error::AutoInstallError::SshError(format!("Failed to execute command: {}", e))
         })?;
 
@@ -446,3 +472,45 @@ impl Default for SshClient {
 }
 
 use std::io::{Read, Write};
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_sudo;
+
+    #[test]
+    fn test_wrap_sudo_disabled_is_passthrough() {
+        assert_eq!(wrap_sudo(false, "zpool create rpool /dev/mapper/luks"), "zpool create rpool /dev/mapper/luks");
+    }
+
+    #[test]
+    fn test_wrap_sudo_wraps_simple_command() {
+        assert_eq!(
+            wrap_sudo(true, "wipefs -a /dev/md126"),
+            "sudo -n bash -c 'wipefs -a /dev/md126'"
+        );
+    }
+
+    #[test]
+    fn test_wrap_sudo_escapes_embedded_single_quotes() {
+        // A chroot command with nested single quotes must survive: each ' becomes
+        // '\'' so the outer shell reconstructs the original string verbatim.
+        let inner = "chroot /mnt/targetos bash -lc 'update-grub'";
+        let got = wrap_sudo(true, inner);
+        assert_eq!(
+            got,
+            "sudo -n bash -c 'chroot /mnt/targetos bash -lc '\\''update-grub'\\'''"
+        );
+    }
+
+    #[test]
+    fn test_wrap_sudo_preserves_heredoc_and_pipe() {
+        // Heredoc + pipe content must be reconstructed unchanged by the outer shell.
+        let inner = "cat > /mnt/targetos/etc/f <<'EOF'\nline\nEOF";
+        let got = wrap_sudo(true, inner);
+        // Round-trip check: stripping the wrapper and un-escaping yields the original.
+        let prefix = "sudo -n bash -c '";
+        assert!(got.starts_with(prefix) && got.ends_with('\''));
+        let body = &got[prefix.len()..got.len() - 1];
+        assert_eq!(body.replace("'\\''", "'"), inner);
+    }
+}

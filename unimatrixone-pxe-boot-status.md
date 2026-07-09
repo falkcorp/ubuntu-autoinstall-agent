@@ -1,13 +1,93 @@
 <!-- file: unimatrixone-pxe-boot-status.md -->
-<!-- version: 6.0.0 -->
+<!-- version: 7.0.0 -->
 <!-- guid: 8f3a1c72-6d4e-4b9a-9e21-7c5b0a2f4d18 -->
-<!-- last-edited: 2026-07-08 -->
+<!-- last-edited: 2026-07-09 -->
 
-# unimatrixone PXE Boot Debug — Status (2026-07-08 evening — READ THIS SECTION FIRST)
+# unimatrixone PXE Boot Debug — Status (2026-07-08 night — READ THIS SECTION FIRST)
+
+## PAUSED — netboot effort on hold indefinitely (2026-07-09)
+
+User has decided to stop chasing netboot on this board for now. **No further action needed
+unless/until this is picked back up.** The always-available fallback (proven-bootable Ubuntu
+26.04 live-server USB stick) remains the path forward if unimatrixone needs to be installed
+before netboot is revisited.
+
+**Current physical state, left as of 2026-07-09**: machine powered ON, `chassis bootdev bios`
+set (one-time next-boot-to-Setup), so it should currently be sitting in BIOS Setup. **Boot
+Order #1 is set to `UEFI AP:UEFI: Built-in EFI Shell`** (changed by the user tonight for the
+NVRAM-diffing experiment below) — if anyone power-cycles this machine expecting it to boot an
+OS normally, it will instead boot straight to the EFI Shell prompt first. Change Boot Order #1
+back to a normal device (e.g. Hard Disk / UEFI OS) before expecting a normal boot.
 
 ## RESUME HERE NEXT SESSION
 
 **Everything below "## HISTORICAL (2026-07-07 night)" is superseded** — kept for reference only.
+
+### What happened 2026-07-08 night (TPM / TXT investigation)
+
+1. Disabling CSM (Compatibility Support Module) locked the machine at "Discovering PCIe
+   devices" again — same hang as before. Required a physical CMOS clear via the JBT1 jumper.
+2. User's working theory shifted over the course of the night: initially suspected IPMI/IPMI-NIC
+   config, then suspected enabling TPM, and **the final conclusion reached was Intel TXT
+   (Trusted Execution Technology)** — user's exact words: *"That's the bug. We can't turn on
+   intel trusted execution stuff in there."* This is now the leading theory for what's been
+   causing lockups/instability on this board, distinct from (and superseding) the earlier TPM
+   and IPMI-NIC theories. **Not yet proven, but treat "leave Intel TXT (`TXT Support`) Disabled"
+   as a hard constraint on this board going forward** — do not re-enable it without deliberately
+   retesting this specific theory.
+3. Successfully enabled TPM as a controlled test (`Security Device Support` → Enabled, `TPM
+   State` → Enabled) while explicitly leaving `Intel TXT(LT-SX) Configuration → TXT Support`
+   Disabled. Saved, reset, forced back into BIOS Setup — **no crash loop**, confirmed clean
+   after being back in BIOS for several minutes. `Current Status Information` confirmed: TPM
+   Enabled Status: Enabled, TPM Active Status: Activated, TPM Owner Status: Owned, TXT Support:
+   Disabled. This result (TPM enable alone doesn't crash-loop) is part of why the theory shifted
+   toward TXT specifically rather than TPM generally.
+4. Set up a reverse-engineering workflow for the opaque AMI/Aptio `Setup` NVRAM blob: set Boot
+   Order #1 to `UEFI AP:UEFI: Built-in EFI Shell` so the machine lands straight in the EFI Shell
+   on every boot, with the intent to change one BIOS setting at a time, save+restart, and
+   `dmpstore` the full NVRAM variable set after each change to diff against the previous dump
+   and locate which byte(s)/variable(s) correspond to which Setup option. Only the first
+   baseline dump was captured tonight (see below) — the actual one-setting-at-a-time diffing
+   was not carried out yet.
+5. Captured a full NVRAM baseline via the EFI Shell (`EFI Shell version 2.40 [5.11]`):
+   - `dmpstore -s nvram-backup.dat` — saved on unimatrixone's own `fs0:` volume. **Not yet
+     copied off the machine** (not on the server, not on the USB stick) — do this before relying
+     on it, in case it needs to survive another CMOS clear or disk wipe.
+   - A second, screen-printed `dmpstore` dump (no file) — 538 total variable entries, captured
+     via the continuous SOL session log on the server:
+     `~/uni-boot-capture/sol-fulllog-20260708-200659.log` (259297 bytes, 2911 lines, confirmed
+     ending cleanly at the `fs0:\>` prompt, no truncation).
+6. **Process note for next session**: while navigating BIOS menus over SOL, the agent
+   misnavigated once (opened "Boot Mode Select" instead of the intended "Dual Boot Order #1"
+   popup) — caught by the user before any value was changed. User then set a standing
+   constraint for the rest of that session: only make the specific changes explicitly
+   requested, no improvised/proactive navigation. Worth remembering if resuming BIOS-menu
+   automation over SOL: verify field identity via the description pane after every single
+   keystroke, never trust a multi-key blind batch send for anything consequential (see the
+   SOL/keystroke reliability notes preserved further down for the full detail).
+
+### Next steps (when/if this is picked back up)
+
+1. Retrieve `nvram-backup.dat` off unimatrixone's `fs0:` volume (EFI Shell `cp fs0:nvram-backup.dat fs1:` to a USB stick, or similar) so it survives independent of the machine's own storage.
+2. Decide whether to continue the one-setting-at-a-time NVRAM diffing experiment (Boot Order #1
+   is already primed for it — lands straight in EFI Shell) to pin down exactly which Setup
+   variable corresponds to `TXT Support`, or to just treat "leave TXT Disabled" as settled and
+   move on.
+3. Once back in BIOS: re-enable `Ipv6 PXE Support` AND the 82599's per-slot Option ROM (both in
+   `Advanced → PCIe/PCI/PnP Configuration`, both reset by tonight's CMOS clear), re-verify
+   `UEFI NETWORK Drive BBS Priorities`, and reset Boot Order #1 back to a normal boot device
+   before expecting a normal OS boot.
+4. Investigate the IPMI/IPMI-NIC theory raised earlier tonight (`ipmitool lan print 1`, BMC
+   network config) — never actually checked; superseded in priority by the TXT theory but still
+   an open, unconfirmed thread.
+5. Re-run `scripts/capture-uni-boot.sh` for a clean pcap+log capture of a netboot attempt once
+   the above BIOS settings are restored.
+6. The original 2026-07-07 discrepancy (server logs showed zero PXE traffic while the user's
+   console showed progress) is still unresolved.
+
+---
+
+## HISTORICAL (2026-07-08 evening, pre-TPM/TXT investigation) — superseded, kept for reference only
 
 ### What happened 2026-07-08
 
