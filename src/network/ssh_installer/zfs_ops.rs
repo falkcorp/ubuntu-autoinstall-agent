@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.2.0
+// version: 2.2.1
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -149,10 +149,16 @@ impl<'a> ZfsManager<'a> {
     /// Build the zpool create command for rpool using the LUKS mapper device
     fn build_rpool_create_command() -> String {
         String::from(
+            // NOTE: mountpoint=none (+ -m none), NOT the HOWTO's mountpoint=/ —
+            // this installer writes /mnt/targetos/uuid before pool creation, so a
+            // mountpoint=/ rpool would try to mount over a non-empty altroot and
+            // fail. The pool-level mountpoint is irrelevant to boot anyway: the
+            // real root is rpool/ROOT/ubuntu_<uuid> (mountpoint=/), and GRUB never
+            // reads rpool. Only bpool's mountpoint=/boot matters (for grub-probe).
             "zpool create -o ashift=12 -o autotrim=on \
              -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
-             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=/ \
-             -R /mnt/targetos rpool /dev/mapper/luks",
+             -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
+             -m none -R /mnt/targetos rpool /dev/mapper/luks",
         )
     }
 
