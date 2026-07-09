@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-06-20
+// last-edited: 2026-07-09
 
 //! Configuration structures for SSH/local installation
 
@@ -69,10 +69,42 @@ pub struct InstallationConfig {
     /// SSH public keys to install for root.
     #[serde(default)]
     pub ssh_authorized_keys: Vec<String>,
+    /// Enroll a TPM2 + PIN LUKS keyslot on first boot of the installed target.
+    ///
+    /// TPM2 must bind to the *installed* system's PCR values (not the live
+    /// installer's), so enrollment happens via a oneshot systemd unit on first
+    /// boot rather than during the unattended install. clevis's tpm2 pin has no
+    /// PIN support, so this uses `systemd-cryptenroll --tpm2-with-pin` (unlocked
+    /// at boot by the sd-cryptsetup dracut module, alongside clevis for Tang).
+    #[serde(default = "default_true")]
+    pub enroll_tpm2: bool,
+    /// PIN required at boot for the TPM2 keyslot. Empty/None disables TPM2+PIN
+    /// enrollment even when `enroll_tpm2` is true (no PIN = no anti-theft value).
+    #[serde(default)]
+    pub tpm2_pin: Option<String>,
+    /// PCR indices the TPM2 policy binds to (comma-separated). Default "7"
+    /// (secure-boot state). Kept minimal so routine kernel updates don't
+    /// invalidate the binding; the PIN is the real anti-theft factor.
+    #[serde(default = "default_tpm2_pcr_ids")]
+    pub tpm2_pcr_ids: String,
+    /// FIDO2 (YubiKey) unlock is enrolled MANUALLY post-install via
+    /// `register-fido2-luks.sh` (needs the physical key + touch), so it is not
+    /// part of the unattended install config. This flag only records intent /
+    /// drives `verify` to check that at least one fido2 keyslot exists.
+    #[serde(default = "default_true")]
+    pub expect_fido2: bool,
 }
 
 fn default_tang_threshold() -> u8 {
     2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_tpm2_pcr_ids() -> String {
+    "7".to_string()
 }
 
 impl InstallationConfig {
@@ -120,6 +152,13 @@ impl InstallationConfig {
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local".to_string(),
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820".to_string(),
             ],
+            enroll_tpm2: true,
+            // Placeholder — the real PIN is injected per-host from a secret at
+            // seed-render time, never committed. None here disables TPM2 in the
+            // hardcoded fallback config.
+            tpm2_pin: None,
+            tpm2_pcr_ids: default_tpm2_pcr_ids(),
+            expect_fido2: true,
         }
     }
 }
@@ -175,5 +214,39 @@ mod tests {
         let cfg = InstallationConfig::for_len_serv_003();
         assert_eq!(cfg.network_address, "172.16.3.96/23");
         assert_eq!(cfg.network_interface, "enp1s0f0");
+    }
+
+    #[test]
+    fn test_for_len_serv_003_multikey_defaults() {
+        let cfg = InstallationConfig::for_len_serv_003();
+        // TPM2+PIN and FIDO2 expectations default on; the PIN itself is injected
+        // per-host from a secret (None in the hardcoded fallback).
+        assert!(cfg.enroll_tpm2);
+        assert_eq!(cfg.tpm2_pin, None);
+        assert_eq!(cfg.tpm2_pcr_ids, "7");
+        assert!(cfg.expect_fido2);
+    }
+
+    #[test]
+    fn test_multikey_serde_defaults_when_absent() {
+        // A minimal YAML with none of the new fields must deserialize with the
+        // secure defaults (TPM2 on, PCR 7, FIDO2 expected) rather than failing.
+        let yaml = r#"
+hostname: test
+disk_device: /dev/sda
+timezone: UTC
+luks_key: k
+root_password: p
+network_interface: eth0
+network_address: 10.0.0.2/24
+network_gateway: 10.0.0.1
+network_search: local
+network_nameservers: ["10.0.0.1"]
+"#;
+        let cfg: InstallationConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.enroll_tpm2);
+        assert_eq!(cfg.tpm2_pcr_ids, "7");
+        assert!(cfg.expect_fido2);
+        assert_eq!(cfg.tpm2_pin, None);
     }
 }

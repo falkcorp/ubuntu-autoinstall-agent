@@ -1,7 +1,7 @@
 // file: src/cli/commands.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-06-21
+// last-edited: 2026-07-09
 
 //! Command implementations for the CLI
 
@@ -562,12 +562,18 @@ fn create_local_installation_config(
         network_gateway: gateway,
         network_search: "local".to_string(),
         network_nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
-        debootstrap_release: Some("plucky".to_string()),
+        // Ubuntu 26.04 LTS (Resolute Raccoon) — the fleet target. Was previously
+        // "plucky" (25.04); pinned to resolute per the 26.04 requirement.
+        debootstrap_release: Some("resolute".to_string()),
         debootstrap_mirror: Some("http://archive.ubuntu.com/ubuntu/".to_string()),
         initramfs_type: InitramfsType::default(),
         tang_servers: vec![],
         tang_threshold: 2,
         ssh_authorized_keys: vec![],
+        enroll_tpm2: true,
+        tpm2_pin: None,
+        tpm2_pcr_ids: "7".to_string(),
+        expect_fido2: true,
     })
 }
 
