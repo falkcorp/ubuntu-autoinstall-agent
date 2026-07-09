@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -563,8 +563,10 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
         format!("bash -lc 'UUID=$(blkid -s UUID -o value {d}p4 2>/dev/null || true); DEV=\"{d}p4\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'", d=config.disk_device),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),
-        "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck'".to_string(),
-        "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck --no-nvram' # fallback".to_string(),
+        // --uefi-secure-boot lays down the signed shim chain (shimx64.efi ->
+        // grubx64.efi) so Secure Boot can be enabled without reinstalling.
+        "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck'".to_string(),
+        "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck --no-nvram' # fallback".to_string(),
         "chroot /mnt/targetos bash -lc 'update-grub'".to_string(),
     ]
 }
