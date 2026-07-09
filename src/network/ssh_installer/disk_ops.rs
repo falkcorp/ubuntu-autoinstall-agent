@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/disk_ops.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
 
 //! Disk operations for SSH installation
@@ -142,6 +142,24 @@ impl<'a> DiskManager<'a> {
     /// Clean up existing mounts and filesystem structures
     async fn cleanup_existing_mounts(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Cleaning up existing mounts and filesystems");
+
+        // Robust release of a PRIOR install so re-runs don't hit "device busy"
+        // (idempotency). LAZY unmount the target tree deepest-first, REPEATED a
+        // few times — a single umount loses to a transient/busy holder — then
+        // unmount all ZFS, force-export every imported pool (which releases the
+        // underlying disk/mapper), and close LUKS. Without this, a re-run over a
+        // prior install fails at wipefs and cascades.
+        let release_cmd = "for i in 1 2 3; do \
+             mount | awk '$3 ~ \"/mnt/targetos\" {print $3}' | sort -r | xargs -r -n1 umount -lf 2>/dev/null || true; \
+             done; \
+             zfs unmount -a 2>/dev/null || true; \
+             for p in $(zpool list -H -o name 2>/dev/null); do zpool export -f \"$p\" 2>/dev/null || true; done; \
+             cryptsetup close luks 2>/dev/null || true";
+        self.log_and_execute(
+            "Robust release: lazy-unmount target, export pools, close LUKS",
+            release_cmd,
+        )
+        .await?;
 
         // Unmount any existing mounts on the target disk
         let mounted_parts = self
