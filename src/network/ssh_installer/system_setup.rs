@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.6.0
+// version: 2.7.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -719,6 +719,17 @@ impl<'a> SystemConfigurator<'a> {
     fn build_dracut_crypt_conf(include_clevis: bool, include_mdraid: bool) -> String {
         let clevis = if include_clevis { " clevis" } else { "" };
         let mdraid = if include_mdraid { " mdraid" } else { "" };
+        // For an md/IMSM root, also bake the array config (/etc/mdadm/mdadm.conf,
+        // the ARRAY UUID lines) into the initramfs and force the raid1 driver, so
+        // the fake-RAID volume assembles deterministically at boot before LUKS.
+        // NOTE: the dracut module is `mdraid` (dir 90mdraid); there is no `mdadm`
+        // dracut module — `mdadmconf` is the directive that includes mdadm.conf.
+        let mdadm_extra = if include_mdraid {
+            "mdadmconf=\"yes\"\n\
+             add_drivers+=\" md_mod raid1 \"\n"
+        } else {
+            ""
+        };
         format!(
             "# Managed by ubuntu-autoinstall-agent — do not edit by hand.\n\
              # Both LUKS unlock subsystems must live in the initramfs so any\n\
@@ -727,6 +738,7 @@ impl<'a> SystemConfigurator<'a> {
              #   crypt/tpm2/fido2 -> systemd-cryptsetup for TPM2+PIN and YubiKey\n\
              #   mdraid    -> assemble BIOS/IMSM fake-RAID (md) root before unlock\n\
              add_dracutmodules+=\" crypt tpm2-tss{clevis}{mdraid} \"\n\
+             {mdadm_extra}\
              # cryptsetup token plugins + libfido2 so TPM2/FIDO2 slots resolve in initrd\n\
              install_optional_items+=\" /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-tpm2.so /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-fido2.so /usr/lib/*/libfido2.so* \"\n"
         )
