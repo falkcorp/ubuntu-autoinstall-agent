@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.5.0
+// version: 2.6.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -96,7 +96,27 @@ impl<'a> SystemConfigurator<'a> {
             .debootstrap_mirror
             .as_deref()
             .unwrap_or("http://archive.ubuntu.com/ubuntu/");
-        let primary_cmd = format!("debootstrap {} /mnt/targetos {}", release, mirror);
+        // Use a persistent debootstrap base tarball if one is present on the
+        // `uaacache`-labelled device (e.g. the box's spare NVMe): mount it and
+        // pass `--unpack-tarball` so the base packages are NOT re-downloaded —
+        // debootstrap over WAN is the slow phase. Falls back to a full
+        // debootstrap when no cache is available. Build the cache once with:
+        //   debootstrap --make-tarball=/mnt/uaacache/<release>-<arch>-base.tar.gz \
+        //               <release> /tmp/scratch <mirror>
+        let primary_cmd = format!(
+            "mkdir -p /mnt/uaacache; \
+             mountpoint -q /mnt/uaacache || mount -o ro /dev/disk/by-label/uaacache /mnt/uaacache 2>/dev/null || true; \
+             CACHE=/mnt/uaacache/{release}-$(dpkg --print-architecture)-base.tar.gz; \
+             if [ -f \"$CACHE\" ]; then \
+               echo \"debootstrap: using cached base $CACHE\"; \
+               debootstrap --unpack-tarball=\"$CACHE\" {release} /mnt/targetos {mirror}; \
+             else \
+               echo \"debootstrap: no cache, full download\"; \
+               debootstrap {release} /mnt/targetos {mirror}; \
+             fi",
+            release = release,
+            mirror = mirror
+        );
         if let Err(_e) = self
             .log_and_execute("Running debootstrap", &primary_cmd)
             .await
