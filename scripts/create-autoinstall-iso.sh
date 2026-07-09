@@ -1,7 +1,8 @@
 #!/bin/bash
 # file: scripts/create-autoinstall-iso.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: x9y8z7w6-v5u4-3210-9876-543210xyzwvu
+# last-edited: 2026-07-08
 
 # Script to create a modified Ubuntu ISO with autoinstall enabled
 
@@ -27,7 +28,9 @@ GRUB_CFG="$WORK_DIR/iso/boot/grub/grub.cfg"
 
 if [[ -f "$GRUB_CFG" ]]; then
     # Add autoinstall parameters to the default Ubuntu Server option
-    sed -i 's/linux.*vmlinuz.*/& autoinstall ds=nocloud-net\\;s=\/run\/cloud-init\/ console=ttyS0,115200n8/' "$GRUB_CFG"
+    # nocloud-net was folded into the unified "nocloud" datasource; ds=nocloud
+    # now handles http(s)/ftp seedfrom URLs too (docs.cloud-init.io NoCloud ref).
+    sed -i 's/linux.*vmlinuz.*/& autoinstall ds=nocloud\\;s=\/run\/cloud-init\/ console=ttyS0,115200n8/' "$GRUB_CFG"
     sed -i 's/set timeout=30/set timeout=5/' "$GRUB_CFG"
 fi
 

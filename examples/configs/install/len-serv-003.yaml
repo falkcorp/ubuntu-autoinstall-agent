@@ -1,0 +1,65 @@
+# file: examples/configs/install/len-serv-003.yaml
+# version: 1.0.0
+# guid: a1b2c3d4-0003-4a3b-8c2d-1e2f3a4b5c63
+# last-edited: 2026-07-09
+#
+# Per-host ZFS-on-LUKS install config for len-serv-003.
+# Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs);
+# fetched by the Option-2 installer image and run via `uaa install --config`.
+# Served at http://172.16.2.30/cloud-init/len-serv-003.yaml (place-time copy of this).
+#
+# NOTE: distinct from the OFF-LIMITS, user-managed examples/configs/len-serv-003.yaml
+# (old subiquity-era schema). This install/ file is the current InstallationConfig schema
+# and mirrors the built-in `InstallationConfig::for_len_serv_003()`.
+#
+# Fleet fact (verified 2026-06-20): 172.16.3.96/23, NIC enp1s0f0,
+# MAC 6c:4b:90:bc:f7:f4, NVMe -> /dev/nvme0n1 (p-suffix partitions), amd64.
+# HARD RULE: 003 is not wiped until the installer is VM-validated (see project memory).
+#
+# SECRETS below are PLACEHOLDERS. `from_yaml_file` does NO substitution, so the
+# place-time step must replace every REPLACE_AT_PLACE_TIME token with the real
+# per-host secret before serving. Never commit real luks_key/root_password/tpm2_pin.
+
+hostname: len-serv-003
+disk_device: /dev/nvme0n1
+timezone: America/New_York
+
+# --- secrets: injected per-host at place-time ---
+luks_key: REPLACE_AT_PLACE_TIME
+root_password: REPLACE_AT_PLACE_TIME
+
+network_interface: enp1s0f0
+network_address: 172.16.3.96/23
+network_gateway: 172.16.2.1
+network_search: jf.local
+network_nameservers:
+  - 172.16.2.1
+  - 1.1.1.1
+  - 8.8.8.8
+
+debootstrap_release: resolute
+debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
+initramfs_type: dracut
+
+# clevis Tang SSS: 2-of-3 must respond to auto-unlock on-LAN.
+tang_servers:
+  - url: http://172.16.2.45
+  - url: http://172.16.2.46
+  - url: http://172.16.2.47
+tang_threshold: 2
+
+ssh_authorized_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan"
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local"
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820"
+
+# TPM2 + PIN keyslot enrolled on FIRST boot (binds installed-system PCRs).
+# tpm2_pin is a secret placeholder: if left unsubstituted, first-boot enrollment
+# runs with a bogus PIN. Inject the real PIN at place-time.
+enroll_tpm2: true
+tpm2_pin: REPLACE_AT_PLACE_TIME
+tpm2_pcr_ids: "7"
+
+# FIDO2/YubiKey keyslot enrolled MANUALLY post-install; this only asserts intent
+# so `verify` checks a fido2 keyslot exists.
+expect_fido2: true

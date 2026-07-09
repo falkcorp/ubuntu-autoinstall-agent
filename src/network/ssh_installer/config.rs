@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -225,6 +225,58 @@ mod tests {
         assert_eq!(cfg.tpm2_pin, None);
         assert_eq!(cfg.tpm2_pcr_ids, "7");
         assert!(cfg.expect_fido2);
+    }
+
+    #[test]
+    fn test_install_example_configs_round_trip() {
+        // The committed per-host example configs under examples/configs/install/
+        // must deserialize into InstallationConfig with the multi-key features
+        // explicitly enabled (they must NOT rely on serde defaults for tang/tpm2).
+        // Scoped to these four files only — the legacy examples/configs/*.yaml use
+        // an older, incompatible schema and are intentionally not loaded here.
+        let cases = [
+            ("len-serv-001", "/dev/nvme0n1", "172.16.3.92/23"),
+            ("len-serv-002", "/dev/nvme0n1", "172.16.3.94/23"),
+            ("len-serv-003", "/dev/nvme0n1", "172.16.3.96/23"),
+            ("unimatrixone", "/dev/md126", "172.16.2.35/23"),
+        ];
+        for (host, disk, addr) in cases {
+            let path = format!(
+                "{}/examples/configs/install/{}.yaml",
+                env!("CARGO_MANIFEST_DIR"),
+                host
+            );
+            let cfg = InstallationConfig::from_yaml_file(&path)
+                .unwrap_or_else(|e| panic!("{host} config must parse: {e}"));
+
+            assert_eq!(cfg.hostname, host, "{host}: hostname");
+            assert_eq!(cfg.disk_device, disk, "{host}: disk_device");
+            assert_eq!(cfg.network_address, addr, "{host}: network_address");
+            assert_eq!(cfg.initramfs_type, InitramfsType::Dracut, "{host}: dracut");
+
+            // Tang + TPM2 must be explicit, not defaulted away.
+            assert_eq!(cfg.tang_servers.len(), 3, "{host}: 3 tang servers");
+            assert_eq!(cfg.tang_threshold, 2, "{host}: tang threshold");
+            assert!(cfg.enroll_tpm2, "{host}: enroll_tpm2");
+            assert!(cfg.expect_fido2, "{host}: expect_fido2");
+            assert!(
+                cfg.tpm2_pin.is_some(),
+                "{host}: tpm2_pin must be present (placeholder), not None"
+            );
+
+            // Guard against ever committing real secrets: the example files must
+            // carry placeholder tokens for every secret field.
+            assert_eq!(cfg.luks_key, "REPLACE_AT_PLACE_TIME", "{host}: luks_key placeholder");
+            assert_eq!(
+                cfg.root_password, "REPLACE_AT_PLACE_TIME",
+                "{host}: root_password placeholder"
+            );
+            assert_eq!(
+                cfg.tpm2_pin.as_deref(),
+                Some("REPLACE_AT_PLACE_TIME"),
+                "{host}: tpm2_pin placeholder"
+            );
+        }
     }
 
     #[test]

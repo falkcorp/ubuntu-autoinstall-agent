@@ -1,7 +1,7 @@
 // file: src/cli/args.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
-// last-edited: 2026-06-21
+// last-edited: 2026-07-08
 
 //! Command line argument definitions
 
@@ -30,7 +30,7 @@ pub enum Commands {
         #[arg(short, long, value_enum, default_value = "amd64")]
         arch: ArchArg,
 
-        #[arg(long, default_value = "24.04")]
+        #[arg(long, default_value = "26.04")]
         version: String,
 
         #[arg(short, long)]
@@ -318,7 +318,7 @@ mod tests {
                 cache_dir,
             } => {
                 assert!(matches!(arch, ArchArg::Amd64));
-                assert_eq!(version, "24.04");
+                assert_eq!(version, "26.04");
                 assert!(output.is_none());
                 assert!(spec.is_none());
                 assert!(cache_dir.is_none());

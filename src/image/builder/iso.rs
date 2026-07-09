@@ -1,6 +1,7 @@
 // file: src/image/builder/iso.rs
-// version: 1.0.1
+// version: 1.1.0
 // guid: a1a2a3a4-b5b6-7890-1234-567890abcdef
+// last-edited: 2026-07-08
 
 //! ISO management and download utilities
 
@@ -89,6 +90,8 @@ impl IsoManager {
 
         // Convert version to codename for releases URL
         let codename = match spec.ubuntu_version.as_str() {
+            "26.04" => "resolute",
+            "25.10" => "questing",
             "25.04" => "plucky",
             "24.10" => "oracular",
             "24.04" => "noble",
