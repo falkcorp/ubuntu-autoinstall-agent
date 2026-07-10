@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/autoinstall/verify.rs
-// version: 1.2.2
+// version: 1.3.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
 // last-edited: 2026-07-10
 
@@ -41,13 +41,21 @@ use crate::{
 ///
 /// ZFS-on-LUKS layout (Path B): p1 ESP, p2 RESET, p3 bpool, **p4 LUKS** (holds
 /// rpool). The old LVM layout put LUKS on p3 — retargeted to p4 here.
-const LUKS_PARTITION: &str = "/dev/nvme0n1p4";
+///
+/// This is the DEFAULT sourced by `fleet::FleetConfig::luks_partition` — the
+/// live value used at runtime (`verify_host` and the pure evaluators below)
+/// is read through `crate::fleet::fleet()`, not this const directly.
+pub const LUKS_PARTITION: &str = "/dev/nvme0n1p4";
 
 /// The NIC used on all Lenovo fleet hosts.
-const LENSERV_NIC: &str = "enp1s0f0";
+///
+/// DEFAULT sourced by `fleet::FleetConfig::lenserv_nic` — see [`LUKS_PARTITION`].
+pub const LENSERV_NIC: &str = "enp1s0f0";
 
 /// Tang servers that must all appear in the clevis SSS binding.
-const TANG_URLS: &[&str] = &[
+///
+/// DEFAULT sourced by `fleet::FleetConfig::tang_urls` — see [`LUKS_PARTITION`].
+pub const TANG_URLS: &[&str] = &[
     "http://172.16.2.45",
     "http://172.16.2.46",
     "http://172.16.2.47",
@@ -112,7 +120,8 @@ impl VerifyReport {
 /// Expects output of `lsblk -o NAME,TYPE,FSTYPE`.
 pub fn evaluate_luks_partition(lsblk_output: &str) -> CheckResult {
     if lsblk_output.contains("crypto_LUKS") {
-        CheckResult::pass("luks_partition", format!("{LUKS_PARTITION} is LUKS"))
+        let luks_partition = &crate::fleet::fleet().luks_partition;
+        CheckResult::pass("luks_partition", format!("{luks_partition} is LUKS"))
     } else {
         CheckResult::fail(
             "luks_partition",
@@ -242,16 +251,16 @@ pub fn evaluate_shim_present(esp_listing: &str) -> CheckResult {
 ///
 /// Expects output of `clevis luks list <dev>`.
 pub fn evaluate_clevis_binding(clevis_output: &str) -> CheckResult {
+    let tang_urls = &crate::fleet::fleet().tang_urls;
     let has_sss = clevis_output.contains("sss");
     let has_threshold = clevis_output.contains(CLEVIS_THRESHOLD_STR);
-    let missing_urls: Vec<&str> = TANG_URLS
+    let missing_urls: Vec<&String> = tang_urls
         .iter()
-        .copied()
-        .filter(|url| !clevis_output.contains(url))
+        .filter(|url| !clevis_output.contains(url.as_str()))
         .collect();
 
     if has_sss && has_threshold && missing_urls.is_empty() {
-        CheckResult::pass("clevis_binding", format!("SSS t=2 with {} Tang servers", TANG_URLS.len()))
+        CheckResult::pass("clevis_binding", format!("SSS t=2 with {} Tang servers", tang_urls.len()))
     } else {
         let mut reasons = vec![];
         if !has_sss { reasons.push("missing 'sss' pin"); }
@@ -362,13 +371,14 @@ pub fn evaluate_hostname(hostname_output: &str, spec: &HostSpec) -> CheckResult 
 ///
 /// Expects output of `ip -br addr show <nic>`.
 pub fn evaluate_ip_address(ip_br_output: &str, spec: &HostSpec) -> CheckResult {
+    let lenserv_nic = &crate::fleet::fleet().lenserv_nic;
     if ip_br_output.contains(&spec.network_address) {
-        CheckResult::pass("ip_matches", format!("{} on {LENSERV_NIC}", spec.network_address))
+        CheckResult::pass("ip_matches", format!("{} on {lenserv_nic}", spec.network_address))
     } else {
         CheckResult::fail(
             "ip_matches",
             format!(
-                "expected {} on {LENSERV_NIC}, got: {ip_br_output:?}",
+                "expected {} on {lenserv_nic}, got: {ip_br_output:?}",
                 spec.network_address
             ),
         )
@@ -396,6 +406,8 @@ pub async fn verify_host(
     spec: &HostSpec,
     host_label: &str,
 ) -> Result<VerifyReport> {
+    let luks_partition = crate::fleet::fleet().luks_partition.clone();
+    let lenserv_nic = crate::fleet::fleet().lenserv_nic.clone();
     let mut checks = Vec::with_capacity(12);
 
     // 1. LUKS partition (+ no-LVM regression guard from the same lsblk)
@@ -432,14 +444,14 @@ pub async fn verify_host(
 
     // 2. Clevis SSS Tang binding
     let clevis = runner
-        .execute_with_output(&format!("sudo -n clevis luks list -d {LUKS_PARTITION}"))
+        .execute_with_output(&format!("sudo -n clevis luks list -d {luks_partition}"))
         .await
         .unwrap_or_default();
     checks.push(evaluate_clevis_binding(&clevis));
 
     // 2b. TPM2 (first-boot) + FIDO2 (manual) keyslots from luksDump
     let luksdump = runner
-        .execute_with_output(&format!("sudo -n cryptsetup luksDump {LUKS_PARTITION}"))
+        .execute_with_output(&format!("sudo -n cryptsetup luksDump {luks_partition}"))
         .await
         .unwrap_or_default();
     checks.push(evaluate_tpm2_keyslot(&luksdump));
@@ -484,7 +496,7 @@ pub async fn verify_host(
 
     // 9. IP address
     let ip_out = runner
-        .execute_with_output(&format!("ip -br addr show {LENSERV_NIC}"))
+        .execute_with_output(&format!("ip -br addr show {lenserv_nic}"))
         .await
         .unwrap_or_default();
     checks.push(evaluate_ip_address(&ip_out, spec));

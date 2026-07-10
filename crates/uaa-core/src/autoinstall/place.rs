@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/autoinstall/place.rs
-// version: 1.0.1
+// version: 1.1.0
 // guid: d3e4f5a6-b7c8-9d0e-1f2a-3b4c5d6e7f8a
 // last-edited: 2026-07-10
 
@@ -32,17 +32,29 @@ use crate::{
 };
 
 // ── Server-side constants ─────────────────────────────────────────────────────
+//
+// These are the DEFAULTS sourced by `crate::fleet::FleetConfig` — the single
+// source of truth for the literal values. Runtime code below reads the live
+// value through `crate::fleet::fleet()`, not these consts directly.
 
 /// Where cloud-init seeds live on the netboot server.
+///
+/// DEFAULT sourced by `fleet::FleetConfig::cloud_init_base`.
 pub const CLOUD_INIT_BASE: &str = "/var/www/html/cloud-init";
 
 /// Default netboot/API server.
+///
+/// DEFAULT sourced by `fleet::FleetConfig::netboot_server`.
 pub const DEFAULT_NETBOOT_SERVER: &str = "172.16.2.30";
 
 /// Default SSH user for the netboot server and lenserv hosts.
+///
+/// DEFAULT sourced by `fleet::FleetConfig::server_user`.
 pub const DEFAULT_SERVER_USER: &str = "jdfalk";
 
 /// Port where the flip API listens.
+///
+/// DEFAULT sourced by `fleet::FleetConfig::flip_api_port`.
 pub const FLIP_API_PORT: u16 = 25000;
 
 /// Boot target name for autoinstall.
@@ -77,12 +89,14 @@ pub fn render_meta_data(spec: &HostSpec) -> String {
 /// `hexmac` is the directory name (no path separator); `filename` is
 /// `user-data` or `meta-data`.
 pub fn seed_path(hexmac: &str, filename: &str) -> String {
-    format!("{CLOUD_INIT_BASE}/{hexmac}/{filename}")
+    let cloud_init_base = &crate::fleet::fleet().cloud_init_base;
+    format!("{cloud_init_base}/{hexmac}/{filename}")
 }
 
 /// Build the flip API URL for a hostname and target.
 pub fn flip_url(server: &str, hostname: &str, target: &str) -> String {
-    format!("http://{server}:{FLIP_API_PORT}/api/flip/{hostname}?target={target}")
+    let flip_api_port = crate::fleet::fleet().flip_api_port;
+    format!("http://{server}:{flip_api_port}/api/flip/{hostname}?target={target}")
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -145,7 +159,8 @@ pub async fn resolve_hexmac(
     server: &mut dyn CommandExecutor,
     hostname: &str,
 ) -> Result<String> {
-    let symlink_path = format!("{CLOUD_INIT_BASE}/{hostname}");
+    let cloud_init_base = &crate::fleet::fleet().cloud_init_base;
+    let symlink_path = format!("{cloud_init_base}/{hostname}");
     let output = server
         .execute_with_output(&format!("readlink {symlink_path}"))
         .await?;
@@ -225,11 +240,14 @@ pub async fn call_flip_api(url: &str) -> Result<FlipResult> {
         .to_string();
 
     if status == reqwest::StatusCode::FORBIDDEN {
+        let fleet = crate::fleet::fleet();
+        let netboot_server = &fleet.netboot_server;
+        let flip_api_port = fleet.flip_api_port;
         return Ok(FlipResult {
             ok: false,
             message: format!(
                 "403 Forbidden — machine not approved for reinstall. \
-                 Run: curl http://{DEFAULT_NETBOOT_SERVER}:{FLIP_API_PORT}/api/approve/<mac>"
+                 Run: curl http://{netboot_server}:{flip_api_port}/api/approve/<mac>"
             ),
         });
     }
