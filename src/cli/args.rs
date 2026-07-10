@@ -1,7 +1,7 @@
 // file: src/cli/args.rs
-// version: 2.6.0
+// version: 2.7.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! Command line argument definitions
 
@@ -119,6 +119,16 @@ pub enum Commands {
             help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook)"
         )]
         report_url: Option<String>,
+
+        #[arg(
+            long,
+            conflicts_with = "from_phase",
+            help = "Run only these phases, e.g. \"5\", \"4-6\", \"0,1,5\" (default: all)"
+        )]
+        phases: Option<String>,
+
+        #[arg(long, help = "Run phases n..=6 (shorthand for \"n-6\")")]
+        from_phase: Option<u8>,
     },
 
     /// Install Ubuntu via SSH to target machine
@@ -158,6 +168,16 @@ pub enum Commands {
             help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook)"
         )]
         report_url: Option<String>,
+
+        #[arg(
+            long,
+            conflicts_with = "from_phase",
+            help = "Run only these phases, e.g. \"5\", \"4-6\", \"0,1,5\" (default: all)"
+        )]
+        phases: Option<String>,
+
+        #[arg(long, help = "Run phases n..=6 (shorthand for \"n-6\")")]
+        from_phase: Option<u8>,
     },
 
     /// Install Ubuntu locally (on current live system)
@@ -182,6 +202,16 @@ pub enum Commands {
             help = "Force installation even when not in live environment (use with caution)"
         )]
         force: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "from_phase",
+            help = "Run only these phases, e.g. \"5\", \"4-6\", \"0,1,5\" (default: all)"
+        )]
+        phases: Option<String>,
+
+        #[arg(long, help = "Run phases n..=6 (shorthand for \"n-6\")")]
+        from_phase: Option<u8>,
     },
 
     /// Write rendered user-data seed into the netboot server's cloud-init tree,
@@ -527,6 +557,8 @@ mod tests {
                 hold_on_failure,
                 pause_after_storage,
                 report_url: _,
+                phases,
+                from_phase,
             } => {
                 assert_eq!(host, "10.0.0.5");
                 assert!(hostname.is_none());
@@ -536,6 +568,8 @@ mod tests {
                 assert!(!dry_run);
                 assert!(!hold_on_failure);
                 assert!(!pause_after_storage);
+                assert!(phases.is_none());
+                assert!(from_phase.is_none());
             }
             _ => panic!("Expected SshInstall command"),
         }
@@ -574,6 +608,8 @@ mod tests {
                 hold_on_failure,
                 pause_after_storage,
                 report_url: _,
+                phases,
+                from_phase,
             } => {
                 assert_eq!(host, "server.example.com");
                 assert_eq!(hostname.as_deref(), Some("prod-web-01"));
@@ -583,6 +619,8 @@ mod tests {
                 assert!(dry_run);
                 assert!(hold_on_failure);
                 assert!(pause_after_storage);
+                assert!(phases.is_none());
+                assert!(from_phase.is_none());
             }
             _ => panic!("Expected SshInstall command"),
         }
@@ -624,6 +662,8 @@ mod tests {
                 hold_on_failure,
                 pause_after_storage,
                 force,
+                phases,
+                from_phase,
             } => {
                 assert!(hostname.is_none());
                 assert!(!investigate_only);
@@ -633,6 +673,8 @@ mod tests {
                 assert!(!force);
                 assert!(!hold_on_failure);
                 assert!(!pause_after_storage);
+                assert!(phases.is_none());
+                assert!(from_phase.is_none());
             }
             _ => panic!("Expected LocalInstall command"),
         }
@@ -664,6 +706,8 @@ mod tests {
                 hold_on_failure,
                 pause_after_storage,
                 force,
+                phases,
+                from_phase,
             } => {
                 assert_eq!(hostname.as_deref(), Some("local-server"));
                 assert!(investigate_only);
@@ -671,6 +715,8 @@ mod tests {
                 assert!(hold_on_failure);
                 assert!(pause_after_storage);
                 assert!(!force);
+                assert!(phases.is_none());
+                assert!(from_phase.is_none());
             }
             _ => panic!("Expected LocalInstall command"),
         }

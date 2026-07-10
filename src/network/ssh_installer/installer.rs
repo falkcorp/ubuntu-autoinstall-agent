@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.7.0
+// version: 2.8.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -27,6 +27,123 @@ use tracing::{error, info};
 /// `curtin in-target -- sh -c 'touch /etc/uaa-target-marker'`.
 pub const TARGET_MARKER_PATH: &str = "/etc/uaa-target-marker";
 
+/// Which of phases 0..=6 run. Parsed from `--phases` / `--from-phase`.
+///
+/// The flagless install builds [`PhaseSelection::full`] (every phase selected,
+/// `explicit == false`), so the default command stream is byte-identical to a
+/// pre-flag run. A selective run sets `explicit == true` and only the chosen
+/// phases execute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseSelection {
+    selected: [bool; 7],
+    explicit: bool,
+}
+
+/// Zero-sized wipe token. The single field is private, so a `WipeAuthorization`
+/// can only be minted inside this module via [`PhaseSelection::authorize_wipe`]
+/// — which hands one back exactly when Phase 2 is selected. No token, no wipe:
+/// every wipe-capable call site requires this value, so a selection that omits
+/// Phase 2 makes a disk wipe structurally unreachable.
+pub struct WipeAuthorization(pub(crate) ());
+
+impl PhaseSelection {
+    /// Every phase 0..=6 selected. Non-explicit: this is the flagless default,
+    /// and its command stream matches the pre-flag installer exactly.
+    pub fn full() -> Self {
+        Self {
+            selected: [true; 7],
+            explicit: false,
+        }
+    }
+
+    /// Parse a `--phases` spec: comma-separated single phases (`"5"`) and/or
+    /// inclusive ranges (`"4-6"`), e.g. `"0,1,5"`. Fail-closed — every
+    /// malformed input is an `Err`, never a best-effort selection.
+    pub fn parse(spec: &str) -> std::result::Result<Self, String> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err("empty --phases spec".to_string());
+        }
+        let mut selected = [false; 7];
+        for token in spec.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(format!("empty phase token in \"{spec}\""));
+            }
+            match token.split_once('-') {
+                Some((a, b)) => {
+                    let a = Self::parse_phase(a)?;
+                    let b = Self::parse_phase(b)?;
+                    if a > b {
+                        return Err(format!("reversed phase range \"{token}\""));
+                    }
+                    for phase in a..=b {
+                        selected[phase as usize] = true;
+                    }
+                }
+                None => {
+                    let phase = Self::parse_phase(token)?;
+                    selected[phase as usize] = true;
+                }
+            }
+        }
+        Ok(Self {
+            selected,
+            explicit: true,
+        })
+    }
+
+    /// Parse a single `0..=6` phase number, rejecting anything else.
+    fn parse_phase(s: &str) -> std::result::Result<u8, String> {
+        let s = s.trim();
+        let n: u8 = s
+            .parse()
+            .map_err(|_| format!("invalid phase \"{s}\" (expected 0..=6)"))?;
+        if n > 6 {
+            return Err(format!("phase {n} out of range (expected 0..=6)"));
+        }
+        Ok(n)
+    }
+
+    /// `--from-phase n` shorthand for `"n-6"`.
+    pub fn from_phase(n: u8) -> std::result::Result<Self, String> {
+        Self::parse(&format!("{n}-6"))
+    }
+
+    /// Whether the given phase is selected to run.
+    pub fn contains(&self, phase: u8) -> bool {
+        self.selected.get(phase as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether the selection came from a flag (vs. the flagless `full()` default).
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Mint a wipe token iff Phase 2 (disk preparation) is selected. Every
+    /// wipe-capable call site gates on the returned `Some`.
+    pub fn authorize_wipe(&self) -> Option<WipeAuthorization> {
+        if self.selected[2] {
+            Some(WipeAuthorization(()))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a non-destructive LUKS reopen is needed: Phase 2 is NOT selected
+    /// but some later phase (3..=6) is. Consumed by phase-rerun/TASK-02.
+    pub fn needs_luks_reopen(&self) -> bool {
+        !self.selected[2] && (3..=6).any(|p| self.selected[p])
+    }
+
+    /// Whether a non-destructive pool import is needed: Phases 2 AND 3 are both
+    /// NOT selected but some later phase (4..=6) is. Consumed by
+    /// phase-rerun/TASK-02.
+    pub fn needs_pool_import(&self) -> bool {
+        !self.selected[2] && !self.selected[3] && (4..=6).any(|p| self.selected[p])
+    }
+}
+
 /// Installer that works over SSH or locally.
 ///
 /// Call [`connect`] for SSH or [`connect_local`] for local execution before
@@ -45,6 +162,19 @@ impl SshInstaller {
         Self {
             runner: Box::new(LocalClient::new()),
             connected: false,
+            variables: HashMap::new(),
+            report_url: None,
+        }
+    }
+
+    /// Test-only constructor: pre-connected installer backed by an injected
+    /// executor (e.g. a recording mock), so phase sequencing can be exercised
+    /// without a real SSH/local target.
+    #[cfg(test)]
+    pub(crate) fn for_tests(runner: Box<dyn CommandExecutor>) -> Self {
+        Self {
+            runner,
+            connected: true,
             variables: HashMap::new(),
             report_url: None,
         }
@@ -109,9 +239,10 @@ impl SshInstaller {
         config: &InstallationConfig,
         hold_on_failure: bool,
         pause_after_storage: bool,
+        selection: &PhaseSelection,
     ) -> Result<()> {
         if !hold_on_failure && !pause_after_storage {
-            return self.perform_installation(config).await;
+            return self.perform_installation(config, selection).await;
         }
         self.require_connected()?;
 
@@ -123,7 +254,7 @@ impl SshInstaller {
         let mut failed_phases: Vec<String> = Vec::new();
         let mut successful_phases: Vec<&str> = Vec::new();
 
-        if let Err(e) = self.preflight_checks(config).await {
+        if let Err(e) = self.preflight_checks(config, selection).await {
             error!("✗ Preflight checks failed: {}", e);
         } else {
             info!("✓ Preflight checks passed");
@@ -149,10 +280,26 @@ impl SshInstaller {
             }};
         }
 
-        run_phase!("Phase 0: Setup variables", self.setup_installation_variables(config));
-        run_phase!("Phase 1: Package installation", self.phase_1_package_installation());
-        run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config));
-        run_phase!("Phase 3: ZFS creation", self.phase_3_zfs_creation(config));
+        if selection.contains(0) {
+            run_phase!("Phase 0: Setup variables", self.setup_installation_variables(config));
+        } else {
+            info!("Phase 0: Setup variables — SKIPPED (--phases)");
+        }
+        if selection.contains(1) {
+            run_phase!("Phase 1: Package installation", self.phase_1_package_installation());
+        } else {
+            info!("Phase 1: Package installation — SKIPPED (--phases)");
+        }
+        if let Some(_wipe_auth) = selection.authorize_wipe() {
+            run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config));
+        } else {
+            info!("Phase 2: Disk preparation — SKIPPED (--phases)");
+        }
+        if selection.contains(3) {
+            run_phase!("Phase 3: ZFS creation", self.phase_3_zfs_creation(config));
+        } else {
+            info!("Phase 3: ZFS creation — SKIPPED (--phases)");
+        }
 
         if pause_after_storage {
             self.print_next_commands_after_storage(config).await?;
@@ -165,12 +312,24 @@ impl SshInstaller {
                 .await;
         }
 
-        run_phase!("Phase 4: Base system", self.phase_4_base_system(config));
-        run_phase!(
-            "Phase 5: System configuration",
-            self.phase_5_system_configuration(config)
-        );
-        run_phase!("Phase 6: Final setup", self.phase_6_final_setup(config));
+        if selection.contains(4) {
+            run_phase!("Phase 4: Base system", self.phase_4_base_system(config));
+        } else {
+            info!("Phase 4: Base system — SKIPPED (--phases)");
+        }
+        if selection.contains(5) {
+            run_phase!(
+                "Phase 5: System configuration",
+                self.phase_5_system_configuration(config)
+            );
+        } else {
+            info!("Phase 5: System configuration — SKIPPED (--phases)");
+        }
+        if selection.contains(6) {
+            run_phase!("Phase 6: Final setup", self.phase_6_final_setup(config));
+        } else {
+            info!("Phase 6: Final setup — SKIPPED (--phases)");
+        }
 
         self.generate_installation_report(&successful_phases, &failed_phases)
             .await;
@@ -182,7 +341,11 @@ impl SshInstaller {
     }
 
     /// Full installation with standard error collection (continues past failures).
-    pub async fn perform_installation(&mut self, config: &InstallationConfig) -> Result<()> {
+    pub async fn perform_installation(
+        &mut self,
+        config: &InstallationConfig,
+        selection: &PhaseSelection,
+    ) -> Result<()> {
         self.require_connected()?;
 
         info!("Starting ZFS+LUKS installation for {}", config.hostname);
@@ -212,7 +375,7 @@ impl SshInstaller {
             }};
         }
 
-        match self.preflight_checks(config).await {
+        match self.preflight_checks(config, selection).await {
             Ok(_) => info!("✓ Preflight checks passed"),
             Err(e) => {
                 error!("✗ Preflight checks failed: {}", e);
@@ -220,17 +383,45 @@ impl SshInstaller {
             }
         }
 
-        run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
-        run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation());
-        run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config));
-        run_phase!("Phase 3: ZFS creation", 50, self.phase_3_zfs_creation(config));
-        run_phase!("Phase 4: Base system", 75, self.phase_4_base_system(config));
-        run_phase!(
-            "Phase 5: System configuration",
-            90,
-            self.phase_5_system_configuration(config)
-        );
-        run_phase!("Phase 6: Final setup", 95, self.phase_6_final_setup(config));
+        if selection.contains(0) {
+            run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
+        } else {
+            info!("Phase 0: Setup variables — SKIPPED (--phases)");
+        }
+        if selection.contains(1) {
+            run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation());
+        } else {
+            info!("Phase 1: Package installation — SKIPPED (--phases)");
+        }
+        if let Some(_wipe_auth) = selection.authorize_wipe() {
+            run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config));
+        } else {
+            info!("Phase 2: Disk preparation — SKIPPED (--phases)");
+        }
+        if selection.contains(3) {
+            run_phase!("Phase 3: ZFS creation", 50, self.phase_3_zfs_creation(config));
+        } else {
+            info!("Phase 3: ZFS creation — SKIPPED (--phases)");
+        }
+        if selection.contains(4) {
+            run_phase!("Phase 4: Base system", 75, self.phase_4_base_system(config));
+        } else {
+            info!("Phase 4: Base system — SKIPPED (--phases)");
+        }
+        if selection.contains(5) {
+            run_phase!(
+                "Phase 5: System configuration",
+                90,
+                self.phase_5_system_configuration(config)
+            );
+        } else {
+            info!("Phase 5: System configuration — SKIPPED (--phases)");
+        }
+        if selection.contains(6) {
+            run_phase!("Phase 6: Final setup", 95, self.phase_6_final_setup(config));
+        } else {
+            info!("Phase 6: Final setup — SKIPPED (--phases)");
+        }
 
         self.generate_installation_report(&successful_phases, &failed_phases)
             .await;
@@ -315,7 +506,11 @@ impl SshInstaller {
         }
     }
 
-    async fn preflight_checks(&mut self, config: &InstallationConfig) -> Result<()> {
+    async fn preflight_checks(
+        &mut self,
+        config: &InstallationConfig,
+        selection: &PhaseSelection,
+    ) -> Result<()> {
         info!("Running preflight checks");
 
         let ping = self
@@ -384,11 +579,23 @@ impl SshInstaller {
 
         if has_bpool || has_rpool || luks_active || target_has_mounts {
             info!(
-                "Preflight: residual state detected (bpool={} rpool={} luks={} mounts={}); recovering",
+                "Preflight: residual state detected (bpool={} rpool={} luks={} mounts={})",
                 has_bpool, has_rpool, luks_active, target_has_mounts
             );
-            let mut disk_manager = DiskManager::new(&mut *self.runner);
-            let _ = disk_manager.recover_after_failure_and_wipe(config).await;
+            match selection.authorize_wipe() {
+                Some(_auth) => {
+                    info!("Preflight: Phase 2 selected — recovering (wipe authorized)");
+                    let mut disk_manager = DiskManager::new(&mut *self.runner);
+                    let _ = disk_manager.recover_after_failure_and_wipe(config).await;
+                }
+                None => {
+                    return Err(crate::error::AutoInstallError::ValidationError(
+                        "Residual install state detected and Phase 2 is not selected; refusing to wipe. \
+                         Non-destructive mount-existing-target prep lands in phase-rerun/TASK-02."
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -718,5 +925,270 @@ mod tests {
     fn test_installer_default_not_connected() {
         let installer = SshInstaller::new();
         assert!(!installer.connected);
+    }
+
+    // ── Phase-selection unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_phase_selection_parse_single_range_list() {
+        let single = PhaseSelection::parse("5").unwrap();
+        assert!(single.is_explicit());
+        assert!(single.contains(5));
+        for p in [0u8, 1, 2, 3, 4, 6] {
+            assert!(!single.contains(p), "phase {p} should not be selected");
+        }
+
+        let range = PhaseSelection::parse("4-6").unwrap();
+        assert!(range.is_explicit());
+        for p in [4u8, 5, 6] {
+            assert!(range.contains(p));
+        }
+        for p in [0u8, 1, 2, 3] {
+            assert!(!range.contains(p));
+        }
+
+        let list = PhaseSelection::parse("0,1,5").unwrap();
+        assert!(list.is_explicit());
+        for p in [0u8, 1, 5] {
+            assert!(list.contains(p));
+        }
+        for p in [2u8, 3, 4, 6] {
+            assert!(!list.contains(p));
+        }
+    }
+
+    #[test]
+    fn test_phase_selection_parse_rejects_invalid() {
+        for spec in ["", "7", "6-4", "a", "1,,2"] {
+            assert!(
+                PhaseSelection::parse(spec).is_err(),
+                "spec {spec:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_phase_selection_default_is_full_not_explicit() {
+        let full = PhaseSelection::full();
+        for p in 0u8..=6 {
+            assert!(full.contains(p));
+        }
+        assert!(!full.is_explicit());
+        assert!(full.authorize_wipe().is_some());
+    }
+
+    #[test]
+    fn test_authorize_wipe_denied_without_phase2() {
+        assert!(PhaseSelection::parse("4-6")
+            .unwrap()
+            .authorize_wipe()
+            .is_none());
+        assert!(PhaseSelection::parse("2-6")
+            .unwrap()
+            .authorize_wipe()
+            .is_some());
+    }
+
+    #[test]
+    fn test_from_phase_shorthand() {
+        let sel = PhaseSelection::from_phase(4).unwrap();
+        assert_eq!(sel, PhaseSelection::parse("4-6").unwrap());
+    }
+
+    #[test]
+    fn test_needs_prep_matrix() {
+        let five = PhaseSelection::parse("5").unwrap();
+        assert!(five.needs_luks_reopen());
+        assert!(five.needs_pool_import());
+
+        let three_six = PhaseSelection::parse("3-6").unwrap();
+        assert!(three_six.needs_luks_reopen());
+        assert!(!three_six.needs_pool_import());
+
+        let two_six = PhaseSelection::parse("2-6").unwrap();
+        assert!(!two_six.needs_luks_reopen());
+        assert!(!two_six.needs_pool_import());
+
+        let full = PhaseSelection::full();
+        assert!(!full.needs_luks_reopen());
+        assert!(!full.needs_pool_import());
+    }
+
+    // ── Recording executor for phase-sequencing tests ─────────────────────────
+
+    use std::sync::{Arc, Mutex};
+
+    /// Records every command routed through the executor into a shared log so
+    /// tests can assert which commands a selective/full run issued. Mirrors the
+    /// `RecordingMock` pattern in `src/autoinstall/place.rs`.
+    #[derive(Clone, Default)]
+    struct RecordingExecutor {
+        /// Command → preset response (drives `check_silent` / output methods).
+        responses: HashMap<String, String>,
+        /// Ordered log of every command string seen.
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingExecutor {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_responses(pairs: &[(&str, &str)]) -> Self {
+            Self {
+                responses: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                commands: Arc::new(Mutex::new(vec![])),
+            }
+        }
+
+        fn recorded(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommandExecutor for RecordingExecutor {
+        async fn connect(&mut self, _host: &str, _user: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn execute(&mut self, cmd: &str) -> Result<()> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(())
+        }
+        async fn execute_with_output(&mut self, cmd: &str) -> Result<String> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(self.responses.get(cmd).cloned().unwrap_or_default())
+        }
+        async fn execute_with_error_collection(
+            &mut self,
+            cmd: &str,
+            _desc: &str,
+        ) -> Result<(i32, String, String)> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok((0, self.responses.get(cmd).cloned().unwrap_or_default(), String::new()))
+        }
+        async fn check_silent(&mut self, cmd: &str) -> Result<bool> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(!self.responses.get(cmd).map_or(true, |s| s.is_empty()))
+        }
+        async fn collect_debug_info(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn upload_file(&mut self, _local: &str, _remote: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn download_file(&mut self, _remote: &str, _local: &str) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) {}
+    }
+
+    fn contains_cmd(cmds: &[String], needle: &str) -> bool {
+        cmds.iter().any(|c| c.contains(needle))
+    }
+
+    fn position_cmd(cmds: &[String], needle: &str) -> Option<usize> {
+        cmds.iter().position(|c| c.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn test_selective_run_skips_unselected_phases() {
+        let mock = RecordingExecutor::new();
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        for forbidden in [
+            "wipefs",
+            "sgdisk",
+            "debootstrap",
+            "zpool create",
+            "cryptsetup luksFormat",
+        ] {
+            assert!(
+                !contains_cmd(&cmds, forbidden),
+                "selective --phases 5 run must not issue {forbidden:?}"
+            );
+        }
+        assert!(
+            contains_cmd(&cmds, "grub"),
+            "Phase 5 should still issue a grub command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_run_full_sequence() {
+        let mock = RecordingExecutor::new();
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::full();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        let wipefs = position_cmd(&cmds, "wipefs -a").expect("wipefs -a expected");
+        let sgdisk = position_cmd(&cmds, "sgdisk").expect("sgdisk expected");
+        let zpool = position_cmd(&cmds, "zpool create").expect("zpool create expected");
+        // Match the Phase-4 debootstrap *invocation*, not the "debootstrap"
+        // package name apt installs back in Phase 1.
+        let debootstrap =
+            position_cmd(&cmds, "debootstrap resolute /mnt/targetos").expect("debootstrap expected");
+        let grub = position_cmd(&cmds, "grub-install").expect("grub-install expected");
+
+        assert!(
+            wipefs <= sgdisk && sgdisk < zpool && zpool < debootstrap && debootstrap < grub,
+            "expected wipefs<=sgdisk<zpool<debootstrap<grub, got {wipefs} {sgdisk} {zpool} {debootstrap} {grub}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_preflight_selective_no_wipe_on_residual() {
+        // Residual rpool present, but --phases 5 omits Phase 2 → guard refuses.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zpool list -H rpool >/dev/null 2>&1",
+            "rpool",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            !contains_cmd(&cmds, "wipefs"),
+            "residual selective run must not wipe"
+        );
+        assert!(
+            !contains_cmd(&cmds, "sgdisk --zap-all"),
+            "residual selective run must not zap GPT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_run_still_wipes_on_residual() {
+        // ANTI-OVER-SUPPRESSION: the same residual state under the flagless full
+        // selection MUST still wipe — the guard must never block the normal path.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zpool list -H rpool >/dev/null 2>&1",
+            "rpool",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::full();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            contains_cmd(&cmds, "wipefs -a"),
+            "full install on residual state must still wipe"
+        );
     }
 }

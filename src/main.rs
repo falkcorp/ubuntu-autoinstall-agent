@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! Ubuntu AutoInstall Agent - Main entry point
 
@@ -70,6 +70,8 @@ async fn main() -> Result<()> {
                 pause_after_storage,
                 force,
                 report_url,
+                phases,
+                from_phase,
             } => {
                 install_command(
                     remote,
@@ -81,6 +83,8 @@ async fn main() -> Result<()> {
                     pause_after_storage,
                     force,
                     report_url,
+                    phases,
+                    from_phase,
                 )
                 .await
             }
@@ -94,6 +98,8 @@ async fn main() -> Result<()> {
                 hold_on_failure,
                 pause_after_storage,
                 report_url,
+                phases,
+                from_phase,
             } => {
                 ssh_install_command(
                     &host,
@@ -105,6 +111,8 @@ async fn main() -> Result<()> {
                     hold_on_failure,
                     pause_after_storage,
                     report_url,
+                    phases,
+                    from_phase,
                 )
                 .await
             }
@@ -115,6 +123,8 @@ async fn main() -> Result<()> {
                 hold_on_failure,
                 pause_after_storage,
                 force,
+                phases,
+                from_phase,
             } => {
                 local_install_command(
                     hostname,
@@ -125,6 +135,8 @@ async fn main() -> Result<()> {
                     pause_after_storage,
                     force,
                     None, // report_url
+                    phases,
+                    from_phase,
                 )
                 .await
             }
