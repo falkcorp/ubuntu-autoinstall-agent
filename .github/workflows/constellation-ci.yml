@@ -1,0 +1,52 @@
+# file: .github/workflows/constellation-ci.yml
+# version: 1.0.0
+# guid: ac85fa7d-b81e-4daa-bc50-a370bcfb5d73
+# last-edited: 2026-07-10
+
+name: Constellation CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  workspace-checks:
+    name: Workspace clippy + tests + SPA build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: constellation-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Fetch dependencies
+        run: cargo fetch
+
+      - name: Clippy (workspace, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests (workspace, offline)
+        run: cargo test --workspace --lib --offline
+
+      - name: SPA build (web/)
+        run: |
+          if [ -d web ]; then
+            cd web && npm ci && npm run build
+          else
+            echo "SPA build skipped: web/ not present yet"
+          fi
