@@ -1,0 +1,31 @@
+[package]
+name = "uaa"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Automated Ubuntu server deployment with golden images and LUKS encryption"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "ubuntu-autoinstall-agent"
+path = "src/main.rs"
+
+[dependencies]
+uaa-core = { path = "../uaa-core" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tempfile = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

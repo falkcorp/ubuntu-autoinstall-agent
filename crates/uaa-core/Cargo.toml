@@ -1,0 +1,37 @@
+[package]
+name = "uaa-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Automated Ubuntu server deployment with golden images and LUKS encryption"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+ssh2 = { workspace = true }
+ring = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+dirs = { workspace = true }
+nix = { workspace = true }
+indicatif = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }

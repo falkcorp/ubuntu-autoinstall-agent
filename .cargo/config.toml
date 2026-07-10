@@ -1,7 +1,9 @@
 # file: .cargo/config.toml
-# version: 1.0.0
+# version: 1.0.1
 # guid: 7a9b4c2e-5d6f-4b8a-91e2-3c5d7f9a1b2c
+# last-edited: 2026-07-10
 
+# workspace: binary built from crates/uaa (bin name frozen ubuntu-autoinstall-agent)
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
 
