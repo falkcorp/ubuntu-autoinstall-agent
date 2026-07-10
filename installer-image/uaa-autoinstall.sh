@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: installer-image/uaa-autoinstall.sh
-# version: 1.1.0
+# version: 1.2.0
 # guid: 4b8e1d02-6f3a-4c77-9e21-5a0c8b6d1f34
 # last-edited: 2026-07-09
 #
@@ -52,6 +52,18 @@ finish() {
     esac
 }
 
+finish_failure() {
+    # Failure paths must NEVER reboot: with uaa.autoinstall still on the boot
+    # cmdline a reboot lands right back here -> infinite fetch/wipe/reinstall
+    # loop. Coerce reboot->poweroff; only 'shell' is honored as-is.
+    local action="$1"
+    case "$action" in
+        shell) finish shell ;;
+        *)     [ "$action" = reboot ] && log "on_done=reboot ignored on FAILURE (would loop) — powering off"
+               finish poweroff ;;
+    esac
+}
+
 ON_DONE="$(cmdline_value uaa.on_done || echo poweroff)"
 
 CONFIG_URL="$(cmdline_value uaa.config || true)"
@@ -71,7 +83,7 @@ if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "${CONFIG_URL}" -o "${CO
     log "FAILED to fetch config from ${CONFIG_URL}"
     report_status failed "uaa-autoinstall: could not fetch ${CONFIG_URL}"
     # A config-fetch failure should NOT loop-reinstall — halt for inspection.
-    finish "${ON_DONE:-poweroff}"
+    finish_failure "${ON_DONE:-poweroff}"
     exit 1
 fi
 
@@ -89,6 +101,6 @@ else
     report_status failed "uaa-autoinstall: ${HOST} install failed (rc=${rc})"
     # Do NOT reboot-loop on a broken install; power off (or drop to shell) so an
     # operator can inspect. Override with uaa.on_done=shell for interactive debug.
-    finish "${ON_DONE:-poweroff}"
+    finish_failure "${ON_DONE:-poweroff}"
     exit "${rc}"
 fi

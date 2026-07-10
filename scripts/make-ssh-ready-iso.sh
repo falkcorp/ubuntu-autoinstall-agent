@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/make-ssh-ready-iso.sh
-# version: 1.1.0
+# version: 1.2.0
 # guid: 5d2b7f18-9c04-4a6e-8b31-2f7a0c9d6e42
 # last-edited: 2026-07-09
 #
@@ -85,13 +85,20 @@ if xorriso -osirrox on -indev "$IN_DEV" -extract /boot/grub/loopback.cfg "$WD/lo
   HAVE_LOOPBACK=1
 fi
 
+# Portable in-place sed: BSD/macOS sed rejects GNU's `-i -E` combo (-E gets
+# eaten as the -i backup suffix), so write via a temp file instead.
+sed_inplace() {
+  local expr="$1" f="$2"
+  sed -E "$expr" "$f" > "$f.sedtmp" && mv "$f.sedtmp" "$f"
+}
+
 # Add the cloud-init NoCloud datasource to every kernel line that boots casper.
 # The semicolon must be escaped for GRUB. Idempotent (skip if already present).
 patch_cfg() {
   local f="$1"
   if grep -q "ds=nocloud" "$f"; then echo "  ($f already patched)"; return; fi
   # Insert right after the vmlinuz path on each linux/linuxefi line.
-  sed -i -E 's#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\1 ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0#' "$f"
+  sed_inplace 's#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\1 ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0#' "$f"
   echo "  patched $f"
 }
 # Opt-in: bake the uaa.autoinstall token (+ optional uaa.on_done=) so the seed's
@@ -102,7 +109,7 @@ patch_autoinstall() {
   local f="$1" tokens="uaa.autoinstall"
   [ -n "$ON_DONE" ] && tokens="uaa.autoinstall uaa.on_done=${ON_DONE}"
   if grep -q "uaa\.autoinstall" "$f"; then echo "  ($f already has uaa.autoinstall)"; return; fi
-  sed -i -E "s#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\\1 ${tokens}#" "$f"
+  sed_inplace "s#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\\1 ${tokens}#" "$f"
   echo "  baked '${tokens}' into $f"
 }
 echo "== patching kernel cmdline =="

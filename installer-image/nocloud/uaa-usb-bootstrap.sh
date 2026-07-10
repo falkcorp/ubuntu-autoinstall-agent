@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: installer-image/nocloud/uaa-usb-bootstrap.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 9e4c7a20-1b5f-4d38-8a6e-2c0d9f471b63
 # last-edited: 2026-07-09
 #
@@ -65,6 +65,19 @@ finish() {
     esac
 }
 
+finish_failure() {
+    # Failure paths must NEVER reboot: uaa.on_done=reboot is baked into the USB
+    # cmdline, so a reboot lands right back in this bootstrap -> infinite
+    # fetch/wipe/reinstall loop. Coerce reboot->poweroff; only 'shell' (stay up
+    # for SSH inspection) is honored as-is.
+    local action="$1"
+    case "$action" in
+        shell) finish shell ;;
+        *)     [ "$action" = reboot ] && log "on_done=reboot ignored on FAILURE (would loop) — powering off"
+               finish poweroff ;;
+    esac
+}
+
 # Best-effort UEFI boot order: network entries first, ubuntu second, rest after.
 # Non-fatal by design — legacy-BIOS hosts (e.g. U1's legacy-OpROM IMSM array)
 # have no EFI variables and efibootmgr just fails; that's fine.
@@ -93,7 +106,7 @@ log "fetching agent binary: ${AGENT_URL}"
 if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 120 "${AGENT_URL}" -o "${AGENT}"; then
     log "FAILED to fetch agent from ${AGENT_URL}"
     report_status failed "uaa-usb-bootstrap: could not fetch agent ${AGENT_URL}"
-    finish "${ON_DONE}"
+    finish_failure "${ON_DONE}"
     exit 1
 fi
 chmod +x "${AGENT}"
@@ -113,7 +126,7 @@ if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "${CONFIG_URL}" -o "${CO
     log "FAILED to fetch config from ${CONFIG_URL}"
     report_status failed "uaa-usb-bootstrap: could not fetch ${CONFIG_URL}"
     # A config-fetch failure must NOT loop-reinstall — halt for inspection.
-    finish "${ON_DONE}"
+    finish_failure "${ON_DONE}"
     exit 1
 fi
 
@@ -136,6 +149,6 @@ else
     report_status failed "uaa-usb-bootstrap: ${HOST} install failed (rc=${rc})"
     # Do NOT reboot-loop on a broken install; power off (or stay up with
     # uaa.on_done=shell) so an operator can inspect over SSH.
-    finish "${ON_DONE}"
+    finish_failure "${ON_DONE}"
     exit "${rc}"
 fi

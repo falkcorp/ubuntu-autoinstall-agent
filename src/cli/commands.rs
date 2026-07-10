@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-09
 
@@ -311,7 +311,9 @@ pub async fn ssh_install_command(
     // Load config from file or fall back to built-in default
     let config = if let Some(ref path) = config_path {
         info!("Loading installation config from {}", path);
-        InstallationConfig::from_yaml_file(path)?
+        let cfg = InstallationConfig::from_yaml_file(path)?;
+        validate_config_secrets(&cfg)?;
+        cfg
     } else {
         let hn = hostname.unwrap_or_else(|| "len-serv-003".to_string());
         if hn == "len-serv-003" {
@@ -367,14 +369,22 @@ pub async fn ssh_install_command(
     Ok(())
 }
 
-/// Install Ubuntu locally on the current live system
+/// Install Ubuntu locally on the current live system.
+///
+/// With `config_path` the full `InstallationConfig` YAML drives the install
+/// non-interactively (the USB/netboot auto-bootstrap path — stdin is /dev/null
+/// under cloud-init runcmd, so we must never prompt). Without it, the legacy
+/// interactive path auto-detects and prompts.
+#[allow(clippy::too_many_arguments)]
 pub async fn local_install_command(
     hostname: Option<String>,
+    config_path: Option<String>,
     investigate_only: bool,
     dry_run: bool,
     hold_on_failure: bool,
     pause_after_storage: bool,
     force: bool,
+    report_url: Option<String>,
 ) -> Result<()> {
     let hostname = hostname.unwrap_or_else(|| "ubuntu-local".to_string());
 
@@ -403,6 +413,7 @@ pub async fn local_install_command(
     }
 
     let mut installer = SshInstaller::new();
+    installer.set_report_url(report_url);
 
     // "Connect" to localhost (no-op for local)
     installer.connect_local().await?;
@@ -419,8 +430,16 @@ pub async fn local_install_command(
         return Ok(());
     }
 
-    // Create installation configuration for local system
-    let config = create_local_installation_config(&hostname, &system_info)?;
+    // Config-driven (non-interactive) or legacy interactive-detect path.
+    let config_driven = config_path.is_some();
+    let config = if let Some(ref path) = config_path {
+        info!("Loading installation config from {}", path);
+        let cfg = InstallationConfig::from_yaml_file(path)?;
+        validate_config_secrets(&cfg)?;
+        cfg
+    } else {
+        create_local_installation_config(&hostname, &system_info)?
+    };
 
     if dry_run {
         info!("DRY RUN: Would perform full ZFS+LUKS installation with config:");
@@ -451,13 +470,22 @@ pub async fn local_install_command(
         config.disk_device
     );
     println!("This is a DESTRUCTIVE operation that cannot be undone!");
-    println!("Press Ctrl+C to abort, or any other key to continue...");
 
-    // Wait for user confirmation
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(crate::error::AutoInstallError::IoError)?;
+    if config_driven {
+        // Automation path (USB/netboot bootstrap): stdin is /dev/null under
+        // cloud-init runcmd — prompting would silently read EOF. The explicit
+        // --config file IS the operator's confirmation (same contract as the
+        // SSH install path).
+        info!("Config-driven install: proceeding without interactive confirmation");
+    } else {
+        println!("Press Ctrl+C to abort, or any other key to continue...");
+
+        // Wait for user confirmation
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(crate::error::AutoInstallError::IoError)?;
+    }
 
     info!("Starting full ZFS+LUKS Ubuntu installation locally...");
     installer
@@ -513,19 +541,14 @@ pub async fn install_command(
         }
         None => {
             local_install_command(
-                config_path
-                    .as_deref()
-                    .and_then(|p| {
-                        InstallationConfig::from_yaml_file(p)
-                            .ok()
-                            .map(|c| c.hostname)
-                    })
-                    .or_else(|| std::env::var("HOSTNAME").ok()),
+                std::env::var("HOSTNAME").ok(),
+                config_path,
                 investigate_only,
                 dry_run,
                 hold_on_failure,
                 pause_after_storage,
                 force,
+                report_url,
             )
             .await
         }
@@ -534,13 +557,38 @@ pub async fn install_command(
 
 /// Check if we're running in a live environment
 fn is_live_environment() -> bool {
-    // Check for common live environment indicators
+    // Check for common live environment indicators. Ubuntu Server live ISOs
+    // use casper (boot=casper on the cmdline, /run/casper at runtime), NOT
+    // Debian live-boot's /run/live / boot=live — check both families.
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     std::path::Path::exists(std::path::Path::new("/run/live"))
         || std::path::Path::exists(std::path::Path::new("/lib/live"))
+        || std::path::Path::exists(std::path::Path::new("/run/casper"))
         || std::env::var("DEBIAN_FRONTEND").unwrap_or_default() == "noninteractive"
-        || std::fs::read_to_string("/proc/cmdline")
-            .unwrap_or_default()
-            .contains("boot=live")
+        || cmdline.contains("boot=live")
+        || cmdline.contains("boot=casper")
+        || cmdline.split_whitespace().any(|tok| tok == "casper")
+}
+
+/// Refuse to run a destructive install from a config whose secrets were never
+/// injected: an empty `luks_key` would LUKS-format the disk with an EMPTY
+/// passphrase, and a literal REPLACE_AT_PLACE_TIME means the placement step
+/// (deploy-usb-configs.sh secret injection) was skipped.
+fn validate_config_secrets(config: &InstallationConfig) -> Result<()> {
+    if config.luks_key.trim().is_empty() {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "Config luks_key is empty — refusing to LUKS-format with an empty passphrase"
+                .to_string(),
+        ));
+    }
+    if config.luks_key.contains("REPLACE_AT_PLACE_TIME")
+        || config.root_password.contains("REPLACE_AT_PLACE_TIME")
+    {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "Config still contains REPLACE_AT_PLACE_TIME placeholders — inject real secrets at placement time".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Create installation configuration for local system
@@ -634,7 +682,15 @@ fn prompt_for_luks_passphrase() -> Result<String> {
         .read_line(&mut passphrase)
         .map_err(crate::error::AutoInstallError::IoError)?;
 
-    Ok(passphrase.trim().to_string())
+    let passphrase = passphrase.trim().to_string();
+    if passphrase.is_empty() {
+        // stdin EOF (non-interactive) or bare Enter — never format with an
+        // empty passphrase.
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "Empty LUKS passphrase (non-interactive stdin?) — use --config with a luks_key instead".to_string(),
+        ));
+    }
+    Ok(passphrase)
 }
 
 /// Prompt for root password
@@ -1042,11 +1098,13 @@ users:
 
         // Act
         let result = local_install_command(
-            hostname, true,  // investigate_only
+            hostname, None,  // config_path
+            true,  // investigate_only
             false, // dry_run
             false, // hold_on_failure
             false, // pause_after_storage
             false, // force
+            None,  // report_url
         )
         .await;
 
@@ -1062,16 +1120,45 @@ users:
 
         // Act
         let result = local_install_command(
-            hostname, false, // investigate_only
+            hostname, None,  // config_path
+            false, // investigate_only
             true,  // dry_run
             false, // hold_on_failure
             false, // pause_after_storage
             false, // force
+            None,  // report_url
         )
         .await;
 
         // Assert
         // Should fail since we're not running as root in test environment
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_config_secrets_rejects_empty_luks_key() {
+        let mut config = InstallationConfig::for_len_serv_003();
+        config.luks_key = "".to_string();
+        assert!(validate_config_secrets(&config).is_err());
+        config.luks_key = "   ".to_string();
+        assert!(validate_config_secrets(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_secrets_rejects_placeholder() {
+        let mut config = InstallationConfig::for_len_serv_003();
+        config.luks_key = "REPLACE_AT_PLACE_TIME".to_string();
+        assert!(validate_config_secrets(&config).is_err());
+        config.luks_key = "realkey".to_string();
+        config.root_password = "REPLACE_AT_PLACE_TIME".to_string();
+        assert!(validate_config_secrets(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_config_secrets_accepts_real_secrets() {
+        let mut config = InstallationConfig::for_len_serv_003();
+        config.luks_key = "a-real-passphrase".to_string();
+        config.root_password = "a-real-password".to_string();
+        assert!(validate_config_secrets(&config).is_ok());
     }
 }
