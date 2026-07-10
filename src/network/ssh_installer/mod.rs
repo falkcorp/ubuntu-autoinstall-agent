@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/mod.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: sshmod01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-09
 
 //! SSH-based Ubuntu installation with ZFS and LUKS
 //!
@@ -14,6 +14,7 @@ pub mod installer;
 pub mod investigation;
 pub mod packages;
 pub mod partitions;
+pub mod reset_partition;
 pub mod status;
 pub mod system_setup;
 pub mod zfs_ops;

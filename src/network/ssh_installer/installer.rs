@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.9.0
+// version: 2.10.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-09
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -13,6 +13,7 @@ use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
 use super::packages::PackageManager;
 use super::partitions::partition_path;
+use super::reset_partition::ResetPartitionStager;
 use super::system_setup::SystemConfigurator;
 use super::zfs_ops::ZfsManager;
 use crate::network::{CommandExecutor, LocalClient, SshClient};
@@ -902,6 +903,14 @@ impl SshInstaller {
 
     async fn phase_5_system_configuration(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Phase 5: System configuration");
+        {
+            // Stage RESET p2 (recovery ISO + tarball + gated helper + GRUB drop-in).
+            // Non-fatal by design: a staging problem must not break the proven 7/7 flow.
+            let mut rp = ResetPartitionStager::new(&mut *self.runner);
+            if let Err(e) = rp.stage(config).await {
+                tracing::warn!("RESET partition staging skipped: {e}");
+            }
+        }
         let mut sc = SystemConfigurator::new(&mut *self.runner);
         sc.configure_zfs_in_chroot(config).await?;
         sc.configure_grub_in_chroot(config).await?;
