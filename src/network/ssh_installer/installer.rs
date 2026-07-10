@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.6.0
+// version: 2.6.1
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -634,6 +634,7 @@ mod tests {
             network_gateway: "192.0.2.1".into(),
             network_search: "example.test".into(),
             network_nameservers: vec!["1.1.1.1".into()],
+            network_renderer: crate::network::ssh_installer::config::default_network_renderer(),
             debootstrap_release: None,
             debootstrap_mirror: None,
             initramfs_type: InitramfsType::Dracut,

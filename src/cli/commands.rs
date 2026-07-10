@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.7.0
+// version: 2.7.1
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-10
 
@@ -664,6 +664,7 @@ fn create_local_installation_config(
         network_gateway: gateway,
         network_search: "local".to_string(),
         network_nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+        network_renderer: crate::network::ssh_installer::config::default_network_renderer(),
         // Ubuntu 26.04 LTS (Resolute Raccoon) — the fleet target. Was previously
         // "plucky" (25.04); pinned to resolute per the 26.04 requirement.
         debootstrap_release: Some("resolute".to_string()),
