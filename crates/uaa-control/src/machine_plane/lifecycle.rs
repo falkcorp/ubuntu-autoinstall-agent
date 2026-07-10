@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/machine_plane/lifecycle.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: f1273168-f053-480d-8baf-aa653555cb85
 // last-edited: 2026-07-10
 
@@ -470,12 +470,45 @@ async fn handle_webhook(State(state): State<AppState>, body: Bytes) -> Response 
     json_response(StatusCode::OK, json!({"ok": true}))
 }
 
+/// Reduce an untrusted string to a single safe filename component: every char
+/// that is not `[A-Za-z0-9._-]` (including `/`, `\`, NUL, and every other path
+/// separator) becomes `_`, so the result can never contain a path separator or
+/// span directories. An empty or all-dots result (`""`, `.`, `..`) falls back to
+/// `"unknown"` so it can never be a traversal component.
+fn safe_filename_component(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
 fn save_webhook_file(files_dir: &std::path::Path, hostname: &str, f: &Value) {
     let raw_path = f.get("path").and_then(Value::as_str).unwrap_or("unknown");
-    let sanitized = raw_path.replace('/', "_");
+    // Path-traversal guard: BOTH the webhook-supplied hostname and path are
+    // untrusted and flow into the on-disk filename. Sanitize each to a single
+    // component (the prior code left `hostname` unsanitized — a value like
+    // `../../etc/cron.d/x` escaped files_dir).
+    let sanitized = safe_filename_component(raw_path);
     let ts = now_epoch_string();
-    let hostname = if hostname.is_empty() { "unknown" } else { hostname };
-    let out = files_dir.join(format!("{hostname}-{ts}-{sanitized}"));
+    let safe_host = safe_filename_component(hostname);
+    let out = files_dir.join(format!("{safe_host}-{ts}-{sanitized}"));
+    // Defense-in-depth: a sanitized single-component name must land directly in
+    // files_dir. If that invariant ever breaks, refuse to write.
+    if out.parent() != Some(files_dir) {
+        tracing::warn!(path = %out.display(), "refusing webhook file write outside files_dir");
+        return;
+    }
     let content_b64 = f.get("content").and_then(Value::as_str).unwrap_or("");
 
     use base64::Engine;
@@ -998,5 +1031,30 @@ mod tests {
             endpoints,
             vec!["/api/finalreport", "/api/hardware-info", "/api/cloud-init"]
         );
+    }
+
+    #[test]
+    fn test_save_webhook_file_no_path_traversal() {
+        // Malicious hostname / path must never escape files_dir.
+        for evil in [
+            "../../etc/cron.d/x",
+            "..",
+            "a/b/c",
+            "x\\y",
+            "\0/etc/passwd",
+            "",
+        ] {
+            let c = safe_filename_component(evil);
+            assert!(!c.contains('/'), "sep leaked from {evil:?}: {c}");
+            assert!(!c.contains('\\'), "sep leaked from {evil:?}: {c}");
+            assert!(c != "..", "bare traversal survived {evil:?}");
+            // Joining the sanitized component onto files_dir stays in files_dir.
+            let files_dir = std::path::Path::new("/var/log/uaa/files");
+            let out = files_dir.join(format!("host-123-{c}"));
+            assert_eq!(out.parent(), Some(files_dir), "{evil:?} escaped");
+        }
+        // Anti-over-suppression: a legit filename is preserved (dots/dashes kept).
+        assert_eq!(safe_filename_component("install.log"), "install.log");
+        assert_eq!(safe_filename_component("len-serv-001"), "len-serv-001");
     }
 }
