@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # file: scripts/autoinstall-agent.py
-# version: 1.4.1
+# version: 1.5.0
 # guid: 7b6e4a2c-9f1d-4e8a-b3c6-2d5f8a1c9e07
-# last-edited: 2026-07-10
+# last-edited: 2026-07-09
 """
 autoinstall-agent: HTTP service on port 25000
 Handles webhook events, iPXE flips, cert issuance, MAC-based auth with approval,
@@ -22,7 +22,7 @@ autoinstall-agent.service (user cockroach-autoinstall). This file in the repo
 is a tracked mirror for version control/review — after editing, scp it to the
 server and `sudo systemctl restart autoinstall-agent` to deploy.
 """
-import json, os, re, time, base64, hashlib, secrets
+import html, json, os, re, time, base64, hashlib, secrets
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
@@ -111,6 +111,45 @@ def find_ipxe_file_by_hostname(hostname):
             if f"set hostname {hostname}" in content:
                 return os.path.join(IPXE_BOOT_DIR, f)
     return None
+
+def render_dashboard(registry, events, configs, binary):
+    """Single-page, display-only status HTML. No external assets, no <script>,
+    no forms — every interpolated value goes through esc()."""
+    def esc(v):
+        return html.escape("" if v is None else str(v), quote=True)
+    out = []
+    out.append("<!DOCTYPE html><html><head><meta charset='utf-8'>")
+    out.append("<title>autoinstall-agent status</title><style>")
+    out.append("body{font-family:sans-serif;margin:2em}table{border-collapse:collapse;margin-bottom:2em}")
+    out.append("th,td{border:1px solid #999;padding:4px 8px;text-align:left}th{background:#eee}")
+    out.append("</style></head><body><h1>autoinstall-agent — install server status</h1>")
+    # agent binary
+    out.append("<h2>Agent binary</h2><table><tr><th>path</th><th>present</th><th>size</th><th>mtime</th></tr>")
+    out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr></table>" % (
+        esc(binary.get("path")), esc(binary.get("present")),
+        esc(binary.get("size")), esc(binary.get("mtime"))))
+    # registry
+    out.append("<h2>Registry</h2><table><tr><th>hostname</th><th>mac</th><th>status</th><th>last_seen</th><th>last_ip</th></tr>")
+    for mac, e in sorted(registry.items()):
+        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(e.get("hostname")), esc(e.get("mac", mac)), esc(e.get("status")),
+            esc(e.get("last_seen")), esc(e.get("last_ip"))))
+    out.append("</table>")
+    # placed configs (METADATA ONLY — never contents, never links to contents)
+    out.append("<h2>Placed configs</h2><table><tr><th>hexmac</th><th>hostname</th><th>mtime</th><th>ready</th></tr>")
+    for c in configs:
+        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(c.get("hexmac")), esc(c.get("hostname")), esc(c.get("mtime")),
+            "yes" if c.get("placeholder_free") else "PLACEHOLDER"))
+    out.append("</table>")
+    # last events
+    out.append("<h2>Last %d events</h2><table><tr><th>received_at</th><th>name</th><th>event_type</th><th>status</th><th>progress</th><th>message</th></tr>" % len(events))
+    for ev in events:
+        out.append("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(ev.get("received_at")), esc(ev.get("name")), esc(ev.get("event_type")),
+            esc(ev.get("status")), esc(ev.get("progress")), esc(ev.get("message"))))
+    out.append("</table></body></html>")
+    return "".join(out)
 
 def webhook_should_flip(data):
     """True only for FINAL successful-install webhook payloads.
@@ -336,6 +375,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/uaa-configs":
             configs = collect_uaa_configs(CLOUD_INIT_BASE, load_registry())
             self.send_json(200, {"configs": configs, "count": len(configs)})
+            return
+
+        # ── Status dashboard (display-only; no forms, no mutation) ──
+        if path == "/dashboard":
+            try:
+                lines = open(EVENTS_LOG).readlines()[-20:]
+                events = [json.loads(l) for l in lines]
+            except Exception:
+                events = []
+            reg = load_registry()
+            body = render_dashboard(
+                reg, events,
+                collect_uaa_configs(CLOUD_INIT_BASE, reg),
+                agent_binary_status(UAA_BINARY_PATH),
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         # ── Machine registry ──
