@@ -1,5 +1,5 @@
 # file: crates/uaa-control/Cargo.toml
-# version: 1.0.0
+# version: 1.1.0
 # guid: 1e1a4386-a459-4a97-8baf-c942283b3107
 # last-edited: 2026-07-10
 
@@ -45,6 +45,15 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+# Wave-4 fillers: OAuth/RBAC (CT-03), audit chain (CT-04), parity endpoints (IP-01/02)
+reqwest = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
 # Sibling crates
 uaa-proto = { path = "../uaa-proto" }
 uaa-core = { path = "../uaa-core" }
