@@ -1,6 +1,7 @@
 # file: .github/workflows/musl-build.yml
-# version: 1.0.0
+# version: 1.1.0
 # guid: 6b2d9f04-3a7e-4c15-8d60-1f4e7a2c9b58
+# last-edited: 2026-07-10
 
 # Static x86_64 musl release build of the agent.
 #
@@ -13,6 +14,7 @@
 # (or build locally with scripts/build-musl.sh) and place it on the server:
 #   scp uaa-amd64 172.16.2.30:/tmp/ && \
 #   ssh 172.16.2.30 'sudo install -m 0755 /tmp/uaa-amd64 /var/www/html/uaa/uaa-amd64'
+# Later constellation binaries (uaa-control/uaa-web/uaa-pxe) upload as <name>-amd64 automatically once their crates exist.
 
 name: Musl Static Build
 
@@ -56,15 +58,23 @@ jobs:
       - name: Build static release binary
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl --workspace
 
-      - name: Verify the binary is static
+      - name: Verify every workspace binary is static
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent
-          file "$BIN"
-          if ldd "$BIN" 2>&1 | grep -vq "not a dynamic executable\|statically linked"; then
-            echo "ERROR: binary is not static"; ldd "$BIN"; exit 1
-          fi
+          set -euo pipefail
+          REL=target/x86_64-unknown-linux-musl/release
+          FOUND=0
+          for BIN in "$REL"/*; do
+            [ -f "$BIN" ] && [ -x "$BIN" ] || continue
+            case "$BIN" in *.d|*.so|*.rlib) continue;; esac
+            FOUND=$((FOUND+1)); file "$BIN"
+            if ldd "$BIN" 2>&1 | grep -vq "not a dynamic executable\|statically linked"; then
+              echo "ERROR: $BIN is not static"; ldd "$BIN"; exit 1
+            fi
+          done
+          [ "$FOUND" -ge 1 ] || { echo "ERROR: no binaries produced"; exit 1; }
+          echo "verified $FOUND static binaries"
 
       - name: Upload artifact (uaa-amd64)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -72,3 +82,24 @@ jobs:
           name: uaa-amd64
           path: target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent
           if-no-files-found: error
+
+      - name: Upload artifact (uaa-control-amd64)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: uaa-control-amd64
+          path: target/x86_64-unknown-linux-musl/release/uaa-control
+          if-no-files-found: ignore
+
+      - name: Upload artifact (uaa-web-amd64)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: uaa-web-amd64
+          path: target/x86_64-unknown-linux-musl/release/uaa-web
+          if-no-files-found: ignore
+
+      - name: Upload artifact (uaa-pxe-amd64)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: uaa-pxe-amd64
+          path: target/x86_64-unknown-linux-musl/release/uaa-pxe
+          if-no-files-found: ignore
