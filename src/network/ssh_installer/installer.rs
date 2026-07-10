@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -12,6 +12,7 @@ use super::config::{InstallationConfig, SystemInfo};
 use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
 use super::packages::PackageManager;
+use super::partitions::partition_path;
 use super::system_setup::SystemConfigurator;
 use super::zfs_ops::ZfsManager;
 use crate::network::{CommandExecutor, LocalClient, SshClient};
@@ -563,7 +564,8 @@ impl Default for SshInstaller {
 /// Build the list of manual commands that would run after storage setup.
 /// Used by pause-after-storage and tests.
 pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> Vec<String> {
-    let esp_part = format!("{}p1", config.disk_device);
+    let esp_part = partition_path(&config.disk_device, 1);
+    let p4 = partition_path(&config.disk_device, 4);
     let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
     vec![
         "mkdir -p /mnt/targetos/boot/efi".to_string(),
@@ -602,7 +604,7 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         // tpm2/fido2 stacks for the TPM2+PIN and YubiKey keyslots.
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd systemd-cryptsetup tpm2-tools tpm-udev libfido2-1'".to_string(),
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
-        format!("bash -lc 'UUID=$(blkid -s UUID -o value {d}p4 2>/dev/null || true); DEV=\"{d}p4\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'", d=config.disk_device),
+        format!("bash -lc 'UUID=$(blkid -s UUID -o value {p4} 2>/dev/null || true); DEV=\"{p4}\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'"),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),
         // --uefi-secure-boot lays down the signed shim chain (shimx64.efi ->
         // grubx64.efi) so Secure Boot can be enabled without reinstalling.

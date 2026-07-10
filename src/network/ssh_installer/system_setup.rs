@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.8.0
+// version: 2.9.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -10,6 +10,7 @@
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
 use super::config::{InitramfsType, InstallationConfig};
+use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
 use tracing::{info, warn};
@@ -43,12 +44,12 @@ impl<'a> SystemConfigurator<'a> {
     fn build_crypttab_entry(disk_device: &str, uuid_opt: Option<&str>) -> String {
         let dev = if let Some(uuid) = uuid_opt {
             if uuid.trim().is_empty() {
-                format!("{}p4", disk_device)
+                partition_path(disk_device, 4)
             } else {
                 format!("/dev/disk/by-uuid/{}", uuid.trim())
             }
         } else {
-            format!("{}p4", disk_device)
+            partition_path(disk_device, 4)
         };
         format!("luks {} none luks,discard,initramfs", dev)
     }
@@ -57,13 +58,14 @@ impl<'a> SystemConfigurator<'a> {
     fn choose_esp_partition(detected_output: &str, default_disk: &str) -> String {
         let part = detected_output.trim();
         if part.is_empty() {
-            format!("{}p1", default_disk)
+            partition_path(default_disk, 1)
         } else {
             part.to_string()
         }
     }
 
-    /// Detect the ESP partition path by GUID PARTTYPE; fallback to `${DISK}p1` if not found
+    /// Detect the ESP partition path by GUID PARTTYPE; fallback to partition 1 of the
+    /// configured disk (suffix-aware: nvme0n1p1 / sda1) if not found
     async fn detect_esp_partition_path(&mut self, default_disk: &str) -> Result<String> {
         let guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
         let cmd = Self::build_esp_detection_command(guid);
@@ -570,7 +572,7 @@ impl<'a> SystemConfigurator<'a> {
     pub async fn setup_luks_key_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Configuring LUKS crypttab in chroot");
 
-        let part = format!("{}p4", config.disk_device);
+        let part = partition_path(&config.disk_device, 4);
         let uuid_out = self
             .runner
             .execute_with_output(&format!(
@@ -881,7 +883,7 @@ impl<'a> SystemConfigurator<'a> {
 
         let luksdev = match uuid_opt {
             Some(u) if !u.trim().is_empty() => format!("/dev/disk/by-uuid/{}", u.trim()),
-            _ => format!("{}p4", config.disk_device),
+            _ => partition_path(&config.disk_device, 4),
         };
 
         // Seed contains the passphrase + PIN — write via unlogged execute + a
@@ -998,7 +1000,7 @@ mod tests {
     fn test_choose_esp_partition_falls_back_when_empty() {
         let detected = "  \n\t";
         let chosen = SystemConfigurator::choose_esp_partition(detected, "/dev/sda");
-        assert_eq!(chosen, "/dev/sdap1");
+        assert_eq!(chosen, "/dev/sda1");
     }
 
     #[test]
@@ -1023,13 +1025,13 @@ mod tests {
     #[test]
     fn test_build_crypttab_entry_without_uuid() {
         let e = SystemConfigurator::build_crypttab_entry("/dev/sda", None);
-        assert_eq!(e, "luks /dev/sdap4 none luks,discard,initramfs");
+        assert_eq!(e, "luks /dev/sda4 none luks,discard,initramfs");
     }
 
     #[test]
     fn test_build_crypttab_entry_with_empty_uuid() {
         let e = SystemConfigurator::build_crypttab_entry("/dev/sda", Some("  "));
-        assert_eq!(e, "luks /dev/sdap4 none luks,discard,initramfs");
+        assert_eq!(e, "luks /dev/sda4 none luks,discard,initramfs");
     }
 
     /// Extract the enabled dracut module list (the value of `add_dracutmodules+=`).

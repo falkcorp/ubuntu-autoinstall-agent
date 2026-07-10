@@ -1,11 +1,12 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! ZFS operations for SSH installation
 
 use super::config::InstallationConfig;
+use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
 use std::collections::HashMap;
@@ -197,8 +198,8 @@ impl<'a> ZfsManager<'a> {
              -o compatibility=grub2 -o feature@livelist=enabled -o feature@zpool_checkpoint=enabled \
              -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
              -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
-             -m none -R /mnt/targetos bpool {}p3",
-            disk
+             -m none -R /mnt/targetos bpool {}",
+            partition_path(disk, 3)
         )
     }
 
@@ -378,7 +379,7 @@ mod tests {
         assert!(cmd.contains("zpool create"));
         // device should be present and appear at the end of the command
         assert!(cmd.contains(" bpool "));
-        assert!(cmd.ends_with("/dev/sdap3"));
+        assert!(cmd.ends_with("/dev/sda3"));
         assert!(cmd.contains(" -R /mnt/targetos "));
         assert!(cmd.contains("compatibility=grub2"));
         assert!(cmd.contains("cachefile=/etc/zfs/zpool.cache"));
