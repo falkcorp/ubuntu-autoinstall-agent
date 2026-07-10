@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # file: scripts/autoinstall-agent.py
-# version: 1.4.0
+# version: 1.4.1
 # guid: 7b6e4a2c-9f1d-4e8a-b3c6-2d5f8a1c9e07
 # last-edited: 2026-07-10
 """
@@ -162,6 +162,37 @@ def resolve_cloud_init_dir(client_ip):
     path = os.path.join(CLOUD_INIT_BASE, hexmac)
     return hexmac, (path if os.path.isdir(path) else None)
 
+def collect_uaa_configs(base, registry):
+    """Inventory placed <hexmac>/uaa.yaml files under base.
+
+    METADATA ONLY — hexmac, hostname, mtime, placeholder_free. NEVER return
+    or log file contents: placed uaa.yaml files hold real secrets.
+    """
+    hex_to_hostname = {}
+    for mac, entry in registry.items():
+        hex_to_hostname[mac_to_hex(mac)] = entry.get("hostname")
+    configs = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return configs          # missing root -> empty inventory, not an error
+    for name in names:
+        if not re.fullmatch(r"[0-9a-f]{12}", name):
+            continue            # skip README.md, reporting.sh, scripts/, ...
+        fpath = os.path.join(base, name, "uaa.yaml")
+        try:
+            st = os.stat(fpath)
+            data = open(fpath, "rb").read()
+        except OSError:
+            continue            # hexmac dir without a placed uaa.yaml
+        configs.append({
+            "hexmac": name,
+            "hostname": hex_to_hostname.get(name),
+            "mtime": datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "placeholder_free": b"REPLACE_AT_PLACE_TIME" not in data,
+        })
+    return configs
+
 # ── Certs ────────────────────────────────────────────────────────────────────
 def generate_certs(hostname, ip):
     tmpdir = tempfile.mkdtemp()
@@ -299,6 +330,12 @@ class Handler(BaseHTTPRequestHandler):
                 "tang_servers": len(load_tang_registry()),
                 "agent_binary": agent_binary_status(UAA_BINARY_PATH),
             })
+            return
+
+        # ── Placed-config inventory (metadata only — never file contents) ──
+        if path == "/api/uaa-configs":
+            configs = collect_uaa_configs(CLOUD_INIT_BASE, load_registry())
+            self.send_json(200, {"configs": configs, "count": len(configs)})
             return
 
         # ── Machine registry ──
