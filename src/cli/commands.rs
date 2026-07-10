@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.6.0
+// version: 2.7.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-10
 
@@ -594,7 +594,7 @@ fn validate_config_secrets(config: &InstallationConfig) -> Result<()> {
 /// Create installation configuration for local system
 fn create_local_installation_config(
     hostname: &str,
-    system_info: &SystemInfo,
+    _system_info: &SystemInfo,
 ) -> Result<InstallationConfig> {
     // Detect primary disk (usually the largest disk) by enumerating block
     // devices on the LIVE target — never guessed from /dev/sd* conventions.
@@ -614,8 +614,41 @@ fn create_local_installation_config(
     let lsblk_json = String::from_utf8_lossy(&lsblk_output.stdout);
     let disk_device = detect_primary_disk(&lsblk_json)?;
 
-    // Detect network configuration
-    let (interface, address, gateway) = detect_network_config(&system_info.network_info)?;
+    // Detect network configuration by parsing live `ip -j addr` / `ip -j
+    // route` output — never guessed from free-text display info.
+    let ip_addr_output = std::process::Command::new("ip")
+        .args(["-j", "addr"])
+        .output()
+        .map_err(|_| {
+            crate::error::AutoInstallError::ValidationError(
+                "cannot read network state on the live target — refusing to guess (use --config)"
+                    .to_string(),
+            )
+        })?;
+    if !ip_addr_output.status.success() {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "cannot read network state on the live target — refusing to guess (use --config)"
+                .to_string(),
+        ));
+    }
+    let ip_route_output = std::process::Command::new("ip")
+        .args(["-j", "route"])
+        .output()
+        .map_err(|_| {
+            crate::error::AutoInstallError::ValidationError(
+                "cannot read network state on the live target — refusing to guess (use --config)"
+                    .to_string(),
+            )
+        })?;
+    if !ip_route_output.status.success() {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "cannot read network state on the live target — refusing to guess (use --config)"
+                .to_string(),
+        ));
+    }
+    let ip_addr_json = String::from_utf8_lossy(&ip_addr_output.stdout);
+    let ip_route_json = String::from_utf8_lossy(&ip_route_output.stdout);
+    let (interface, address, gateway) = detect_network_config(&ip_addr_json, &ip_route_json)?;
 
     // Detect timezone
     let timezone = detect_timezone().unwrap_or_else(|| "UTC".to_string());
@@ -730,15 +763,105 @@ fn detect_primary_disk(lsblk_json: &str) -> Result<String> {
     }
 }
 
-/// Detect network configuration
-fn detect_network_config(_network_info: &str) -> Result<(String, String, String)> {
-    // This is a simplified implementation
-    // In a real implementation, you'd parse the network info more carefully
-    let interface = "eth0".to_string(); // Default
-    let address = "dhcp".to_string(); // Use DHCP by default
-    let gateway = "auto".to_string(); // Auto-detect
+/// Detect network configuration by parsing `ip -j addr` and `ip -j route`
+/// JSON output from the live target — never guessed.
+///
+/// The route pass locates the interface owning the default route (and its
+/// gateway); the addr pass finds that interface's first global IPv4 address,
+/// returning the literal `"dhcp"` if it is dynamically assigned or a
+/// `CIDR` string (e.g. `"172.16.2.35/16"`) if static. Missing a default route
+/// or a global IPv4 address is a hard error — there is no fallback to
+/// invented values.
+fn detect_network_config(
+    ip_addr_json: &str,
+    ip_route_json: &str,
+) -> Result<(String, String, String)> {
+    let routes: serde_json::Value = serde_json::from_str(ip_route_json).map_err(|e| {
+        crate::error::AutoInstallError::ValidationError(format!(
+            "failed to parse ip -j route JSON output: {}",
+            e
+        ))
+    })?;
+    let route_array = routes.as_array().ok_or_else(|| {
+        crate::error::AutoInstallError::ValidationError(
+            "ip -j route JSON output is not an array".to_string(),
+        )
+    })?;
 
-    Ok((interface, address, gateway))
+    let default_route = route_array
+        .iter()
+        .find(|entry| entry["dst"].as_str() == Some("default"))
+        .ok_or_else(|| {
+            crate::error::AutoInstallError::ValidationError(
+                "no default route on the live target — cannot autodetect network; use --config"
+                    .to_string(),
+            )
+        })?;
+
+    let iface = default_route["dev"].as_str().ok_or_else(|| {
+        crate::error::AutoInstallError::ValidationError(
+            "no default route on the live target — cannot autodetect network; use --config"
+                .to_string(),
+        )
+    })?;
+    let gateway = default_route["gateway"].as_str().ok_or_else(|| {
+        crate::error::AutoInstallError::ValidationError(
+            "no default route on the live target — cannot autodetect network; use --config"
+                .to_string(),
+        )
+    })?;
+
+    let addrs: serde_json::Value = serde_json::from_str(ip_addr_json).map_err(|e| {
+        crate::error::AutoInstallError::ValidationError(format!(
+            "failed to parse ip -j addr JSON output: {}",
+            e
+        ))
+    })?;
+    let addr_array = addrs.as_array().ok_or_else(|| {
+        crate::error::AutoInstallError::ValidationError(
+            "ip -j addr JSON output is not an array".to_string(),
+        )
+    })?;
+
+    let iface_entry = addr_array
+        .iter()
+        .find(|entry| entry["ifname"].as_str() == Some(iface));
+
+    let global_inet = iface_entry.and_then(|entry| {
+        entry["addr_info"].as_array().and_then(|addr_info| {
+            addr_info.iter().find(|info| {
+                info["family"].as_str() == Some("inet")
+                    && info["scope"].as_str() == Some("global")
+            })
+        })
+    });
+
+    let address = match global_inet {
+        Some(info) if info["dynamic"].as_bool() == Some(true) => "dhcp".to_string(),
+        Some(info) => {
+            let local = info["local"].as_str().ok_or_else(|| {
+                crate::error::AutoInstallError::ValidationError(format!(
+                    "no global IPv4 address on {} — cannot autodetect network; use --config",
+                    iface
+                ))
+            })?;
+            let prefixlen = info["prefixlen"].as_u64().ok_or_else(|| {
+                crate::error::AutoInstallError::ValidationError(format!(
+                    "no global IPv4 address on {} — cannot autodetect network; use --config",
+                    iface
+                ))
+            })?;
+            format!("{}/{}", local, prefixlen)
+        }
+        None => {
+            return Err(crate::error::AutoInstallError::ValidationError(format!(
+                "no global IPv4 address on {} — cannot autodetect network; use --config",
+                iface
+            )));
+        }
+    };
+
+    Ok((iface.to_string(), address, gateway.to_string()))
 }
 
 /// Detect system timezone
@@ -1302,5 +1425,83 @@ users:
     fn test_detect_primary_disk_empty_errors() {
         let json = r#"{"blockdevices": []}"#;
         assert!(detect_primary_disk(json).is_err());
+    }
+
+    #[test]
+    fn test_detect_network_config_static() {
+        let addr_json = r#"[
+            {"ifname": "eno1", "addr_info": [
+                {"family": "inet", "local": "192.168.1.10", "prefixlen": 24, "scope": "global"}
+            ]}
+        ]"#;
+        let route_json = r#"[
+            {"dst": "default", "gateway": "192.168.1.1", "dev": "eno1"}
+        ]"#;
+        let (iface, address, gateway) = detect_network_config(addr_json, route_json).unwrap();
+        assert_eq!(iface, "eno1");
+        assert_eq!(address, "192.168.1.10/24");
+        assert_eq!(gateway, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_detect_network_config_dhcp() {
+        let addr_json = r#"[
+            {"ifname": "eno1", "addr_info": [
+                {"family": "inet", "local": "192.168.1.10", "prefixlen": 24, "scope": "global", "dynamic": true}
+            ]}
+        ]"#;
+        let route_json = r#"[
+            {"dst": "default", "gateway": "192.168.1.1", "dev": "eno1"}
+        ]"#;
+        let (iface, address, gateway) = detect_network_config(addr_json, route_json).unwrap();
+        assert_eq!(iface, "eno1");
+        assert_eq!(address, "dhcp");
+        assert_eq!(gateway, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_detect_network_config_picks_default_route_iface() {
+        let addr_json = r#"[
+            {"ifname": "lo", "addr_info": [
+                {"family": "inet", "local": "127.0.0.1", "prefixlen": 8, "scope": "host"}
+            ]},
+            {"ifname": "docker0", "addr_info": [
+                {"family": "inet", "local": "172.17.0.1", "prefixlen": 16, "scope": "global"}
+            ]},
+            {"ifname": "eno1", "addr_info": [
+                {"family": "inet", "local": "192.168.1.10", "prefixlen": 24, "scope": "global"}
+            ]}
+        ]"#;
+        let route_json = r#"[
+            {"dst": "default", "gateway": "192.168.1.1", "dev": "eno1"}
+        ]"#;
+        let (iface, address, gateway) = detect_network_config(addr_json, route_json).unwrap();
+        assert_eq!(iface, "eno1");
+        assert_eq!(address, "192.168.1.10/24");
+        assert_eq!(gateway, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_detect_network_config_no_default_route_errors() {
+        let addr_json = r#"[
+            {"ifname": "eno1", "addr_info": [
+                {"family": "inet", "local": "192.168.1.10", "prefixlen": 24, "scope": "global"}
+            ]}
+        ]"#;
+        let route_json = r#"[]"#;
+        assert!(detect_network_config(addr_json, route_json).is_err());
+    }
+
+    #[test]
+    fn test_detect_network_config_no_global_inet_errors() {
+        let addr_json = r#"[
+            {"ifname": "eno1", "addr_info": [
+                {"family": "inet6", "local": "fe80::1", "prefixlen": 64, "scope": "link"}
+            ]}
+        ]"#;
+        let route_json = r#"[
+            {"dst": "default", "gateway": "192.168.1.1", "dev": "eno1"}
+        ]"#;
+        assert!(detect_network_config(addr_json, route_json).is_err());
     }
 }
