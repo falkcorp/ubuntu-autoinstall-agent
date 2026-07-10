@@ -1,5 +1,5 @@
 // file: src/main.rs
-// version: 2.5.0
+// version: 2.6.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
 // last-edited: 2026-07-10
 
@@ -185,6 +185,11 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            ubuntu_autoinstall_agent::cli::args::Commands::Power {
+                hostname,
+                action,
+                ipmi_password,
+            } => power_command(&hostname, action, ipmi_password.as_deref()).await,
         }
     };
 

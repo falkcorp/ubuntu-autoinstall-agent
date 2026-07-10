@@ -1,5 +1,5 @@
 // file: src/cli/args.rs
-// version: 2.7.0
+// version: 2.8.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
 // last-edited: 2026-07-10
 
@@ -279,6 +279,20 @@ pub enum Commands {
 
         #[arg(long, help = "Write rendered user-data here (defaults to stdout)")]
         output: Option<String>,
+    },
+
+    /// Remote power control (IPMI runs on the server 172.16.2.30 — never locally)
+    Power {
+        /// Target hostname (must be in the built-in registry, e.g. unimatrixone)
+        hostname: String,
+
+        /// on | off | status (reset/cycle intentionally unsupported)
+        #[arg(value_enum)]
+        action: crate::power::PowerAction,
+
+        /// BMC password; falls back to $UAA_IPMI_PASSWORD. Never hardcode.
+        #[arg(long)]
+        ipmi_password: Option<String>,
     },
 }
 

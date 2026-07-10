@@ -1,7 +1,7 @@
 // file: src/lib.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: d82472d1-7f0f-4eb4-b0a3-6e1547103eb4
-// last-edited: 2026-06-21
+// last-edited: 2026-07-10
 
 //! # Ubuntu AutoInstall Agent
 //!
@@ -16,6 +16,7 @@ pub mod error;
 pub mod image;
 pub mod logging;
 pub mod network;
+pub mod power;
 pub mod security;
 pub mod utils;
 

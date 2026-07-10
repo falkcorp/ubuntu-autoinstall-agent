@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.9.0
+// version: 2.10.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-10
 
@@ -1126,6 +1126,40 @@ pub async fn render_user_data_command(
                 .map_err(crate::error::AutoInstallError::IoError)?;
         }
     }
+
+    Ok(())
+}
+
+/// Remote power control for a fleet host (dispatch lives in `src/power/mod.rs`).
+///
+/// Validates locally (unknown host / stub mechanism / missing password) BEFORE
+/// opening any SSH connection to the server, then connects to
+/// `power::POWER_SERVER` and runs the IPMI command there via the existing
+/// SshClient/CommandExecutor seam — never locally.
+pub async fn power_command(
+    hostname: &str,
+    action: crate::power::PowerAction,
+    ipmi_password: Option<&str>,
+) -> Result<()> {
+    use crate::network::SshClient;
+    use crate::power::{run_power_action, validate_ipmi_request, POWER_SERVER};
+
+    // Flag wins; UAA_IPMI_PASSWORD is the fallback (mirrors clap's `env`
+    // behavior manually, since the crate's clap features don't enable it).
+    let ipmi_password = ipmi_password
+        .map(str::to_string)
+        .or_else(|| std::env::var("UAA_IPMI_PASSWORD").ok());
+    let ipmi_password = ipmi_password.as_deref();
+
+    // Local pre-validation pass: fail closed (unknown host, stub mechanism,
+    // missing password) before touching the network at all.
+    validate_ipmi_request(hostname, ipmi_password)?;
+
+    let mut client = SshClient::new();
+    client.connect(POWER_SERVER, "jdfalk").await?;
+
+    let outcome = run_power_action(&mut client, hostname, action, ipmi_password).await?;
+    println!("{outcome}");
 
     Ok(())
 }
