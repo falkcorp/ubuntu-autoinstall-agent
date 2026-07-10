@@ -1,0 +1,24 @@
+// file: proto/uaa/update/v1/update.proto
+// version: 1.0.0
+// guid: 8a8337c4-f65f-4720-a740-252dae4454ec
+// last-edited: 2026-07-10
+
+syntax = "proto3";
+
+package uaa.update.v1;
+
+// Messages only — served as JSON by uaa-web, not a gRPC service (spec C7).
+
+message Manifest {
+  repeated BinaryEntry binaries = 1;
+  string min_version = 2;
+}
+
+message BinaryEntry {
+  string name = 1;
+  string version = 2;
+  string target = 3;
+  string sha256 = 4;
+  string sig = 5;
+  string url = 6;
+}

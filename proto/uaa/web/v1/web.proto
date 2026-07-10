@@ -1,0 +1,101 @@
+// file: proto/uaa/web/v1/web.proto
+// version: 1.0.0
+// guid: f4c7cc83-6e3e-4566-9159-0b8c94454a07
+// last-edited: 2026-07-10
+
+syntax = "proto3";
+
+package uaa.web.v1;
+
+// WebService is the web-layer API: seed/iPXE placement, boot-target
+// flips, host removal, ISO catalog + build jobs, and agent binary
+// publication.
+service WebService {
+  rpc PlaceSeed(PlaceSeedRequest) returns (Ack);
+  rpc PlaceIpxe(PlaceIpxeRequest) returns (Ack);
+  rpc FlipBootTarget(FlipBootTargetRequest) returns (FlipBootTargetResponse);
+  rpc RemoveHost(RemoveHostRequest) returns (Ack);
+  rpc ListIsos(ListIsosRequest) returns (ListIsosResponse);
+  rpc BuildIso(BuildIsoRequest) returns (BuildIsoResponse);
+  rpc GetBuildJob(GetBuildJobRequest) returns (BuildJob);
+  rpc PublishAgentBinary(PublishAgentBinaryRequest) returns (Ack);
+}
+
+message Ack {
+  bool ok = 1;
+  string detail = 2;
+}
+
+message PlaceSeedRequest {
+  string mac = 1;
+  // Non-secret fields + REPLACE_AT_PLACE_TIME placeholders ONLY
+  // (gate enforced by WB-02).
+  string user_data = 2;
+  string meta_data = 3;
+  string vendor_data = 4;
+  string network_config = 5;
+  string uaa_config = 6;
+}
+
+message PlaceIpxeRequest {
+  string hostname = 1;
+  string content = 2;
+}
+
+message FlipBootTargetRequest {
+  string hostname = 1;
+  string target = 2;
+}
+
+message FlipBootTargetResponse {
+  // Missing iPXE file is ok:false, not an error.
+  bool ok = 1;
+  string detail = 2;
+}
+
+message RemoveHostRequest {
+  string hostname = 1;
+  string mac = 2;
+}
+
+message ListIsosRequest {}
+
+message ListIsosResponse {
+  repeated IsoInfo isos = 1;
+}
+
+message IsoInfo {
+  string name = 1;
+  uint64 size_bytes = 2;
+  string sha256 = 3;
+}
+
+message BuildIsoRequest {
+  string base_iso = 1;
+  string profile = 2;
+}
+
+message BuildIsoResponse {
+  // Detached job (spec C4).
+  string job_id = 1;
+}
+
+message GetBuildJobRequest {
+  string job_id = 1;
+}
+
+message BuildJob {
+  string job_id = 1;
+  string state = 2;
+  string detail = 3;
+  string artifact_path = 4;
+}
+
+message PublishAgentBinaryRequest {
+  string name = 1;
+  string version = 2;
+  string target = 3;
+  bytes artifact = 4;
+  // signature verified before placement.
+  bytes signature = 5;
+}

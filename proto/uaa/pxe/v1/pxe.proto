@@ -1,0 +1,68 @@
+// file: proto/uaa/pxe/v1/pxe.proto
+// version: 1.0.0
+// guid: 4de6b19f-29b8-4497-976d-33a22ebdced6
+// last-edited: 2026-07-10
+
+syntax = "proto3";
+
+package uaa.pxe.v1;
+
+// PxeService is the PXE-layer API: dnsmasq/tftpd setup and boot-target
+// application, health reporting, discovered-MAC streaming, and DNS record
+// management.
+service PxeService {
+  rpc SetupPxe(SetupPxeRequest) returns (Ack);
+  rpc SetBootTarget(SetBootTargetRequest) returns (Ack);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc StreamDiscoveredMacs(StreamDiscoveredMacsRequest) returns (stream DiscoveredMac);
+  rpc SetDnsRecord(SetDnsRecordRequest) returns (Ack);
+}
+
+message Ack {
+  bool ok = 1;
+  string detail = 2;
+}
+
+message SetupPxeRequest {
+  string mac = 1;
+  string hostname = 2;
+  string boot_target = 3;
+}
+
+message SetBootTargetRequest {
+  string mac = 1;
+  string boot_target = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool dnsmasq_active = 1;
+  bool tftpd_active = 2;
+  bool tftp_probe_ok = 3;
+  repeated BootTargetState targets = 4;
+}
+
+message BootTargetState {
+  string mac = 1;
+  string expected = 2;
+  string applied = 3;
+  bool consistent = 4;
+}
+
+message StreamDiscoveredMacsRequest {}
+
+message DiscoveredMac {
+  string mac = 1;
+  string first_seen = 2;
+  string last_seen = 3;
+  string arch_hint = 4;
+  string vendor_class = 5;
+  bool dismissed = 6;
+}
+
+message SetDnsRecordRequest {
+  string hostname = 1;
+  string ip = 2;
+  bool remove = 3;
+}
