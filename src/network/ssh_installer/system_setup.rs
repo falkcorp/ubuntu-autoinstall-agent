@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.9.0
+// version: 2.10.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -52,6 +52,70 @@ impl<'a> SystemConfigurator<'a> {
             partition_path(disk_device, 4)
         };
         format!("luks {} none luks,discard,initramfs", dev)
+    }
+
+    /// Build the netplan YAML for `/etc/netplan/01-netcfg.yaml`.
+    ///
+    /// Validates `config.network_renderer` first (must be exactly `"networkd"`
+    /// or `"NetworkManager"` — no case-insensitive aliasing). When
+    /// `config.network_address` is the literal `dhcp` (case-insensitive) —
+    /// the marker `detect_network_config` emits for DHCP-assigned interfaces —
+    /// renders a `dhcp4: true` ethernet stanza with no `addresses:`,
+    /// `routes:`, or `nameservers:` blocks. Otherwise renders the static
+    /// template byte-identical to before, apart from the renderer
+    /// substitution.
+    fn build_netplan_yaml(config: &InstallationConfig) -> Result<String> {
+        let renderer = config.network_renderer.as_str();
+        match renderer {
+            "networkd" | "NetworkManager" => {}
+            other => {
+                return Err(crate::error::AutoInstallError::ConfigError(format!(
+                    "unsupported network_renderer '{other}' (expected \"networkd\" or \"NetworkManager\")"
+                )))
+            }
+        }
+
+        if config.network_address.eq_ignore_ascii_case("dhcp") {
+            return Ok(format!(
+                r#"network:
+  version: 2
+  renderer: {renderer}
+  ethernets:
+    {interface}:
+      dhcp4: true"#,
+                renderer = renderer,
+                interface = config.network_interface,
+            ));
+        }
+
+        Ok(format!(
+            r#"network:
+  version: 2
+  renderer: {renderer}
+  ethernets:
+    {}:
+      addresses:
+        - {}
+      routes:
+        - to: default
+          via: {}
+      nameservers:
+        search:
+          - {}
+        addresses:
+{}"#,
+            config.network_interface,
+            config.network_address,
+            config.network_gateway,
+            config.network_search,
+            config
+                .network_nameservers
+                .iter()
+                .map(|ns| format!("          - {}", ns))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            renderer = renderer,
+        ))
     }
 
     /// Decide which ESP partition path to use based on detection output
@@ -195,33 +259,7 @@ impl<'a> SystemConfigurator<'a> {
     async fn setup_network_configuration(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Setting up network configuration");
 
-        let netplan_config = format!(
-            r#"network:
-  version: 2
-  renderer: networkd
-  ethernets:
-    {}:
-      addresses:
-        - {}
-      routes:
-        - to: default
-          via: {}
-      nameservers:
-        search:
-          - {}
-        addresses:
-{}"#,
-            config.network_interface,
-            config.network_address,
-            config.network_gateway,
-            config.network_search,
-            config
-                .network_nameservers
-                .iter()
-                .map(|ns| format!("          - {}", ns))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        let netplan_config = Self::build_netplan_yaml(config)?;
 
         self.runner
             .execute("mkdir -p /mnt/targetos/etc/netplan")
@@ -1032,6 +1070,71 @@ mod tests {
     fn test_build_crypttab_entry_with_empty_uuid() {
         let e = SystemConfigurator::build_crypttab_entry("/dev/sda", Some("  "));
         assert_eq!(e, "luks /dev/sda4 none luks,discard,initramfs");
+    }
+
+    fn sample_netplan_config(network_address: &str, network_renderer: &str) -> InstallationConfig {
+        InstallationConfig {
+            hostname: "test-host".into(),
+            disk_device: "/dev/nvme0n1".into(),
+            timezone: "UTC".into(),
+            luks_key: "key".into(),
+            root_password: "root".into(),
+            network_interface: "eth0".into(),
+            network_address: network_address.into(),
+            network_gateway: "192.0.2.1".into(),
+            network_search: "example.test".into(),
+            network_nameservers: vec!["1.1.1.1".into()],
+            network_renderer: network_renderer.into(),
+            debootstrap_release: None,
+            debootstrap_mirror: None,
+            initramfs_type: InitramfsType::Dracut,
+            tang_servers: vec![],
+            tang_threshold: 2,
+            ssh_authorized_keys: vec![],
+            enroll_tpm2: true,
+            tpm2_pin: None,
+            tpm2_pcr_ids: "7".into(),
+            expect_fido2: true,
+        }
+    }
+
+    #[test]
+    fn test_build_netplan_yaml_default_renderer_static() {
+        let cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        let yaml = SystemConfigurator::build_netplan_yaml(&cfg).unwrap();
+        assert!(yaml.contains("renderer: networkd"));
+        assert!(yaml.contains("addresses:"));
+        assert!(yaml.contains("192.0.2.10/24"));
+    }
+
+    #[test]
+    fn test_build_netplan_yaml_networkmanager() {
+        let cfg = sample_netplan_config("192.0.2.10/24", "NetworkManager");
+        let yaml = SystemConfigurator::build_netplan_yaml(&cfg).unwrap();
+        assert!(yaml.contains("renderer: NetworkManager"));
+    }
+
+    #[test]
+    fn test_build_netplan_yaml_rejects_unknown_renderer() {
+        let cfg = sample_netplan_config("192.0.2.10/24", "netword");
+        assert!(SystemConfigurator::build_netplan_yaml(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_build_netplan_yaml_dhcp() {
+        let cfg = sample_netplan_config("dhcp", "networkd");
+        let yaml = SystemConfigurator::build_netplan_yaml(&cfg).unwrap();
+        assert!(yaml.contains("dhcp4: true"));
+        assert!(!yaml.contains("addresses:"));
+        assert!(!yaml.contains("- dhcp"));
+    }
+
+    #[test]
+    fn test_build_netplan_yaml_dhcp_uppercase() {
+        let cfg = sample_netplan_config("DHCP", "networkd");
+        let yaml = SystemConfigurator::build_netplan_yaml(&cfg).unwrap();
+        assert!(yaml.contains("dhcp4: true"));
+        assert!(!yaml.contains("addresses:"));
     }
 
     /// Extract the enabled dracut module list (the value of `add_dracutmodules+=`).

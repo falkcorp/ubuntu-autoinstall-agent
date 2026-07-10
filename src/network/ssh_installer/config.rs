@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -56,6 +56,10 @@ pub struct InstallationConfig {
     pub network_gateway: String,
     pub network_search: String,
     pub network_nameservers: Vec<String>,
+    /// Netplan renderer for the installed system: "networkd" (default) or
+    /// "NetworkManager". Validated at render time.
+    #[serde(default = "default_network_renderer")]
+    pub network_renderer: String,
     pub debootstrap_release: Option<String>,
     pub debootstrap_mirror: Option<String>,
     /// Initramfs generator — defaults to Dracut.
@@ -108,6 +112,10 @@ fn default_tpm2_pcr_ids() -> String {
     "7".to_string()
 }
 
+pub(crate) fn default_network_renderer() -> String {
+    "networkd".to_string()
+}
+
 impl InstallationConfig {
     /// Load configuration from a YAML file.
     pub fn from_yaml_file(path: &str) -> crate::Result<Self> {
@@ -133,6 +141,7 @@ impl InstallationConfig {
                 "1.1.1.1".to_string(),
                 "8.8.8.8".to_string(),
             ],
+            network_renderer: default_network_renderer(),
             debootstrap_release: Some("resolute".to_string()),
             debootstrap_mirror: Some("http://archive.ubuntu.com/ubuntu/".to_string()),
             initramfs_type: InitramfsType::Dracut,
@@ -322,5 +331,20 @@ network_nameservers: ["10.0.0.1"]
 "#;
         let err = serde_yaml::from_str::<InstallationConfig>(yaml).unwrap_err();
         assert!(err.to_string().contains("disk_devise"), "error must name the unknown key: {err}");
+    }
+
+    #[test]
+    fn test_network_renderer_defaults_when_absent() {
+        // Old committed YAML has no `network_renderer` key; the serde default
+        // must keep it parsing (and defaulting to "networkd") unchanged.
+        let cfg = InstallationConfig::for_len_serv_003();
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let yaml_without_renderer: String = yaml
+            .lines()
+            .filter(|l| !l.contains("network_renderer"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: InstallationConfig = serde_yaml::from_str(&yaml_without_renderer).unwrap();
+        assert_eq!(back.network_renderer, "networkd");
     }
 }
