@@ -1,0 +1,54 @@
+# file: crates/uaa-control/Cargo.toml
+# version: 1.0.0
+# guid: 1e1a4386-a459-4a97-8baf-c942283b3107
+# last-edited: 2026-07-10
+
+[package]
+name = "uaa-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "uaa-control daemon (spec C3): registry system-of-record, listeners + socket activation, snapshot/WAL degraded mode"
+
+[lib]
+name = "uaa_control"
+path = "src/lib.rs"
+
+[[bin]]
+name = "uaa-control"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime + CLI
+tokio = { workspace = true }
+clap = { workspace = true }
+# HTTP / gRPC listeners
+axum = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tower-http = { workspace = true }
+# TLS (wired at runtime; scaffolds bind plain for now — Decision 5)
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+# Registry system-of-record: tokio-postgres only, per spec Decision 5.
+tokio-postgres = { workspace = true }
+# Serialization + IDs + hashing
+serde = { workspace = true }
+serde_json = { workspace = true }
+# serde feature is additive on top of the workspace dep (root Cargo.toml untouched);
+# WAL/snapshot rows serialize event_id UUIDs to JSON.
+uuid = { workspace = true, features = ["serde"] }
+sha2 = { workspace = true }
+# Errors + logging + async traits
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+# Sibling crates
+uaa-proto = { path = "../uaa-proto" }
+uaa-core = { path = "../uaa-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-test = { workspace = true }

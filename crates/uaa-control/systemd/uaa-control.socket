@@ -1,0 +1,23 @@
+# file: crates/uaa-control/systemd/uaa-control.socket
+# version: 1.0.0
+# guid: 02f1cce2-118c-4877-ba0d-3b1bca5f56d6
+# last-edited: 2026-07-10
+#
+# Socket-activation unit for the legacy machine plane (spec Decision 24). systemd owns
+# the :25000 listening socket, so a uaa-control self-update restart never drops it (the
+# residual gap of "restart between accept() and bind()" is closed — the kernel keeps
+# the socket and queues connections while the service is momentarily down).
+#
+# DEPLOY IS BUCKET-3 (human) WORK: this file is a docs/reference artifact. Installing it
+# (copy to /etc/systemd/system, `systemctl enable --now uaa-control.socket`) is done by
+# an operator on 172.16.2.30 at cutover, NOT by any agent.
+
+[Unit]
+Description=uaa-control legacy machine plane socket (:25000)
+
+[Socket]
+ListenStream=25000
+# fd 3 is handed to the service; matches listeners::parse_listen_fds (LISTEN_FDS>=1).
+
+[Install]
+WantedBy=sockets.target
