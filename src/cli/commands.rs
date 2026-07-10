@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.7.1
+// version: 2.8.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-10
 
@@ -397,14 +397,22 @@ pub async fn local_install_command(
         ));
     }
 
-    // Check if we're in a live environment (unless forced)
-    if !force && !is_live_environment() {
+    let in_target = is_inside_installed_target();
+    if in_target {
+        info!("/etc/uaa-target-marker found — in-target mode: post-install configuration only (no disk prep, no debootstrap, no wipe)");
+    }
+
+    // Check if we're in a live environment (unless forced, or already inside
+    // an installed target — curtin sets DEBIAN_FRONTEND=noninteractive, which
+    // would otherwise make is_live_environment() lie and let this fall through
+    // toward a full wipe).
+    if !in_target && !force && !is_live_environment() {
         return Err(crate::error::AutoInstallError::ValidationError(
             "Local installation should only be run from a live USB/CD environment. Use --force to override this check (dangerous!)".to_string(),
         ));
     }
 
-    if force && !is_live_environment() {
+    if !in_target && force && !is_live_environment() {
         warn!("WARNING: --force used to bypass live environment check!");
         warn!(
             "This will install Ubuntu on the CURRENT SYSTEM, potentially destroying existing data!"
@@ -440,6 +448,22 @@ pub async fn local_install_command(
     } else {
         create_local_installation_config(&hostname, &system_info)?
     };
+
+    if in_target {
+        if dry_run {
+            info!(
+                "DRY RUN: would run in-target post-install configuration (Phase 5) for {}",
+                config.hostname
+            );
+            return Ok(());
+        }
+        if hold_on_failure || pause_after_storage {
+            warn!("--hold-on-failure/--pause-after-storage are ignored in in-target mode (no storage phases run)");
+        }
+        installer.perform_in_target_configuration(&config).await?;
+        info!("In-target configuration completed for {}", config.hostname);
+        return Ok(());
+    }
 
     if dry_run {
         info!("DRY RUN: Would perform full ZFS+LUKS installation with config:");
@@ -568,6 +592,21 @@ fn is_live_environment() -> bool {
         || cmdline.contains("boot=live")
         || cmdline.contains("boot=casper")
         || cmdline.split_whitespace().any(|tok| tok == "casper")
+}
+
+/// Pure core: marker presence under an arbitrary root (unit-testable).
+fn target_marker_present(root: &std::path::Path) -> bool {
+    root.join(
+        crate::network::ssh_installer::installer::TARGET_MARKER_PATH.trim_start_matches('/'),
+    )
+    .exists()
+}
+
+/// True when running inside an installed target (e.g. under `curtin
+/// in-target`). Marker-file ONLY — is_live_environment() is unusable here
+/// because curtin sets DEBIAN_FRONTEND=noninteractive.
+fn is_inside_installed_target() -> bool {
+    target_marker_present(std::path::Path::new("/"))
 }
 
 /// Refuse to run a destructive install from a config whose secrets were never
@@ -1048,6 +1087,44 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::fs;
+
+    #[test]
+    fn test_target_marker_present_detects_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "uaa-target-marker-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+        std::fs::write(root.join("etc").join("uaa-target-marker"), b"installed-by=uaa\n")
+            .unwrap();
+
+        assert!(target_marker_present(&root));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn test_target_marker_absent_means_full_install_path() {
+        let root = std::env::temp_dir().join(format!(
+            "uaa-target-marker-absent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("etc")).unwrap();
+
+        // No marker file written: this is the anti-over-suppression case —
+        // absence of the marker means the full-install path is selected.
+        assert!(!target_marker_present(&root));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[tokio::test]
     async fn test_create_image_command_minimal_spec() {

@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.6.1
+// version: 2.7.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -19,6 +19,13 @@ use crate::network::{CommandExecutor, LocalClient, SshClient};
 use crate::Result;
 use std::collections::HashMap;
 use tracing::{error, info};
+
+/// Marker written into the installed target's /etc during Phase 4.
+/// Presence on a RUNNING root means "we are inside an installed target"
+/// (e.g. under `curtin in-target`) — install commands must then reconfigure,
+/// never wipe. Curtin/subiquity callers create it via a late-command:
+/// `curtin in-target -- sh -c 'touch /etc/uaa-target-marker'`.
+pub const TARGET_MARKER_PATH: &str = "/etc/uaa-target-marker";
 
 /// Installer that works over SSH or locally.
 ///
@@ -253,6 +260,45 @@ impl SshInstaller {
                 failed_phases.len()
             )))
         }
+    }
+
+    /// In-target (curtin-compatible) mode: the binary is already running INSIDE
+    /// the installed/target chroot. Runs ONLY post-install configuration
+    /// (Phase 5: GRUB, LUKS crypttab, dracut, Tang) by bind-mounting / to
+    /// /mnt/targetos so the existing chroot-based Phase-5 code is reused
+    /// unchanged. NEVER runs preflight_checks (it wipes residual state),
+    /// Phases 1-4 (packages/disk prep/ZFS/debootstrap), or Phase 6
+    /// (final_cleanup would zpool-export / cryptsetup-close the RUNNING root).
+    pub async fn perform_in_target_configuration(&mut self, config: &InstallationConfig) -> Result<()> {
+        self.require_connected()?;
+
+        if self
+            .runner
+            .execute(&format!("test -f {}", TARGET_MARKER_PATH))
+            .await
+            .is_err()
+        {
+            return Err(crate::error::AutoInstallError::ValidationError(
+                "no /etc/uaa-target-marker — refusing in-target configuration outside an installed target".into(),
+            ));
+        }
+
+        self.runner
+            .execute("mkdir -p /mnt/targetos && { mountpoint -q /mnt/targetos || mount --bind / /mnt/targetos; }")
+            .await?;
+
+        self.phase_5_system_configuration(config).await?;
+
+        let _ = self
+            .runner
+            .execute("umount -R /mnt/targetos 2>/dev/null || umount -l /mnt/targetos 2>/dev/null || true")
+            .await;
+
+        info!(
+            "In-target post-install configuration completed for {}",
+            config.hostname
+        );
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -535,6 +581,16 @@ impl SshInstaller {
         info!("Phase 4: Base system");
         let mut sc = SystemConfigurator::new(&mut *self.runner);
         sc.install_base_system(config).await?;
+        if let Err(e) = self
+            .runner
+            .execute(&format!(
+                "printf 'installed-by=uaa\\n' > /mnt/targetos{p} && chmod 0644 /mnt/targetos{p}",
+                p = TARGET_MARKER_PATH
+            ))
+            .await
+        {
+            tracing::warn!("Could not write target marker (non-fatal): {}", e);
+        }
         info!("Phase 4 completed");
         Ok(())
     }
