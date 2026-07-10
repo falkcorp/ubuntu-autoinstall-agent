@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/machine_plane/mod.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: eee7b5c0-24d0-4406-b5f6-68d5bac52cae
 // last-edited: 2026-07-10
 
@@ -24,12 +24,13 @@ use serde_json::json;
 
 /// The `:25000` router. Followers merge their submodule routers here (see module doc).
 pub fn router() -> Router {
-    Router::new().route(
-        "/healthz",
-        get(|| async { Json(json!({ "service": "uaa-control", "listener": "machine-plane" })) }),
-    )
-    // IP-01: .merge(seeds::router())
-    // IP-02: .merge(lifecycle::router())
+    Router::new()
+        .route(
+            "/healthz",
+            get(|| async { Json(json!({ "service": "uaa-control", "listener": "machine-plane" })) }),
+        )
+    // IP-01: .merge(seeds::router()) [reverted — handler trait bound; re-dispatch]
+        .merge(lifecycle::router()) // IP-02
     // IP-03: .merge(inventory::router())
     // IP-04: .merge(dashboard::router())
 }
