@@ -1,12 +1,45 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.9.0
+# version: 2.0.0
 # guid: todo0001-0000-0000-0000-000000000001
-# last-edited: 2026-07-09
+# last-edited: 2026-07-10
 
 > **PLANNING PACKAGE (2026-07-09):** every remaining `[ ]` item below is either
 > tasked in `docs/agent-tasks/` (see the master table in `docs/agent-tasks/README.md`,
 > specs in `docs/specs/`) or deferred with reasons in `docs/agent-tasks/DEFERRED.md`.
 > Items annotated `→ planned:` name their brief.
+
+## ✅ install-ops execution complete (2026-07-10) — all 20 planned briefs merged
+
+All six workstreams executed via the coordinator/worker orchestration in
+`docs/agent-tasks/ORCHESTRATION.md`, 6 dependency waves, `cargo test --lib --offline`
+grew 237 → **311 passing**, 0 failed at every merge. Merged commits:
+
+- **installer-robustness** (8): partition_path suffix helper `7273286` · detect_primary_disk
+  lsblk-json `d04567f` · detect_network_config ip-json `44c0bca` · netplan renderer+dhcp4
+  `519e721` · **LUKS 0600 keyfile (killed echo-pipe + env leak)** `10fbb0f` · config
+  deny_unknown_fields `b9d710f` · curtin in-target mode `6ffeae0` · Path A/B split doc `466e0b5`
+- **phase-rerun** (2): `--phases`/`--from-phase` + **compile-time WipeAuthorization guard**
+  `7d909e8` · non-destructive mount-existing-target (/ → /boot → ESP order) `69263ed`
+- **boot-prod** (2): efibootmgr BootOrder in chroot (network#1/ubuntu#2, non-fatal) `0cc3b3c` ·
+  RESET p2 staging + `nuke it`-gated GRUB recover entry `3ef30b6`
+- **install-server** (5, repo-mirror — human deploys): webhook flip on `success` `3c4b0c9` ·
+  `/api/health` + agent-binary serving docs `973b340` · `/api/uaa-configs` inventory `4ae949a` ·
+  deploy-usb-configs `--inject-from` place-time secrets `0e6d5a8` · `/dashboard` `4900f93`
+- **testing-gates** (2): QEMU+swtpm `scripts/vm-validate.sh` (THE hardware gate) `e7a8eb7` ·
+  LocalClient unit tests `55ab93a`
+- **remote-power** (1): `uaa power <host> on|off|status` IPMI-via-server dispatch `f99dffa`
+
+Every wipe-adjacent change (partition helper, LUKS keyfile, both phase-rerun tasks) was
+Opus-tier and independently re-verified by the coordinator before merge. NO hardware was
+touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any hardware install.
+
+- [ ] **SECURITY follow-up (surfaced by remote-power/TASK-01):** `SshClient::execute_with_output`
+  (`src/network/ssh.rs`) does `debug!("Executing command with output: {}", command)`, logging the
+  FULL command string. `uaa power` passes `IPMI_PASSWORD='<pw>' ipmitool …` through the
+  `CommandExecutor` seam, so running with `-v`/debug would leak the BMC password to local logs
+  (the power module itself only ever logs a redacted twin). Add a redaction seam to
+  `SshClient`/`CommandExecutor` (e.g. an optional "loggable command" override) before `uaa power`
+  is used with verbose logging.
 
 ## Critical Bugs (blocking correct operation)
 
