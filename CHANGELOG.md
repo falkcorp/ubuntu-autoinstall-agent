@@ -1,11 +1,26 @@
 <!-- file: CHANGELOG.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: chnglog1-0000-0000-0000-000000000001 -->
-<!-- last-edited: 2026-06-20 -->
+<!-- last-edited: 2026-07-09 -->
 
 # Changelog
 
 All notable changes to `ubuntu-autoinstall-agent` are documented here.
+
+## [Unreleased] — docs/plan-install-ops (2026-07-09)
+
+### Added (planning only — no code changes)
+
+- **install-ops planning package**: 6 design specs + 6 implementation plans
+  (`docs/specs/<slug>-{design,plan}.md`), 20 weak-model-proof task briefs across 6
+  workstreams (`docs/agent-tasks/`), coordinator protocol (`ORCHESTRATION.md`),
+  computed same-file collision matrix + 6-wave schedule (`docs/agent-tasks/README.md`),
+  and hardware-blocked deferrals (`DEFERRED.md`). Every brief passed a cold-read
+  brief-verifier; the package passed a mechanical audit.
+- **todo.md reconciliation**: idempotency (041982e), mdadm-initramfs (10599d8),
+  is_live_environment/casper + config-driven local install (PR #27), SSH-key injection
+  (already implemented), zsys (stale) closed with evidence; all remaining open items
+  annotated with their task brief or deferral.
 
 ## [Unreleased] — feat/install-subcommands
 
