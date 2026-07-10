@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/auth.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: af3dc9c0-def6-46ff-9892-90e54716fe21
 // last-edited: 2026-07-10
 
@@ -81,6 +81,10 @@ pub const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// The session cookie name.
 pub const SESSION_COOKIE_NAME: &str = "uaa_session";
+
+/// The short-lived, HttpOnly cookie that binds an in-flight OAuth `state` to the
+/// browser that started the login (CSRF / login-fixation defense).
+pub const OAUTH_STATE_COOKIE_NAME: &str = "uaa_oauth_state";
 
 /// The HMAC key file's name under [`AuthConfig::state_dir`].
 const HMAC_KEY_FILE: &str = "auth_hmac.key";
@@ -504,6 +508,20 @@ impl AuthState {
     }
 }
 
+/// Constant-time byte-equality (no early return on first differing byte) so the
+/// OAuth state/cookie comparison leaks no timing signal about how many leading
+/// bytes matched. A length difference short-circuits (token length is not secret).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 // ── OAuth flow (pure, testable core) ──────────────────────────────────────────────
 
 /// Result of [`begin_oauth_login`]: the state token (also stashed server-side) and
@@ -564,13 +582,21 @@ pub async fn complete_oauth_callback(
     state: &AuthState,
     code: &str,
     given_state: &str,
+    cookie_state: Option<&str>,
     now_unix: u64,
 ) -> CallbackOutcome {
+    // Browser-binding (CSRF / login-fixation defense): the `state` GitHub echoes
+    // back must equal the `oauth_state` cookie we set on THIS browser at
+    // /auth/login, compared in constant time — in ADDITION to the single-use
+    // server-side store check below. Without this, an attacker who obtains a valid
+    // state can replay it into a victim's browser and fixate a session.
+    let cookie_bound = matches!(cookie_state, Some(c) if ct_eq(c.as_bytes(), given_state.as_bytes()));
+    // Consume the server-side state regardless (single-use), then require BOTH checks.
     let state_valid = {
         let mut states = state.oauth_states.lock().unwrap();
         matches!(states.remove(given_state), Some(issued_at) if issued_at.elapsed() < OAUTH_STATE_TTL)
     };
-    if !state_valid {
+    if !cookie_bound || !state_valid {
         return CallbackOutcome::StateMismatch;
     }
 
@@ -640,21 +666,36 @@ pub async fn check_access(
     }
 }
 
-fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     raw.split(';').map(str::trim).find_map(|kv| {
-        kv.strip_prefix(SESSION_COOKIE_NAME)
+        kv.strip_prefix(name)
             .and_then(|rest| rest.strip_prefix('='))
             .map(str::to_string)
     })
 }
 
+fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    extract_cookie(headers, SESSION_COOKIE_NAME)
+}
+
 // ── axum wiring (handlers + middleware for CT-07 to mount) ───────────────────────
 
 /// `GET /auth/login` — 302 to GitHub's authorize endpoint with a fresh `state`.
-pub async fn login_handler(State(state): State<Arc<AuthState>>) -> impl IntoResponse {
+pub async fn login_handler(State(state): State<Arc<AuthState>>) -> Response {
     let redirect = begin_oauth_login(&state);
-    Redirect::to(&redirect.authorize_url)
+    // Bind this state to the browser: set it as a short-lived HttpOnly cookie the
+    // callback must echo back. SameSite=Lax so it survives the GitHub redirect.
+    let cookie = format!(
+        "{OAUTH_STATE_COOKIE_NAME}={}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+        redirect.state_token,
+        OAUTH_STATE_TTL.as_secs(),
+    );
+    let mut resp = Redirect::to(&redirect.authorize_url).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    resp
 }
 
 #[derive(Debug, Deserialize)]
@@ -669,9 +710,28 @@ pub struct CallbackQuery {
 /// failure during login is a 502 — none of those three paths ever sets a cookie.
 pub async fn callback_handler(
     State(state): State<Arc<AuthState>>,
+    headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    match complete_oauth_callback(&state, &query.code, &query.state, unix_now()).await {
+    // The state the browser must echo from its /auth/login cookie.
+    let cookie_state = extract_cookie(&headers, OAUTH_STATE_COOKIE_NAME);
+    // Clear the one-time state cookie on every outcome (success or reject).
+    let clear_state =
+        format!("{OAUTH_STATE_COOKIE_NAME}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax");
+    let append_clear = |resp: &mut Response| {
+        if let Ok(v) = HeaderValue::from_str(&clear_state) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    };
+    match complete_oauth_callback(
+        &state,
+        &query.code,
+        &query.state,
+        cookie_state.as_deref(),
+        unix_now(),
+    )
+    .await
+    {
         CallbackOutcome::Success { cookie, .. } => {
             let cookie_header = format!(
                 "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; Secure; HttpOnly; SameSite=Lax"
@@ -680,19 +740,30 @@ pub async fn callback_handler(
             if let Ok(value) = HeaderValue::from_str(&cookie_header) {
                 resp.headers_mut().insert(header::SET_COOKIE, value);
             }
+            append_clear(&mut resp);
             resp
         }
         CallbackOutcome::StateMismatch => {
-            (StatusCode::BAD_REQUEST, Json(json!({"error": "state_mismatch"}))).into_response()
+            let mut resp =
+                (StatusCode::BAD_REQUEST, Json(json!({"error": "state_mismatch"}))).into_response();
+            append_clear(&mut resp);
+            resp
         }
         CallbackOutcome::Denied => {
-            (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+            let mut resp =
+                (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response();
+            append_clear(&mut resp);
+            resp
         }
-        CallbackOutcome::GithubError => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "github_unavailable"})),
-        )
-            .into_response(),
+        CallbackOutcome::GithubError => {
+            let mut resp = (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "github_unavailable"})),
+            )
+                .into_response();
+            append_clear(&mut resp);
+            resp
+        }
     }
 }
 
@@ -854,7 +925,15 @@ mod tests {
 
     async fn login_via_mock(state: &AuthState) -> CallbackOutcome {
         let login = begin_oauth_login(state);
-        complete_oauth_callback(state, "mock-code", &login.state_token, unix_now()).await
+        // Happy path: the browser echoes the same state via its oauth_state cookie.
+        complete_oauth_callback(
+            state,
+            "mock-code",
+            &login.state_token,
+            Some(login.state_token.as_str()),
+            unix_now(),
+        )
+        .await
     }
 
     #[test]
@@ -946,11 +1025,47 @@ mod tests {
     async fn test_oauth_state_mismatch_rejected() {
         let (state, mock, _dir) = test_state(MockGithubApi::healthy("alice", vec![], true));
         let _issued = begin_oauth_login(&state);
-        let outcome =
-            complete_oauth_callback(&state, "mock-code", "not-the-issued-state", unix_now()).await;
+        // Cookie matches the (forged) given state, so the browser-binding passes —
+        // this isolates the SERVER-side single-use store rejection.
+        let outcome = complete_oauth_callback(
+            &state,
+            "mock-code",
+            "not-the-issued-state",
+            Some("not-the-issued-state"),
+            unix_now(),
+        )
+        .await;
         assert!(matches!(outcome, CallbackOutcome::StateMismatch));
         // Rejected before any GithubApi call — a forged/replayed callback never
         // touches GitHub.
+        assert_eq!(mock.exchange_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_oauth_cookie_binding_required() {
+        // A valid server-side state but a MISSING or MISMATCHED browser cookie is
+        // rejected (CSRF / login-fixation defense) — before any GithubApi call.
+        let (state, mock, _dir) = test_state(MockGithubApi::healthy("alice", vec![], true));
+        let issued = begin_oauth_login(&state);
+
+        // Missing cookie → StateMismatch.
+        let no_cookie =
+            complete_oauth_callback(&state, "mock-code", &issued.state_token, None, unix_now())
+                .await;
+        assert!(matches!(no_cookie, CallbackOutcome::StateMismatch));
+        assert_eq!(mock.exchange_calls.load(Ordering::SeqCst), 0);
+
+        // Fresh state (the prior one was consumed), wrong cookie → StateMismatch.
+        let issued2 = begin_oauth_login(&state);
+        let wrong_cookie = complete_oauth_callback(
+            &state,
+            "mock-code",
+            &issued2.state_token,
+            Some("attacker-cookie"),
+            unix_now(),
+        )
+        .await;
+        assert!(matches!(wrong_cookie, CallbackOutcome::StateMismatch));
         assert_eq!(mock.exchange_calls.load(Ordering::SeqCst), 0);
     }
 
