@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/power/mod.rs
-// version: 1.0.2
+// version: 1.1.0
 // guid: 76330c27-93dd-46ab-8265-8b8e9b6a4dc1
 // last-edited: 2026-07-10
 
@@ -71,17 +71,39 @@ pub enum PowerMechanism {
 
 /// The host that runs ipmitool for us. Deliberately NOT the same constant
 /// as COCKROACH_SERVER_IP (same value, different role).
+///
+/// DEFAULT sourced by `crate::fleet::FleetConfig::power_server` — the live
+/// value used at runtime (`run_power_action`) is read through
+/// `crate::fleet::fleet()`, not this const directly.
 pub const POWER_SERVER: &str = "172.16.2.30";
 
-/// Hardcoded v1 host registry. Returns None for unknown hostnames.
+/// Host registry, backed by `crate::fleet::fleet().power_hosts` (default:
+/// today's hardcoded v1 table). Returns `None` for unknown hostnames, and for
+/// entries whose `mechanism` string doesn't match a known
+/// [`PowerMechanism`] (logged via `tracing::warn!`).
 pub fn lookup_host(hostname: &str) -> Option<PowerMechanism> {
-    match hostname {
-        "unimatrixone" => Some(PowerMechanism::Ipmi {
-            bmc_host: "172.16.3.150",
-            username: "ADMIN",
-        }),
-        "len-serv-001" | "len-serv-002" | "len-serv-003" => Some(PowerMechanism::AmdDash),
-        _ => None,
+    let entry = crate::fleet::fleet()
+        .power_hosts
+        .iter()
+        .find(|e| e.hostname == hostname)?;
+
+    match entry.mechanism.as_str() {
+        "ipmi" => match (entry.bmc_host.as_deref(), entry.username.as_deref()) {
+            (Some(bmc_host), Some(username)) => Some(PowerMechanism::Ipmi { bmc_host, username }),
+            _ => {
+                tracing::warn!(
+                    "power host '{hostname}' has mechanism 'ipmi' but is missing bmc_host/username"
+                );
+                None
+            }
+        },
+        "amd-dash" => Some(PowerMechanism::AmdDash),
+        "intel-amt" => Some(PowerMechanism::IntelAmt),
+        "wol" => Some(PowerMechanism::WakeOnLan),
+        other => {
+            tracing::warn!("power host '{hostname}' has unknown mechanism '{other}'");
+            None
+        }
     }
 }
 
@@ -173,7 +195,7 @@ pub async fn run_power_action(
     // NEVER log `cmd` — it embeds the password. Log the redacted twin only.
     tracing::info!(
         "power: running on {}: {}",
-        POWER_SERVER,
+        crate::fleet::fleet().power_server,
         redacted_ipmi_command(bmc_host, username, action)
     );
 
