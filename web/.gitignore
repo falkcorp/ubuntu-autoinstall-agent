@@ -1,0 +1,7 @@
+# file: web/.gitignore
+# version: 1.0.0
+# guid: 8d9ddfed-1437-4724-9bd2-19d551e32b1d
+# last-edited: 2026-07-10
+
+dist/*
+!dist/.gitkeep

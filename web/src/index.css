@@ -1,0 +1,109 @@
+/* file: web/src/index.css */
+/* version: 1.0.0 */
+/* guid: eda64990-a578-4026-b133-dee17e5db539 */
+/* last-edited: 2026-07-10 */
+
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid #8888;
+}
+
+.app-header nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.nav-link {
+  text-decoration: none;
+}
+
+.nav-link-active {
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.app-main {
+  padding: 1.25rem;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-top: 0.5rem;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #8884;
+}
+
+.badge {
+  padding: 0.1rem 0.5rem;
+  border-radius: 0.75rem;
+  font-size: 0.85em;
+  border: 1px solid #8888;
+}
+
+.badge-drift {
+  border-color: #c0392b;
+  color: #c0392b;
+}
+
+.badge-consistent {
+  border-color: #2e7d32;
+  color: #2e7d32;
+}
+
+.error-card {
+  border: 1px solid #c0392b;
+  border-radius: 0.4rem;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.banner {
+  border-radius: 0.4rem;
+  padding: 0.6rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.banner-forbidden {
+  border: 1px solid #c0392b;
+}
+
+.banner-verify-ok {
+  border: 1px solid #2e7d32;
+}
+
+.banner-verify-fail {
+  border: 1px solid #c0392b;
+}
+
+.empty-state {
+  opacity: 0.75;
+  font-style: italic;
+}
+
+.approvals-section {
+  margin-bottom: 1.5rem;
+}

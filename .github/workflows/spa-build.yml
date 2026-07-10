@@ -1,0 +1,58 @@
+# file: .github/workflows/spa-build.yml
+# version: 1.0.0
+# guid: 50828ed2-c594-4b05-9569-3677be8c3d69
+# last-edited: 2026-07-10
+
+# Builds the constellation control-plane SPA (web/) on every change under
+# web/**. This is the SPA's own build gate — it does not touch Rust and does
+# not run on non-web changes. CT-07 (rust-embed hookup, several waves later)
+# depends on `web/dist/.gitkeep` existing so its `#[folder = "web/dist"]`
+# compiles even before this workflow has produced a real build; this
+# workflow's `spa-dist` artifact is the CI-built dist that will eventually be
+# consumed downstream.
+
+name: SPA Build
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "web/**"
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-spa:
+    name: Build web/ (npm ci && npm run build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install and build
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload artifact (spa-dist)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: spa-dist
+          path: web/dist
+          if-no-files-found: error
