@@ -1,5 +1,5 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.5.0
+# version: 1.6.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-09
 
@@ -59,6 +59,38 @@
 - [ ] **`curtin in-target` compatibility** — when invoked as `curtin in-target -- ubuntu-autoinstall-agent
   install`, the binary is already inside the chroot; skip mount setup and debootstrap; only do
   post-install configuration (GRUB, LUKS crypttab, dracut, Tang).
+
+## Post-install / boot productionization (designed 2026-07-09, install now 7/7)
+
+- [ ] **Preflight: SUM read-only check of SATA/RAID controller OpROM mode (md targets).**
+  IMSM arrays only boot in the OpROM mode they were created under. Before installing to an
+  md/IMSM target, run SUM `GetCurrentBiosCfg` (READ ONLY — we can run SUM in-band from the
+  live disk) and check the storage OpROM/controller mode token; if it would make the array
+  unbootable (e.g. UEFI mode for a legacy-created array), ABORT the install and warn the
+  user to fix the BIOS. Do NOT auto-change BIOS via SUM (keep firmware writes manual). This
+  prevents completing a 7/7 install that then can't boot (exactly what happened on U1 —
+  fixed by manually setting the controller to legacy). Need to identify the exact BIOS token.
+- [ ] **efibootmgr boot order in chroot (post-grub).** Set UEFI BootOrder so
+  **network #1, ubuntu #2** — firmware tries PXE first, falls through to the installed
+  disk. grub-install currently makes `ubuntu` #1. Also flip the server's PXE target for
+  the MAC to "boot local/proceed" so netboot doesn't reinstall. Prefer efibootmgr in the
+  chroot over ipmitool-from-server for the EFI order.
+- [ ] **USB auto-bootstrap like netboot.** USB live env should, on boot, fetch its config
+  BY MAC from the web util (172.16.2.30 autoinstall-agent.py, same as netboot) and
+  auto-run `uaa install`. On success (USB case) report back so boot order is fixed. Rebuild
+  the USB image, copy to the server for reuse, dd to the stick, test the full flow.
+  SCOPE: OS install only — NO cockroach post-install/join.
+- [ ] **Populate the RESET partition (p2, 4GiB ext4 — subiquity reset/recovery partition).**
+  Currently created + formatted but empty. Idea (user 2026-07-09): put a copy of the
+  bootable USB + the debootstrap tarball on it, and a GRUB "reset/recover" entry. The reset
+  flow must GATE on explicit confirmation — load the recovery env, prompt that it will
+  DELETE EVERYTHING, require typing `nuke it` (or similar) before wiping. Ref:
+  subiquity autoinstall reset-partition.
+- [ ] **Installed OS didn't boot on first try (2026-07-09):** with `ubuntu` already #1 in
+  BootOrder + BootNext=0000, U1 still booted the USB live env. So either the installed
+  loader (shim/grub on IMSM md126p1 ESP) failed and fell through to the USB, or the BIOS
+  prefers removable/USB. Isolate by pulling the USB + reboot; if it still fails, watch IPMI
+  SOL (from server) for where it dies (shim/grub vs initramfs md-assembly vs Tang unlock).
 
 ## Known Issues / Tech Debt
 
