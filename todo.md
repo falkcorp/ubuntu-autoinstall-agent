@@ -1,11 +1,21 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.8.0
+# version: 1.9.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-09
 
+> **PLANNING PACKAGE (2026-07-09):** every remaining `[ ]` item below is either
+> tasked in `docs/agent-tasks/` (see the master table in `docs/agent-tasks/README.md`,
+> specs in `docs/specs/`) or deferred with reasons in `docs/agent-tasks/DEFERRED.md`.
+> Items annotated `→ planned:` name their brief.
+
 ## Critical Bugs (blocking correct operation)
 
-- [ ] **Autoinstall produces a broken `/boot` layout (ext4 instead of ZFS/bpool).** The autoinstall must
+- [ ] **Autoinstall produces a broken `/boot` layout (ext4 instead of ZFS/bpool).**
+  *(2026-07-09 reconcile: Path B — `src/network/ssh_installer/` — produces the CORRECT
+  bpool `/boot` layout since faea48e (mount order) + 297a49e (compatibility=grub2),
+  proven 7/7 on U1. This item describes Path A (`src/autoinstall/` subiquity renderer),
+  which is still live for render/place/verify. Path A disposition is
+  → planned: docs/agent-tasks/installer-robustness/TASK-08-path-a-b-split-doc.md.)* The autoinstall must
   create `/boot` as a ZFS dataset that is part of the `bpool` zpool, NOT as a standalone ext4 (or the
   vfat-shadow hack seen on len-serv-002). Concrete failure diagnosed 2026-07-09 on len-serv-002
   (172.16.3.94): the install left `/boot/grub` **bind-mounted from a vfat copy** (`/boot/efi/grub` →
@@ -52,17 +62,19 @@
   packs the binary with an embedded config payload (appended to the ELF). At runtime the binary detects
   the payload and uses it as config without external files. Optional AES-256 encryption of the payload
   keyed to a passphrase for secret hiding.
-- [ ] **Config file schema** — add proper serde deserialization for the full `InstallationConfig` YAML
-  including tang_servers, initramfs_type, ssh_keys, user accounts.
-- [ ] **SSH key injection** — after debootstrap, inject the operator's `~/.ssh/authorized_keys` into
-  `/mnt/targetos/root/.ssh/authorized_keys`.
-- [ ] **`curtin in-target` compatibility** — when invoked as `curtin in-target -- ubuntu-autoinstall-agent
+- [x] **Config file schema** — DONE in substance: `InstallationConfig::from_yaml_file` covers all 20
+  fields 1:1 with `examples/configs/install/*.yaml` (verified 2026-07-09). Residual hardening
+  (deny_unknown_fields + round-trip tests) → planned: docs/agent-tasks/installer-robustness/TASK-06-config-schema-hardening.md.
+- [x] **SSH key injection** — already implemented: `configure_system_in_chroot` injects
+  `config.ssh_authorized_keys` into the target (system_setup.rs:409-425; verified 2026-07-09).
+- [ ] **`curtin in-target` compatibility** *(→ planned: docs/agent-tasks/installer-robustness/TASK-07-curtin-in-target.md)* — when invoked as `curtin in-target -- ubuntu-autoinstall-agent
   install`, the binary is already inside the chroot; skip mount setup and debootstrap; only do
   post-install configuration (GRUB, LUKS crypttab, dracut, Tang).
 
 ## Phase-selective re-run (designed 2026-07-09)
 
-- [ ] **Run only specific install phases (idempotent partial re-run).** Install is 7 phases
+- [ ] **Run only specific install phases (idempotent partial re-run).**
+  *(→ planned: docs/agent-tasks/phase-rerun/TASK-01 + TASK-02; spec docs/specs/phase-selective-rerun-design.md)* Install is 7 phases
   (0 vars, 1 pkgs, 2 disk-prep/WIPE, 3 zfs, 4 base, 5 sys-config incl. grub, 6 final).
   Add `--phases <spec>` / `--from-phase <n>` so e.g. a failed grub can be redone with
   `--phases 5` WITHOUT re-wiping (Phases 2-3). Requires a non-destructive "mount existing
@@ -75,6 +87,7 @@
 ## Post-install / boot productionization (designed 2026-07-09, install now 7/7)
 
 - [ ] **Preflight: SUM read-only check of SATA/RAID controller OpROM mode (md targets).**
+  *(DEFERRED — needs the exact BIOS token from U1 hardware; see docs/agent-tasks/DEFERRED.md)*
   IMSM arrays only boot in the OpROM mode they were created under. Before installing to an
   md/IMSM target, run SUM `GetCurrentBiosCfg` (READ ONLY — we can run SUM in-band from the
   live disk) and check the storage OpROM/controller mode token; if it would make the array
@@ -82,7 +95,8 @@
   user to fix the BIOS. Do NOT auto-change BIOS via SUM (keep firmware writes manual). This
   prevents completing a 7/7 install that then can't boot (exactly what happened on U1 —
   fixed by manually setting the controller to legacy). Need to identify the exact BIOS token.
-- [ ] **efibootmgr boot order in chroot (post-grub).** Set UEFI BootOrder so
+- [ ] **efibootmgr boot order in chroot (post-grub).**
+  *(→ planned: docs/agent-tasks/boot-prod/TASK-01-efibootmgr-chroot.md)* Set UEFI BootOrder so
   **network #1, ubuntu #2** — firmware tries PXE first, falls through to the installed
   disk. grub-install currently makes `ubuntu` #1. Also flip the server's PXE target for
   the MAC to "boot local/proceed" so netboot doesn't reinstall. Prefer efibootmgr in the
@@ -112,12 +126,14 @@
   5. Test the full flow on one host: boot USB → agent+config fetched by MAC →
      `uaa install` 7/7 → webhook report → poweroff; verify BootOrder + next boot from disk.
 - [ ] **Populate the RESET partition (p2, 4GiB ext4 — subiquity reset/recovery partition).**
+  *(→ planned: docs/agent-tasks/boot-prod/TASK-02-reset-partition-populate.md; spec docs/specs/reset-partition-design.md)*
   Currently created + formatted but empty. Idea (user 2026-07-09): put a copy of the
   bootable USB + the debootstrap tarball on it, and a GRUB "reset/recover" entry. The reset
   flow must GATE on explicit confirmation — load the recovery env, prompt that it will
   DELETE EVERYTHING, require typing `nuke it` (or similar) before wiping. Ref:
   subiquity autoinstall reset-partition.
-- [ ] **Installed OS didn't boot on first try (2026-07-09):** with `ubuntu` already #1 in
+- [ ] **Installed OS didn't boot on first try (2026-07-09):**
+  *(DEFERRED — needs IPMI SOL capture from the server; see docs/agent-tasks/DEFERRED.md)* with `ubuntu` already #1 in
   BootOrder + BootNext=0000, U1 still booted the USB live env. So either the installed
   loader (shim/grub on IMSM md126p1 ESP) failed and fell through to the USB, or the BIOS
   prefers removable/USB. Isolate by pulling the USB + reboot; if it still fails, watch IPMI
@@ -125,7 +141,8 @@
 
 ## Known Issues / Tech Debt
 
-- [ ] **Installer not idempotent over a prior install (disk busy on re-run).** Found on
+- [x] **FIXED 041982e** — installer idempotent over a prior install: pre-wipe cleanup does
+  lazy-umount x3 + `zpool export -f` + `cryptsetup close`. Original item: Found on
   unimatrixone 2026-07-09: a first clean install ran 5/6 phases; re-running the installer over
   the resulting disk failed at Phase 2 `wipefs -a /dev/md126` with "Device or resource busy"
   because a pre-existing **rpool was still imported** (and its LUKS mapper open) holding the md
@@ -140,14 +157,15 @@
   filesystem". Now uses compatibility=grub2 alone. (Validated only in unit tests — the U1
   re-run to confirm end-to-end was blocked by the idempotency bug above + lab network loss.)
 
-- [ ] **`is_live_environment()` heuristic is weak** — checks `/run/live`, `/lib/live`, or `boot=live` in
+- [x] **FIXED PR #27 (8540976)** — `is_live_environment()` now detects casper (`/run/casper`,
+  `boot=casper`, bare `casper` token). Original item: — checks `/run/live`, `/lib/live`, or `boot=live` in
   cmdline. On Ubuntu Server live ISO this is correct, but on iPXE-netbooted live environments it may
   miss. Consider also checking for `casper` in `/proc/cmdline` or presence of `ubuntu` in overlay mounts.
-- [ ] **`detect_primary_disk` is fragile** — parses `lsblk` text output with simple string matching.
+- [ ] **`detect_primary_disk` is fragile** *(→ planned: docs/agent-tasks/installer-robustness/TASK-02-detect-primary-disk-json.md)* — parses `lsblk` text output with simple string matching.
   Should use `lsblk --json` for reliable parsing.
-- [ ] **`detect_network_config` always returns DHCP** — never actually reads network info; returns
+- [ ] **`detect_network_config` always returns DHCP** *(→ planned: docs/agent-tasks/installer-robustness/TASK-03-detect-network-config-parse.md)* — never actually reads network info; returns
   hardcoded DHCP. Needs actual parsing of `ip addr` / `ip route` output.
-- [ ] **`setup_network_configuration` uses `networkd` renderer** — some servers may prefer `NetworkManager`.
+- [ ] **`setup_network_configuration` uses `networkd` renderer** *(→ planned: docs/agent-tasks/installer-robustness/TASK-04-netplan-renderer-dhcp.md)* — some servers may prefer `NetworkManager`.
   Make renderer configurable.
 - [ ] **`hold_on_failure` keepalive calls `self.ssh.execute`** even in local mode — would fail locally.
   Fixed as part of CommandRunner trait refactor.
@@ -157,17 +175,20 @@
   to `GRUB_CMDLINE_LINUX` when `initramfs_type == Dracut` and Tang servers are configured.
 - [x] **Tang servers hardcoded** — moved to `InstallationConfig.tang_servers`; fully configurable
   per-machine via YAML; `for_len_serv_003()` sets all three Tang server URLs.
-- [ ] **LUKS passphrase in process env** — `setup_installation_variables` exports `LUKS_KEY` as a
+- [ ] **LUKS passphrase in process env** *(→ planned: docs/agent-tasks/installer-robustness/TASK-05-luks-keyfile.md — also fixes the worse leak: passphrase interpolated into cryptsetup command lines, disk_ops.rs:340/348)* — `setup_installation_variables` exports `LUKS_KEY` as a
   shell env var, visible in `/proc/<pid>/environ`. Use a tempfile-based keyfile instead.
-- [ ] **No test for local install flow** — all tests use `SshInstaller` with SSH. Add unit tests for
+- [ ] **No test for local install flow** *(→ planned: docs/agent-tasks/testing-gates/TASK-02-localclient-tests.md)* — all tests use `SshInstaller` with SSH. Add unit tests for
   local mode using `LocalClient`.
-- [ ] **`PackageManager` installs `zsys`** — zsys is deprecated/removed in Ubuntu 24.04+. Remove it
+- [x] **STALE — `PackageManager` never installs `zsys`** (verified 2026-07-09: no zsys in
+  packages.rs; only `com.ubuntu.zsys:*` dataset PROPERTIES in zfs_ops.rs, which are correct
+  per the OpenZFS HOWTO and harmless without the zsys package). Original item: — zsys is deprecated/removed in Ubuntu 24.04+. Remove it
   from package lists when release >= noble.
 - [x] **Static musl binary** (shipped) — `scripts/build-musl.sh` + CI
   `.github/workflows/musl-build.yml` build `x86_64-unknown-linux-musl` release and verify it
   is static (artifact `uaa-amd64`). Human deploys it to the server at
   `/var/www/html/uaa/uaa-amd64` (the `UAA_AGENT_URL` default the USB bootstrap curls).
-- [ ] **unimatrixone needs mdadm assembly in the target initramfs** — u1's disk is Intel IMSM/BIOS
+- [x] **FIXED 10599d8** — dracut `mdraid` module + `mdadmconf=yes` + raid1 driver baked for
+  md/IMSM targets (system_setup.rs:713-730); U1 install #7 booted through md assembly. Original item: — u1's disk is Intel IMSM/BIOS
   fake-RAID assembled by mdadm as `/dev/md126` (single ~885 GiB volume; NOT `/dev/sda`, which is a
   RAID *member*). The installer neither adds `mdadm` to the target package set (`packages.rs` only
   installs into the live env) nor configures a dracut `mdraid` module, so `/dev/md126` would not
@@ -175,7 +196,7 @@
   the target packages + dracut `mdraid` module, gated on the target disk being an md device. Validate
   on the QEMU/mdadm path before any u1 hardware attempt. (The `{}p1` suffix scheme is already correct
   for md126.)
-- [ ] **Partition-name suffix is hardcoded `{}p1..p4`** — correct for every current target (NVMe
+- [ ] **Partition-name suffix is hardcoded `{}p1..p4`** *(→ planned: docs/agent-tasks/installer-robustness/TASK-01-partition-suffix-helper.md — wave-1, blocks the QEMU virtio gate)* — correct for every current target (NVMe
   `nvme0n1`, md `md126` — both end in a digit → take `p`) but wrong for bare `/dev/sda` / `/dev/vda`
   (SATA/virtio → `sda1`, no `p`). Route the ~9 call sites (disk_ops, zfs_ops, system_setup, installer)
   through one helper that appends `p<N>` only when the device name ends in a digit. Needed before the
@@ -189,7 +210,7 @@
 
 ## New Machines / Pending Registration
 
-- [ ] **unimatrixone** — new server (hardware TBD, may be different class than lenservs).
+- [ ] *(DEFERRED — needs a booted host; see docs/agent-tasks/DEFERRED.md)* **unimatrixone** — new server (hardware TBD, may be different class than lenservs).
   Suspected two drives — unknown if hardware RAID, mdadm, or two independents. Must be
   booted and SSH'd into to determine disk layout before generating user-data. Not yet
   registered in the netboot tree (`/var/www/html/cloud-init/` on 172.16.2.30). Steps:
@@ -202,7 +223,7 @@
 
 ## Remote Power Control (IPMI / AMD DASH / Intel ME)
 
-- [ ] **Lenovo M715q (len-serv-001/002/003) — AMD DASH via Realtek**.
+- [ ] *(DEFERRED — driver+creds need hardware; see docs/agent-tasks/DEFERRED.md)* **Lenovo M715q (len-serv-001/002/003) — AMD DASH via Realtek**.
   The M715q uses AMD DASH (NOT Intel AMT — AMD Ryzen Pro, no MEBx). Remote power via
   `wsman` tool calling CIM_PowerManagementService on port 16992.
   Status: BIOS DASH enabled, RTL8111EPP NIC enabled, but Realtek DASH driver + DASHConfigRT
@@ -223,7 +244,7 @@
   - If Intel AMT: use `wsmancli` or `amtterm` targeting port 16992.
   - If neither: fall back to Wake-on-LAN (`wol <mac>`) for power-on (not power-off).
 
-- [ ] **Wire remote power into the tool** — once credentials are known, add a
+- [ ] **Wire remote power into the tool** *(→ planned: docs/agent-tasks/remote-power/TASK-01-power-subcommand-ipmi.md — dispatch + IPMI path now; DASH/AMT arms deferred)* — once credentials are known, add a
   `ubuntu-autoinstall-agent power <hostname> on|off|reset` subcommand that dispatches
   to the right mechanism (DASH/AMT/IPMI/WoL) based on machine class. This enables fully
   automated: place → flip → power-cycle → wait-for-ssh → verify.
