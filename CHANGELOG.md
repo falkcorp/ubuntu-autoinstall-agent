@@ -1,11 +1,72 @@
 <!-- file: CHANGELOG.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: chnglog1-0000-0000-0000-000000000001 -->
-<!-- last-edited: 2026-07-09 -->
+<!-- last-edited: 2026-07-10 -->
 
 # Changelog
 
 All notable changes to `ubuntu-autoinstall-agent` are documented here.
+
+## [Unreleased] — install-ops execution (2026-07-10)
+
+All 20 briefs from the install-ops planning package merged across 6 dependency
+waves (coordinator/worker orchestration). `cargo test --lib --offline` grew
+237 → 311 passing, 0 failed at every merge. No hardware was touched — validation
+was in-repo (cargo, `bash -n`, shellcheck) plus a Linux-only VM gate.
+
+### Added
+
+- **Suffix-aware `partition_path` helper** (`src/network/ssh_installer/partitions.rs`) —
+  routes all 11 partition-path sites; appends `p` only when the device name ends in a
+  digit, so QEMU/virtio `/dev/vda` and bare `/dev/sda` targets partition correctly (`7273286`).
+- **`detect_primary_disk` via `lsblk --json`** (md/nvme/sd/vd, excludes loop/rom) (`d04567f`)
+  and **`detect_network_config` via `ip -j addr`/`ip -j route`** instead of hardcoded
+  eth0/dhcp (`44c0bca`).
+- **Configurable netplan renderer** (networkd | NetworkManager) + `dhcp4: true` rendering
+  when the address is `dhcp` (`519e721`).
+- **`#[serde(deny_unknown_fields)]`** on `InstallationConfig` — typo'd YAML keys now fail
+  loudly (`b9d710f`).
+- **curtin in-target mode** — marker-file detection skips mount/debootstrap and runs
+  Phase-5-only reconfiguration when already inside the target chroot (`6ffeae0`).
+- **`--phases <spec>` / `--from-phase <n>` selective phase runs** with a compile-time
+  `WipeAuthorization` token: a disk wipe is structurally impossible unless Phase 2 is
+  selected; preflight refuses (does not wipe) on residual state in selective mode (`7d909e8`).
+- **Non-destructive mount-existing-target prep** (assemble md → open LUKS → import
+  rpool then bpool → mount `/` → `/boot` → ESP, the load-bearing order) for grub-only
+  re-runs (`69263ed`).
+- **efibootmgr BootOrder in chroot** after update-grub (network #1, ubuntu #2), non-fatal
+  on legacy BIOS / missing efivars (`0cc3b3c`).
+- **RESET partition (p2) staging** — recovery ISO + base tarball + a GRUB reset entry
+  gated on the operator typing `nuke it`; the installer itself stays non-destructive (`3ef30b6`).
+- **QEMU + swtpm VM validation harness** `scripts/vm-validate.sh` (virtio `/dev/vda` + TPM2),
+  the gate that must pass on a Linux host before any hardware install (`e7a8eb7`).
+- **LocalClient unit tests** exercising the `CommandExecutor` seam (`55ab93a`).
+- **`uaa power <host> on|off|status`** subcommand — machine-class dispatch; the IPMI path
+  runs `ipmitool` on the server (`ssh 172.16.2.30`), never locally; explicit off/on only,
+  no reset/cycle (`f99dffa`).
+- **Install-server endpoints (repo mirror, human-deployed):** webhook auto-flip on install
+  `success` + tolerate missing iPXE file (`3c4b0c9`); `GET /api/health` with agent-binary
+  presence + serving docs (`973b340`); `GET /api/uaa-configs` metadata inventory (`4ae949a`);
+  `GET /dashboard` status page (`4900f93`); `deploy-usb-configs.sh --inject-from` place-time
+  secret injection, refusing world-readable secrets and preserving the placeholder gate (`0e6d5a8`).
+- **`docs/architecture-path-split.md`** documenting Path A (subiquity render) vs Path B
+  (ssh_installer) with guardrails (`466e0b5`).
+
+### Security
+
+- **LUKS passphrase via a 0600 tempfile keyfile** (`--key-file`) — removed the
+  `echo '<pass>' | cryptsetup …` command-line interpolation (visible in `ps`/history on the
+  target) and the inert `LUKS_KEY` env export (`10fbb0f`).
+
+### Known follow-up (not yet fixed)
+
+- **IPMI password can leak under verbose logging.** `SshClient::execute_with_output`
+  (`src/network/ssh.rs`) does `debug!("Executing command with output: {}", command)`, logging
+  the full command string. `uaa power` passes `IPMI_PASSWORD='<pw>' ipmitool …` through the
+  `CommandExecutor` seam, so running the binary with `-v`/debug would write the BMC password to
+  local logs (the power module itself only ever logs a redacted twin). Fix pending: add a
+  redaction seam (an optional "loggable command" override) to `SshClient`/`CommandExecutor`
+  before `uaa power` is used with verbose logging. Tracked in `todo.md`.
 
 ## [Unreleased] — docs/plan-install-ops (2026-07-09)
 
