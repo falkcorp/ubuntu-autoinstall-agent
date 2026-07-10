@@ -1,0 +1,74 @@
+# file: .github/workflows/musl-build.yml
+# version: 1.0.0
+# guid: 6b2d9f04-3a7e-4c15-8d60-1f4e7a2c9b58
+
+# Static x86_64 musl release build of the agent.
+#
+# The USB auto-bootstrap (installer-image/nocloud/uaa-usb-bootstrap.sh) curls
+# this binary from the server at http://172.16.2.30/uaa/uaa-amd64, so it MUST
+# be fully static (musl) — the live installer environment and curtin in-target
+# chroots offer no guaranteed glibc.
+#
+# DEPLOY (human step): download the `uaa-amd64` artifact from this workflow run
+# (or build locally with scripts/build-musl.sh) and place it on the server:
+#   scp uaa-amd64 172.16.2.30:/tmp/ && \
+#   ssh 172.16.2.30 'sudo install -m 0755 /tmp/uaa-amd64 /var/www/html/uaa/uaa-amd64'
+
+name: Musl Static Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-musl:
+    name: Build x86_64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools perl make
+
+      - name: Install Rust musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: musl-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build static release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify the binary is static
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -vq "not a dynamic executable\|statically linked"; then
+            echo "ERROR: binary is not static"; ldd "$BIN"; exit 1
+          fi
+
+      - name: Upload artifact (uaa-amd64)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: uaa-amd64
+          path: target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent
+          if-no-files-found: error

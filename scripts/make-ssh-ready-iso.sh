@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/make-ssh-ready-iso.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 5d2b7f18-9c04-4a6e-8b31-2f7a0c9d6e42
 # last-edited: 2026-07-09
 #
@@ -11,10 +11,18 @@
 # so the LIVE installer session boots with openssh-server on, user
 # `ubuntu-server` (known password + operator key) and NOPASSWD sudo — no manual
 # per-boot setup, and the `uaa install` agent can run every command as root over
-# SSH without root login. It does NOT autoinstall (no `autoinstall:` key).
+# SSH without root login. It does NOT subiquity-autoinstall (no `autoinstall:` key).
+#
+# OPT-IN auto-install (--autoinstall or UAA_AUTOINSTALL=1): additionally bakes
+# the `uaa.autoinstall` token (and optional `uaa.on_done=<action>`) into the
+# kernel cmdline. The seed's runcmd gate then runs uaa-usb-bootstrap.sh on boot:
+# fetch agent + per-host config from the server (MAC-resolved), install, power
+# off. WITHOUT the flag the stick stays SSH-ready-only (manual debug) — the
+# SAME seed serves both; only the cmdline token differs.
 #
 # Usage:
-#   scripts/make-ssh-ready-iso.sh <input.iso> [output.iso]
+#   scripts/make-ssh-ready-iso.sh [--autoinstall] [--on-done poweroff|reboot|shell] \
+#       <input.iso> [output.iso]
 #
 # Then write the output to the USB, e.g.:
 #   sudo dd if=<output.iso> of=/dev/sdX bs=4M status=progress conv=fsync
@@ -28,7 +36,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # running the script standalone (e.g. copied to /tmp on a target).
 SEED_DIR="${UAA_SEED_DIR:-${SCRIPT_DIR}/../installer-image/nocloud}"
 
-IN_ISO="${1:?usage: make-ssh-ready-iso.sh <input.iso> [output.iso]}"
+# Opt-in auto-install token baking (flag or env).
+AUTOINSTALL="${UAA_AUTOINSTALL:-0}"
+ON_DONE="${UAA_ON_DONE:-}"
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --autoinstall) AUTOINSTALL=1; shift ;;
+    --on-done)     ON_DONE="${2:?--on-done needs poweroff|reboot|shell}"; shift 2 ;;
+    -h|--help)     grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*)            echo "ERROR: unknown flag: $1"; exit 1 ;;
+    *)             POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+case "$ON_DONE" in ""|poweroff|reboot|shell) ;; *) echo "ERROR: --on-done must be poweroff|reboot|shell"; exit 1 ;; esac
+
+IN_ISO="${1:?usage: make-ssh-ready-iso.sh [--autoinstall] [--on-done <action>] <input.iso> [output.iso]}"
 OUT_ISO="${2:-${IN_ISO%.iso}-ssh-ready.iso}"
 
 command -v xorriso >/dev/null 2>&1 || { echo "ERROR: xorriso not found (apt install xorriso / brew install xorriso)"; exit 1; }
@@ -70,9 +94,25 @@ patch_cfg() {
   sed -i -E 's#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\1 ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0#' "$f"
   echo "  patched $f"
 }
+# Opt-in: bake the uaa.autoinstall token (+ optional uaa.on_done=) so the seed's
+# runcmd gate auto-runs uaa-usb-bootstrap.sh. Separate from patch_cfg so it is
+# idempotent on its own (re-running with --autoinstall on an already-SSH-ready
+# ISO only adds the token; re-running twice adds nothing).
+patch_autoinstall() {
+  local f="$1" tokens="uaa.autoinstall"
+  [ -n "$ON_DONE" ] && tokens="uaa.autoinstall uaa.on_done=${ON_DONE}"
+  if grep -q "uaa\.autoinstall" "$f"; then echo "  ($f already has uaa.autoinstall)"; return; fi
+  sed -i -E "s#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\\1 ${tokens}#" "$f"
+  echo "  baked '${tokens}' into $f"
+}
 echo "== patching kernel cmdline =="
 patch_cfg "$WD/grub.cfg"
 [ "$HAVE_LOOPBACK" = 1 ] && patch_cfg "$WD/loopback.cfg"
+if [ "$AUTOINSTALL" = 1 ]; then
+  echo "== baking uaa.autoinstall token (opt-in) =="
+  patch_autoinstall "$WD/grub.cfg"
+  [ "$HAVE_LOOPBACK" = 1 ] && patch_autoinstall "$WD/loopback.cfg"
+fi
 
 echo "== repacking -> $OUT_ISO (preserving El Torito boot) =="
 MAPS=( -map "$WD/grub.cfg" /boot/grub/grub.cfg -map "$SEED_DIR" /nocloud )

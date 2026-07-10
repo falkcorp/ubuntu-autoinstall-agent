@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # file: scripts/autoinstall-agent.py
-# version: 1.1.0
+# version: 1.2.0
 # guid: 7b6e4a2c-9f1d-4e8a-b3c6-2d5f8a1c9e07
-# last-edited: 2026-07-08
+# last-edited: 2026-07-09
 """
 autoinstall-agent: HTTP service on port 25000
 Handles webhook events, iPXE flips, cert issuance, MAC-based auth with approval,
@@ -372,6 +372,43 @@ class Handler(BaseHTTPRequestHandler):
             file_path = os.path.join(dir_path, filename)
             body = open(file_path, "rb").read() if os.path.isfile(file_path) else b""
             log(f"AUTOINSTALL {filename} -> {client_ip} (hexmac={hexmac})")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # ════════════════════════════════════════════════════════════════════
+        # ── Auto-resolved installer config (USB / netboot bootstrap) ──────
+        # GET /autoinstall/uaa-config
+        # Serves the per-host InstallationConfig (<hexmac>/uaa.yaml) resolved
+        # the same MAC-as-identity way as the cloud-init seed above. Unlike the
+        # seed files, a MISSING uaa.yaml is a hard 404 (never an empty 200):
+        # the USB bootstrap must fail loudly at fetch time, not hand an empty
+        # config to `uaa install`. Place uaa.yaml with deploy-usb-configs.sh.
+        # ════════════════════════════════════════════════════════════════════
+        if path == "/autoinstall/uaa-config":
+            client_ip = self.client_address[0]
+            hexmac, dir_path = resolve_cloud_init_dir(client_ip)
+            if not hexmac:
+                log(f"UAA-CONFIG DENIED {client_ip} - no ARP/NDP neighbor entry")
+                self.send_response(404)
+                self.end_headers()
+                return
+            if not dir_path:
+                log(f"UAA-CONFIG DENIED {client_ip} (hexmac={hexmac}) - no cloud-init dir registered")
+                self.send_response(404)
+                self.end_headers()
+                return
+            file_path = os.path.join(dir_path, "uaa.yaml")
+            if not os.path.isfile(file_path):
+                log(f"UAA-CONFIG DENIED {client_ip} (hexmac={hexmac}) - no uaa.yaml placed")
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = open(file_path, "rb").read()
+            log(f"UAA-CONFIG -> {client_ip} (hexmac={hexmac})")
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", len(body))

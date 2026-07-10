@@ -1,6 +1,6 @@
 #cloud-config
 # file: installer-image/nocloud/user-data
-# version: 1.0.0
+# version: 1.1.0
 # guid: 7c1a9e40-2b56-4d81-9f3a-6e0c2d4b8a10
 # last-edited: 2026-07-09
 #
@@ -12,6 +12,14 @@
 #     without needing root login enabled).
 # This is a live-session cloud-config (NO `autoinstall:` key) — it configures
 # the running installer environment; it does NOT trigger subiquity/curtin.
+#
+# USB auto-bootstrap: the SAME USB additionally auto-installs when (and ONLY
+# when) the kernel cmdline carries the `uaa.autoinstall` token (baked in by
+# make-ssh-ready-iso.sh --autoinstall). Without the token the runcmd gate below
+# is a no-op and the stick is plain SSH-ready for manual debugging. The
+# canonical bootstrap logic lives in uaa-usb-bootstrap.sh in this seed dir
+# (mapped to /nocloud on the ISO -> /cdrom/nocloud at runtime); write_files
+# only lands a thin launcher so the script stays single-source.
 
 ssh_pwauth: true
 
@@ -31,5 +39,28 @@ chpasswd:
   users:
     - {name: ubuntu-server, password: default, type: text}
 
+write_files:
+  - path: /usr/local/sbin/uaa-usb-bootstrap-launcher.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Thin launcher: run the canonical uaa-usb-bootstrap.sh from the ISO seed
+      # dir (single-source; do not duplicate the bootstrap logic here).
+      for d in /cdrom/nocloud /media/*/nocloud; do
+        if [ -f "${d}/uaa-usb-bootstrap.sh" ]; then
+          exec bash "${d}/uaa-usb-bootstrap.sh"
+        fi
+      done
+      echo "[uaa-usb-bootstrap-launcher] uaa-usb-bootstrap.sh not found on ISO" \
+        | tee /dev/kmsg 2>/dev/null
+      exit 1
+
 runcmd:
   - [systemctl, enable, --now, ssh]
+  # Auto-install ONLY when the uaa.autoinstall cmdline token is present
+  # (make-ssh-ready-iso.sh --autoinstall). Absent token = SSH-ready-only boot.
+  - |
+    if grep -qw uaa.autoinstall /proc/cmdline; then
+      /usr/local/sbin/uaa-usb-bootstrap-launcher.sh
+    fi
