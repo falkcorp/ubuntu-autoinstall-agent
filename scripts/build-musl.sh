@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/build-musl.sh
-# version: 1.0.0
+# version: 1.0.1
 # guid: 8c5e1a37-4f92-4d6b-b8a0-6d3c9e2f7a14
-# last-edited: 2026-07-09
+# last-edited: 2026-07-10
 #
 # Build the static x86_64 musl release binary of the agent on a Linux box
 # (e.g. the server 172.16.2.30 or any amd64 Ubuntu host). This is the binary
@@ -33,6 +33,7 @@ rustup target list --installed | grep -q x86_64-unknown-linux-musl \
     || rustup target add x86_64-unknown-linux-musl
 
 export CC_x86_64_unknown_linux_musl=musl-gcc
+# workspace: binary built from crates/uaa (bin name frozen ubuntu-autoinstall-agent)
 cargo build --release --target x86_64-unknown-linux-musl
 
 BIN=target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent
