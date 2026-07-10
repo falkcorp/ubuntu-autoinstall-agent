@@ -1,5 +1,5 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.6.0
+# version: 1.7.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-09
 
@@ -59,6 +59,18 @@
 - [ ] **`curtin in-target` compatibility** — when invoked as `curtin in-target -- ubuntu-autoinstall-agent
   install`, the binary is already inside the chroot; skip mount setup and debootstrap; only do
   post-install configuration (GRUB, LUKS crypttab, dracut, Tang).
+
+## Phase-selective re-run (designed 2026-07-09)
+
+- [ ] **Run only specific install phases (idempotent partial re-run).** Install is 7 phases
+  (0 vars, 1 pkgs, 2 disk-prep/WIPE, 3 zfs, 4 base, 5 sys-config incl. grub, 6 final).
+  Add `--phases <spec>` / `--from-phase <n>` so e.g. a failed grub can be redone with
+  `--phases 5` WITHOUT re-wiping (Phases 2-3). Requires a non-destructive "mount existing
+  target" prep (assemble md, open LUKS, import rpool/bpool, mount in correct order: / then
+  /boot then ESP, chroot binds) that runs when disk phases are skipped but later phases need
+  a mounted target. Guard: skipping Phase 2/3 must never wipe. Config could also carry a
+  default phase set. Motivation: we re-ran the whole ~7min install repeatedly just to retry
+  grub.
 
 ## Post-install / boot productionization (designed 2026-07-09, install now 7/7)
 

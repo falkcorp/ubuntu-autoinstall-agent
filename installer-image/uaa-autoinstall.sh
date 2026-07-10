@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: installer-image/uaa-autoinstall.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 4b8e1d02-6f3a-4c77-9e21-5a0c8b6d1f34
 # last-edited: 2026-07-09
 #
@@ -56,8 +56,14 @@ ON_DONE="$(cmdline_value uaa.on_done || echo poweroff)"
 
 CONFIG_URL="$(cmdline_value uaa.config || true)"
 if [ -z "${CONFIG_URL}" ]; then
-    log "no uaa.config= on kernel cmdline — nothing to do"
-    exit 0
+    # No explicit per-host config on the cmdline (e.g. a USB boot, which has no
+    # per-MAC cmdline like netboot does). Fall back to the server's MAC-resolved
+    # endpoint: the server maps OUR MAC (from its ARP/NDP neighbor table) to our
+    # per-host InstallationConfig and serves it — exactly like the netboot
+    # /autoinstall/ seed. One generic URL works for every machine; identity is the
+    # wire MAC, no client self-reporting needed.
+    CONFIG_URL="${UAA_CONFIG_RESOLVE_URL:-http://172.16.2.30:25000/autoinstall/uaa-config}"
+    log "no uaa.config= on cmdline; using MAC-resolved config endpoint ${CONFIG_URL}"
 fi
 
 log "fetching per-host config: ${CONFIG_URL}"
