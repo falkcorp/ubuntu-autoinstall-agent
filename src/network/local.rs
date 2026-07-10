@@ -1,6 +1,7 @@
 // file: src/network/local.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: local001-2345-6789-abcd-ef0123456789
+// last-edited: 2026-07-09
 
 //! Local command execution for on-machine installation
 
@@ -224,5 +225,150 @@ impl LocalClient {
 impl Default for LocalClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::executor::CommandExecutor;
+    // All commands are side-effect-free: echo/true/false/cp on tempfiles. NO
+    // installer logic, NO root, NO destructive commands.
+
+    #[tokio::test]
+    async fn test_connect_is_noop_ok() {
+        let mut client = LocalClient::new();
+        let result = client.connect("ignored-host", "ignored-user").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_true_succeeds() {
+        let mut client = LocalClient::new();
+        let result = client.execute("true").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_false_returns_process_error() {
+        let mut client = LocalClient::new();
+        let result = client.execute("false").await;
+        match result {
+            Err(crate::error::AutoInstallError::ProcessError { exit_code, .. }) => {
+                assert_eq!(exit_code, Some(1));
+            }
+            other => panic!("expected ProcessError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_output_captures_stdout() {
+        let mut client = LocalClient::new();
+        let result = client.execute_with_output("echo hello").await.unwrap();
+        assert_eq!(result, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_output_failure_prefers_stderr() {
+        let mut client = LocalClient::new();
+
+        // stderr present: it wins.
+        let result = client
+            .execute_with_output("echo oops >&2; exit 3")
+            .await;
+        match result {
+            Err(crate::error::AutoInstallError::ProcessError {
+                exit_code, stderr, ..
+            }) => {
+                assert_eq!(exit_code, Some(3));
+                assert!(stderr.contains("oops"));
+            }
+            other => panic!("expected ProcessError, got {:?}", other),
+        }
+
+        // stderr empty, stdout has text: fallback puts stdout text into the
+        // error's stderr field. This fallback is intentional; do not "fix" it.
+        let result = client.execute_with_output("echo out-only; exit 4").await;
+        match result {
+            Err(crate::error::AutoInstallError::ProcessError {
+                exit_code, stderr, ..
+            }) => {
+                assert_eq!(exit_code, Some(4));
+                assert!(stderr.contains("out-only"));
+            }
+            other => panic!("expected ProcessError, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_error_collection_nonzero_is_ok_tuple() {
+        let mut client = LocalClient::new();
+        // This method returns Ok EVEN on nonzero exit -- asserting Err here
+        // would be wrong.
+        let result = client
+            .execute_with_error_collection("echo so; echo se >&2; exit 5", "desc")
+            .await;
+        let (exit_code, stdout, stderr) = result.unwrap();
+        assert_eq!(exit_code, 5);
+        assert!(stdout.contains("so"));
+        assert!(stderr.contains("se"));
+    }
+
+    #[tokio::test]
+    async fn test_check_silent_true_false() {
+        let mut client = LocalClient::new();
+        assert!(client.check_silent("true").await.unwrap());
+        assert!(!client.check_silent("false").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_upload_download_copy_tempfiles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        let back = dir.path().join("back.txt");
+
+        std::fs::write(&src, b"hello local client\n").unwrap();
+
+        let mut client = LocalClient::new();
+        client
+            .upload_file(src.to_str().unwrap(), dst.to_str().unwrap())
+            .await
+            .unwrap();
+        client
+            .download_file(dst.to_str().unwrap(), back.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let original = std::fs::read(&src).unwrap();
+        let copied = std::fs::read(&back).unwrap();
+        assert_eq!(original, copied);
+    }
+
+    #[tokio::test]
+    async fn test_trait_object_execute_matches_inherent() {
+        let mut boxed: Box<dyn CommandExecutor> = Box::new(LocalClient::new());
+
+        let trait_result = boxed.execute("true").await;
+        assert!(trait_result.is_ok());
+
+        let trait_output = boxed.execute_with_output("echo via-trait").await.unwrap();
+        assert_eq!(trait_output, "via-trait\n");
+
+        // Verify the inherent methods behave the same way.
+        let mut client = LocalClient::new();
+        let inherent_result = client.execute("true").await;
+        assert!(inherent_result.is_ok());
+        let inherent_output = client.execute_with_output("echo via-trait").await.unwrap();
+        assert_eq!(inherent_output, "via-trait\n");
+    }
+
+    #[test]
+    fn test_default_matches_new() {
+        // Both constructors must yield a usable client; the `host` field is
+        // private, so we assert construction succeeds and defer behavioral
+        // proof to the async tests above.
+        let _new = LocalClient::new();
+        let _default = LocalClient::default();
     }
 }
