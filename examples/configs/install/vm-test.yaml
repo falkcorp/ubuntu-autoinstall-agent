@@ -1,0 +1,75 @@
+# file: examples/configs/install/vm-test.yaml
+# version: 1.0.0
+# guid: 30aa53fe-528c-4b04-a29e-a5e3b71d2a54
+# last-edited: 2026-07-09
+#
+# ============================================================================
+# THROWAWAY VM-ONLY TEST SECRETS — NOT REAL. Never use on hardware.
+# Every secret value/field below is a disposable value for the QEMU+swtpm
+# gate (scripts/vm-validate.sh) only. It is committed to git deliberately
+# because it protects nothing real: the VM disk it unlocks is destroyed with
+# `rm -rf` on the next harness run. Do NOT copy these values onto len-serv-003
+# or any other physical host, and never replace them with real secrets in
+# this file.
+# ============================================================================
+#
+# Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs)
+# and is `scp`'d by scripts/vm-validate.sh into the live QEMU session, then
+# run via `sudo uaa install --config /tmp/vm-test.yaml`. Field set based on
+# examples/configs/install/unimatrixone.yaml — see that file for the
+# production-host equivalent, which uses unsubstituted per-host placeholder
+# tokens instead of throwaway values, because it is templated for a real
+# machine (never committed with real secrets either — see that file's
+# header).
+#
+# DISK: QEMU virtio target -> guest sees /dev/vda. Its partitions are
+# vda1..vda4 (name ends in a letter, no `p` infix) — this is the reason the
+# VM gate exists: it is the end-to-end proof that the partition-suffix helper
+# (installer-robustness/TASK-01) handles a non-`p`-suffixed disk correctly.
+
+hostname: vm-test
+disk_device: /dev/vda
+timezone: America/New_York
+
+# --- secrets: THROWAWAY, VM-only. Every value below literally contains the
+# --- NOT-A-REAL-SECRET marker so a leak/paste is self-evidently harmless.
+luks_key: vm-test-throwaway-luks-key-NOT-A-REAL-SECRET
+root_password: vm-test-throwaway-root-pw-NOT-A-REAL-SECRET
+
+# QEMU `-netdev user,...` presents a single virtio-net-pci NIC. `enp0s3` is
+# the typical systemd predictable name for it, but confirm the actual name
+# on the first VM run (`ip link` inside the live session) and adjust here if
+# it differs — this is NOT verified against a live boot yet.
+network_interface: enp0s3
+network_address: 10.0.2.15/24
+network_gateway: 10.0.2.2
+network_search: vm.local
+network_nameservers:
+  - 10.0.2.3
+
+debootstrap_release: resolute
+debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
+initramfs_type: dracut
+
+# Tang network unlock is a v1 non-goal for the VM gate (docs/specs/qemu-validation-design.md
+# Non-goals). Empty list — do NOT point this at the real Tang servers
+# (172.16.2.45-47); those protect real hardware, not a throwaway VM disk.
+tang_servers: []
+
+# Same operator key already committed in installer-image/nocloud/user-data
+# (the live-session SSH login) — reused here so the harness can SSH into the
+# *installed* system as root with the identity it already has loaded.
+ssh_authorized_keys:
+  - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDmLM5QkF0hQiebBV/P7ogMXatVKfywwNNpVE5/XRgpm8ipjMpYn8cUBMnAelPyljezUDX4PsXlNobsWZH87lMsXT7X1RVdFP2IXMUbgCJ1nPIGnWzldRSq7NX0wQOkwPXa8crXdgyTuHeDlJzBQ45GurMzh17BuN93WnssrqXAlCIfjszwhN1/BTzOdy/wIBXaSwkSt75dxdgHGz3Yw5qOg8gPUdtvL1vP3hOkNkOFI52NEVg65deJil8+DgH9kIitiPF83+IQ75dGpk6yHgXX7uf4a8ExeJ8agZ1mwr28bdEGtSpfqYOaHM2FOCh6ZOU868tQMVQuItSXCfAmy4jT johnathan.falk@gmail.com"
+
+# TPM2 present via swtpm socket (--tpm2), so this path is genuinely
+# exercised rather than silently skipped. tpm2_pin is a real, usable
+# throwaway PIN value (systemd-cryptenroll needs a literal PIN string, so it
+# is NOT itself marked with the NOT-A-REAL-SECRET token) — flagged instead
+# via this comment: NOT-A-REAL-SECRET, VM-only, never reused on hardware.
+enroll_tpm2: true
+tpm2_pin: "123456"
+tpm2_pcr_ids: "7"
+
+# No YubiKey in a VM.
+expect_fido2: false
