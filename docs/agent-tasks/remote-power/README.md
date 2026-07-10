@@ -1,7 +1,7 @@
 <!-- file: docs/agent-tasks/remote-power/README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 38126f25-1166-46ae-b309-2088c2141138 -->
-<!-- last-edited: 2026-07-09 -->
+<!-- last-edited: 2026-07-10 -->
 
 # Workstream — remote power control (`uaa power`)
 
@@ -9,9 +9,13 @@ Add one new subcommand, `uaa power <hostname> on|off|status`, with machine-class
 
 **Execution mode:** SERIAL (coordinator-driven, single task) — trigger: 1 task (below the ≥3 parallel-sweep threshold); its global wave-5 slot is gated by 5 cross-workstream collision merges on `src/cli/args.rs`, `src/main.rs`, and `src/cli/commands.rs` (see collision note below).
 
+**Constellation continuation (2026-07-10):** TASK-01 is MERGED (`src/power/mod.rs` exists on main with IPMI implemented and `AmdDash`/`IntelAmt`/`WakeOnLan` as loud stubs). The constellation plan ([docs/specs/constellation-design.md](../../specs/constellation-design.md), Decision 15/17; plan: [constellation-plan.md](../../specs/constellation-plan.md)) adds TASK-02/TASK-03, which fill the CP-01-created stub files `crates/uaa-core/src/power/dash.rs` and `crates/uaa-core/src/power/amt_wol.rs` — disjoint files, mock-executor tests only, NO hardware. Waves in the table below are per-plan: TASK-01's wave is from the install-ops plan (complete); TASK-02/03 sit in **constellation global wave 3**.
+
 | Task | Src id | Title | Priority | Effort | Tier | Wave |
 |------|--------|-------|----------|--------|------|------|
-| TASK-01 | todo:remote-power | uaa power <host> on\|off\|status: machine-class dispatch scaffolding + IPMI-via-server path (ssh 172.16.2.30 ipmitool; explicit off/on, no reset) | P2 | M | Sonnet-class | 5 |
+| TASK-01 | todo:remote-power | uaa power <host> on\|off\|status: machine-class dispatch scaffolding + IPMI-via-server path (ssh 172.16.2.30 ipmitool; explicit off/on, no reset) | P2 | M | Sonnet-class | 5 (install-ops — DONE) |
+| TASK-02 | ws8-power | AMD DASH power path: dashcli-deb-first with wsman fallback, executor-mocked, replacing the stub | P2 | M | Sonnet-class | 3 (constellation) |
+| TASK-03 | ws8-power | Intel AMT (wsman) + Wake-on-LAN (server-side wakeonlan via ssh) replacing stubs | P2 | S | Sonnet-class | 3 (constellation) |
 
 ## Wave table
 
@@ -20,6 +24,12 @@ Waves are GLOBAL across the install-ops plan (this workstream owns only wave 5's
 | Wave | Tasks | Prereq | Parallel-safe because |
 |---|---|---|---|
 | 5 | TASK-01 (+ cross-WS peer `phase-rerun/TASK-02`) | waves 1–4 merged + siblings rebased — specifically `installer-robustness/TASK-02` (wave 1), `installer-robustness/TASK-03` (wave 2), `installer-robustness/TASK-07` (wave 3), `phase-rerun/TASK-01` (wave 4) | wave-5 peer `phase-rerun/TASK-02` shares NO files with TASK-01 (it edits `src/network/ssh_installer/*`; TASK-01 edits `src/power/`, `src/lib.rs`, and CLI wiring) |
+
+Constellation-plan waves (GLOBAL numbering from the constellation skeleton; this workstream owns two wave-3 slots):
+
+| Wave | Tasks | Prereq | Parallel-safe because |
+|---|---|---|---|
+| 3 (constellation) | TASK-02 (RP-02), TASK-03 (RP-03) | constellation wave 2 merged — specifically CP-01 (wave 1: workspace transform + stub files) and CP-03 (wave 2: fleet config) both on `origin/main`, siblings rebased | disjoint stub fills: TASK-02 edits only `crates/uaa-core/src/power/dash.rs`, TASK-03 edits only `crates/uaa-core/src/power/amt_wol.rs`; `power/mod.rs` dispatch was pre-wired by CP-01, so neither task touches a shared file |
 
 ## Ground rules
 
@@ -50,5 +60,16 @@ TASK-01 shares three files with earlier-wave tasks (from the operation collision
 | `src/cli/commands.rs` | `installer-robustness/TASK-02` (wave 1), `installer-robustness/TASK-03` (wave 2), `installer-robustness/TASK-07` (wave 3), `phase-rerun/TASK-01` (wave 4) |
 
 `src/power/mod.rs` (new) and `src/lib.rs` are uncontested. The wave-5 peer `phase-rerun/TASK-02` shares no files with TASK-01, so both wave-5 tasks may run concurrently.
+
+### Constellation continuation (TASK-02/TASK-03)
+
+Execution mode: PARALLEL DISPATCH — RP-02/RP-03 fill disjoint CP-01 stubs — trigger: 2 tasks in one wave, zero shared files.
+
+TASK-02/03 have NO file collisions with each other or with any constellation peer: each fills exactly one CP-01-created stub (`crates/uaa-core/src/power/dash.rs` vs `crates/uaa-core/src/power/amt_wol.rs`), and the stub-creator collision (`crates/uaa-core/src/power/mod.rs`: CP-01 → CP-03) is resolved by wave order (both merged before wave 3 starts). Additional ground rules for the continuation:
+
+- Each brief's diff is exactly ONE source file (`git diff origin/main --stat` gated in acceptance); `power/mod.rs`, the CLI, and all sibling stubs stay untouched.
+- Gate baseline is now **311 passing tests** (`cargo test --lib --offline && cargo build --offline`, clippy `-D warnings`).
+- NO hardware validation: len-serv-002 lacks the Linux DASH/WSMAN service and no Intel-AMT host is registered — all protocol commands are built as strings, executed only through `CommandExecutor` mocks in tests, and carry `VERIFY-ON-HW` markers. WoL magic packets are sent FROM the server (`172.16.2.30`) via the executor seam, never from the Mac. NEVER power on unimatrixone — both new briefs enforce the deny-list fail-closed.
+- Anchors in the new briefs cite pre-move `src/**` paths; after CP-01 they map to `crates/uaa-core/src/**` — grep old path then mapped path, zero hits at both = STOP.
 
 See [ORCHESTRATION.md](../ORCHESTRATION.md) (one level up) for the coordinator + worker protocol.

@@ -1,7 +1,24 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.0.0
+# version: 2.1.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-10
+
+## 📐 constellation planning package (2026-07-10) — PLANNED, not built
+
+The full Rust microservice-constellation rebuild is specced and task-briefed:
+**42 briefs, 10 workstreams, 9 dependency waves** — the briefs are the execution
+interface. NO implementation was executed.
+
+- Spec: `docs/specs/constellation-design.md` (25 locked decisions, 3-lens judge-reviewed)
+- Taskboard: `docs/specs/constellation-plan.md` (collision matrix, waves, tiers, protocol)
+- Breakdown: `docs/agent-tasks/BREAKDOWN-2026-07-10.md` · Roadmap: `docs/constellation/00-ROADMAP.md`
+- Workstreams: core-proto · control · install-plane · pki · uaa-web · uaa-pxe ·
+  luks-keys · remote-power (cont.) · tooling-port · testing-gates (cont.)
+- ⚠ review-critical four (Opus, line review): CP-01 workspace, CT-01 registry,
+  LK-02 LUKS rotate, TP-02 secret injection. ⛔ TP-05 retirement waits for the
+  operator-confirmed M6 cutover.
+- Bucket 3 (operator, no code): M6 cutover runbook · CA + key-backup ceremony ·
+  GitHub OAuth app/teams · CRDB `uaa` database · optional BSR publish.
 
 > **PLANNING PACKAGE (2026-07-09):** every remaining `[ ]` item below is either
 > tasked in `docs/agent-tasks/` (see the master table in `docs/agent-tasks/README.md`,
