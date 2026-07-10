@@ -1,7 +1,7 @@
 <!-- file: docs/netboot-autodeploy.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 9a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9 -->
-<!-- last-edited: 2026-06-21 -->
+<!-- last-edited: 2026-07-10 -->
 
 # Netboot Autodeploy — Source of Truth & Findings
 
@@ -102,12 +102,31 @@ Machine powers on
 ### autoinstall-agent HTTP service (port 25000 on the server)
 - `GET /api/registry` — all machines + status
 - `GET /api/events` — last 50 webhook events
+- `GET /api/health` — service liveness + registry/yubikey/tang counts + agent binary presence
 - `GET /api/approve/<mac>` — approve a pending machine
 - `GET /api/flip/<hostname>[?target=custom-autoinstall]` — set next boot target
   (default flips to local disk; `target=custom-autoinstall` forces reinstall)
 - `POST /api/checkin` — first-boot check-in (hostname/mac/ip/tpm_ek)
 - Logs: `/var/log/cockroach-autoinstall/{events.jsonl,registry.json,files/}`
 - CockroachDB CA: `/var/lib/cockroach-autoinstall/.cockroach-ca/{ca.crt,ca.key}`
+
+### uaa agent binary serving (/var/www/html/uaa/)
+nginx on plain `:80` serves `/var/www/html/uaa/uaa-amd64`, the compiled ubuntu-autoinstall-agent binary (built as `uaa-amd64` for x86_64-unknown-linux-musl). `installer-image/nocloud/uaa-usb-bootstrap.sh` downloads it during USB-boot autoinstall via the `UAA_AGENT_URL` environment variable (default `http://172.16.2.30/uaa/uaa-amd64`).
+
+**Build:** `scripts/build-musl.sh` on a Linux host (or use the CI artifact `uaa-amd64` from `musl-build.yml`).
+
+**Deploy (HUMAN step):**
+```bash
+# On 172.16.2.30, as root:
+sudo install -D -m 0755 target/x86_64-unknown-linux-musl/release/ubuntu-autoinstall-agent /var/www/html/uaa/uaa-amd64
+# (the /uaa/ directory does not exist until this first run)
+```
+
+**Verify deployment:**
+```bash
+curl -s http://172.16.2.30:25000/api/health | python3 -m json.tool
+# Look for "agent_binary": {"present": true, ...}
+```
 
 ### Force a reinstall of an existing host
 ```bash
