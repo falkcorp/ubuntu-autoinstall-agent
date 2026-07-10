@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/vm_validate.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: e3044431-725f-4fc3-a710-2f13497fca46
 // last-edited: 2026-07-10
 
@@ -838,8 +838,11 @@ async fn stage5_boot_disk(
     if ctx.have_socat {
         if let Some(luks_key) = extract_luks_key(&opts.config).await {
             let tries = opts.boot_timeout / 2 + 1;
+            // shq() the LUKS passphrase (read from the config file's contents) so a
+            // value containing a single quote cannot break out of the printf span.
+            let key_q = shq(&luks_key);
             let inject_cmd = format!(
-                "(i=0; while [ $i -lt {tries} ]; do if grep -qiE 'enter passphrase|please unlock disk' {serial_log} 2>/dev/null; then printf '%s\\n' '{luks_key}' | socat -u - UNIX-CONNECT:{serial_sock} 2>/dev/null; break; fi; sleep 2; i=$((i+1)); done) >/dev/null 2>&1 &"
+                "(i=0; while [ $i -lt {tries} ]; do if grep -qiE 'enter passphrase|please unlock disk' {serial_log} 2>/dev/null; then printf '%s\\n' {key_q} | socat -u - UNIX-CONNECT:{serial_sock} 2>/dev/null; break; fi; sleep 2; i=$((i+1)); done) >/dev/null 2>&1 &"
             );
             let _ = executor.execute(&inject_cmd).await;
         }
