@@ -1,0 +1,38 @@
+// file: proto/uaa/enroll/v1/enroll.proto
+// version: 1.0.0
+// guid: 155a93c5-ef54-4b36-af8a-aa6068a36d74
+// last-edited: 2026-07-10
+
+syntax = "proto3";
+
+package uaa.enroll.v1;
+
+// EnrollService handles CSR submission and credential status/retrieval for
+// machine identity enrollment (spec C6).
+service EnrollService {
+  rpc SubmitCsr(SubmitCsrRequest) returns (SubmitCsrResponse);
+  rpc GetCredential(GetCredentialRequest) returns (GetCredentialResponse);
+}
+
+message SubmitCsrRequest {
+  string csr_pem = 1;
+  string claimed_hostname = 2;
+  string claimed_mac = 3;
+}
+
+message SubmitCsrResponse {
+  string spki_fingerprint = 1;
+  string state = 2;
+}
+
+message GetCredentialRequest {
+  string spki_fingerprint = 1;
+}
+
+message GetCredentialResponse {
+  // state is one of: pending|approved|issued|rejected|revoked|superseded
+  // (spec C6).
+  string state = 1;
+  string cert_pem = 2;
+  string ca_pem = 3;
+}

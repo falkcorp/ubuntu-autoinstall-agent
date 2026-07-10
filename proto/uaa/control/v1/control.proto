@@ -1,0 +1,96 @@
+// file: proto/uaa/control/v1/control.proto
+// version: 1.0.0
+// guid: 9ba90d15-73be-4b6c-bb73-db3a0296a547
+// last-edited: 2026-07-10
+
+syntax = "proto3";
+
+package uaa.control.v1;
+
+// ControlService is the operator-facing control plane API: machine
+// approval/lifecycle, install event recording, and discovered-MAC intake.
+service ControlService {
+  rpc ApproveMachine(ApproveMachineRequest) returns (ApproveMachineResponse);
+  rpc GetMachine(GetMachineRequest) returns (Machine);
+  rpc ListMachines(ListMachinesRequest) returns (ListMachinesResponse);
+  rpc RecordInstallEvent(RecordInstallEventRequest) returns (Ack);
+  rpc ReinstallMachine(ReinstallMachineRequest) returns (ReinstallMachineResponse);
+  rpc UpsertDiscoveredMac(UpsertDiscoveredMacRequest) returns (Ack);
+}
+
+message ApproveMachineRequest {
+  string mac = 1;
+  string approved_by = 2;
+}
+
+message ApproveMachineResponse {
+  string saga_id = 1;
+  bool ok = 2;
+  string detail = 3;
+}
+
+message GetMachineRequest {
+  string mac = 1;
+}
+
+message ListMachinesRequest {}
+
+message ListMachinesResponse {
+  repeated Machine machines = 1;
+}
+
+message RecordInstallEventRequest {
+  // event_id is the client-minted WAL-dedup UUID (spec Decision 4).
+  string event_id = 1;
+  string mac = 2;
+  string status = 3;
+  string detail_json = 4;
+  string started_at = 5;
+  string finished_at = 6;
+}
+
+message ReinstallMachineRequest {
+  string mac = 1;
+  bool confirm_cooldown_override = 2;
+}
+
+message ReinstallMachineResponse {
+  string saga_id = 1;
+  bool ok = 2;
+  string detail = 3;
+}
+
+message UpsertDiscoveredMacRequest {
+  string mac = 1;
+  string arch_hint = 2;
+  string vendor_class = 3;
+  string seen_at = 4;
+}
+
+// Machine mirrors the CRDB `machines` table columns (spec Data model) plus
+// the Decision-13 reconciliation fields.
+message Machine {
+  string mac = 1;
+  string hostname = 2;
+  string ip = 3;
+  string type = 4;
+  string status = 5;
+  string boot_target = 6;
+  string tpm_ek = 7;
+  string registered_at = 8;
+  string approved_at = 9;
+  string last_seen = 10;
+  string last_ip = 11;
+  string installed_at = 12;
+  string last_install_status = 13;
+  string updated_at = 14;
+  // Decision-13 reconciliation fields.
+  string web_layer_target = 15;
+  string pxe_layer_target = 16;
+  bool consistent = 17;
+}
+
+message Ack {
+  bool ok = 1;
+  string detail = 2;
+}
