@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/config.rs
-// version: 2.3.1
+// version: 2.4.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! Configuration structures for SSH/local installation
 
@@ -44,6 +44,7 @@ pub struct TangServer {
 
 /// Complete configuration for a machine installation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallationConfig {
     pub hostname: String,
     pub disk_device: String,
@@ -300,5 +301,26 @@ network_nameservers: ["10.0.0.1"]
         assert_eq!(cfg.tpm2_pcr_ids, "7");
         assert!(cfg.expect_fido2);
         assert_eq!(cfg.tpm2_pin, None);
+    }
+
+    #[test]
+    fn test_unknown_yaml_key_rejected() {
+        // deny_unknown_fields: a typo'd key must fail parsing loudly, not be
+        // silently dropped (this installer LUKS-formats disks off this config).
+        let yaml = r#"
+hostname: test
+disk_devise: /dev/sda
+disk_device: /dev/sda
+timezone: UTC
+luks_key: k
+root_password: p
+network_interface: eth0
+network_address: 10.0.0.2/24
+network_gateway: 10.0.0.1
+network_search: local
+network_nameservers: ["10.0.0.1"]
+"#;
+        let err = serde_yaml::from_str::<InstallationConfig>(yaml).unwrap_err();
+        assert!(err.to_string().contains("disk_devise"), "error must name the unknown key: {err}");
     }
 }
