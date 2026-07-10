@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # file: scripts/autoinstall-agent.py
-# version: 1.2.0
+# version: 1.3.0
 # guid: 7b6e4a2c-9f1d-4e8a-b3c6-2d5f8a1c9e07
-# last-edited: 2026-07-09
+# last-edited: 2026-07-10
 """
 autoinstall-agent: HTTP service on port 25000
 Handles webhook events, iPXE flips, cert issuance, MAC-based auth with approval,
@@ -97,6 +97,22 @@ def find_ipxe_file_by_hostname(hostname):
             if f"set hostname {hostname}" in content:
                 return os.path.join(IPXE_BOOT_DIR, f)
     return None
+
+def webhook_should_flip(data):
+    """True only for FINAL successful-install webhook payloads.
+
+    cloud-init reporting.sh posts status "finished"/"complete" (always final).
+    The Rust uaa installer posts event_type "status_update" with status
+    "running" (start + per-phase), "failed", and "success" (final at
+    progress 100) — a status_update may flip only on a final result.
+    """
+    status = data.get("status", "")
+    name = data.get("name", "")
+    if name and status in ("finished", "complete", "success"):
+        if data.get("event_type") == "status_update":
+            return status == "success" or data.get("progress") == 100
+        return True
+    return False
 
 def flip_ipxe(hostname, target="boot-local-disk"):
     path = find_ipxe_file_by_hostname(hostname)
@@ -486,8 +502,13 @@ class Handler(BaseHTTPRequestHandler):
             log_event(data)
             status = data.get("status", "")
             name = data.get("name", "")
-            if status in ("finished", "complete") and name:
-                ok, msg = flip_ipxe(name)
+            if webhook_should_flip(data):
+                try:
+                    ok, msg = flip_ipxe(name)
+                except Exception as e:
+                    ok, msg = False, f"flip failed: {e}"
+                # Missing mac-<hexmac>.ipxe (USB-only host) or any flip error is
+                # logged and swallowed — the webhook itself still succeeded.
                 log(f"WEBHOOK {name} status={status} -> auto-flip: {msg}")
             else:
                 log(f"WEBHOOK {name} event_type={data.get('event_type')} status={status}")
