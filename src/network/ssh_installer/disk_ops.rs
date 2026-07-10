@@ -1,10 +1,12 @@
 // file: src/network/ssh_installer/disk_ops.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
+// last-edited: 2026-07-10
 
 //! Disk operations for SSH installation
 
 use super::config::InstallationConfig;
+use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
 use tracing::info;
@@ -317,12 +319,18 @@ impl<'a> DiskManager<'a> {
         // Format ESP and RESET partitions
         self.log_and_execute(
             "Formatting ESP (vfat)",
-            &format!("mkfs.vfat -F32 -n ESP {}p1", config.disk_device),
+            &format!(
+                "mkfs.vfat -F32 -n ESP {}",
+                partition_path(&config.disk_device, 1)
+            ),
         )
         .await?;
         self.log_and_execute(
             "Formatting RESET (ext4)",
-            &format!("mkfs.ext4 -F -L RESET {}p2", config.disk_device),
+            &format!(
+                "mkfs.ext4 -F -L RESET {}",
+                partition_path(&config.disk_device, 2)
+            ),
         )
         .await?;
 
@@ -337,16 +345,18 @@ impl<'a> DiskManager<'a> {
         self.log_and_execute(
             "Setting up LUKS encryption",
             &format!(
-                "echo '{}' | cryptsetup luksFormat --batch-mode {}p4",
-                config.luks_key, config.disk_device
+                "echo '{}' | cryptsetup luksFormat --batch-mode {}",
+                config.luks_key,
+                partition_path(&config.disk_device, 4)
             ),
         )
         .await?;
         self.log_and_execute(
             "Opening LUKS device",
             &format!(
-                "echo '{}' | cryptsetup open {}p4 luks",
-                config.luks_key, config.disk_device
+                "echo '{}' | cryptsetup open {} luks",
+                config.luks_key,
+                partition_path(&config.disk_device, 4)
             ),
         )
         .await?;
@@ -387,12 +397,12 @@ impl<'a> DiskManager<'a> {
 
     #[cfg(test)]
     fn build_mkfs_esp(disk: &str) -> String {
-        format!("mkfs.vfat -F32 -n ESP {}p1", disk)
+        format!("mkfs.vfat -F32 -n ESP {}", partition_path(disk, 1))
     }
 
     #[cfg(test)]
     fn build_mkfs_reset(disk: &str) -> String {
-        format!("mkfs.ext4 -F -L RESET {}p2", disk)
+        format!("mkfs.ext4 -F -L RESET {}", partition_path(disk, 2))
     }
 }
 
