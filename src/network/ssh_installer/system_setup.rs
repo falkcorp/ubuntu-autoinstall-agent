@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.7.0
+// version: 2.8.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-09
 
@@ -716,8 +716,12 @@ impl<'a> SystemConfigurator<'a> {
     ///
     /// NOTE: the exact module/plugin set is confirmed on the QEMU+swtpm VM
     /// before any real host is installed (see PLAN test strategy).
-    fn build_dracut_crypt_conf(include_clevis: bool, include_mdraid: bool) -> String {
-        let clevis = if include_clevis { " clevis" } else { "" };
+    fn build_dracut_crypt_conf(include_clevis: bool, include_mdraid: bool, nic_driver: &str) -> String {
+        // `network` is REQUIRED alongside clevis: Tang unlock happens over the net
+        // in the initramfs, so the network stack must be present. Without it the
+        // initramfs "fails to start the network", clevis can't reach Tang, LUKS
+        // never opens, and the zfs import (rpool on /dev/mapper/luks) fails.
+        let clevis = if include_clevis { " clevis network" } else { "" };
         let mdraid = if include_mdraid { " mdraid" } else { "" };
         // For an md/IMSM root, also bake the array config (/etc/mdadm/mdadm.conf,
         // the ARRAY UUID lines) into the initramfs and force the raid1 driver, so
@@ -730,15 +734,24 @@ impl<'a> SystemConfigurator<'a> {
         } else {
             ""
         };
+        // Force the boot NIC's kernel driver into the initramfs for Tang unlock —
+        // dracut hostonly omits it because the NIC isn't needed to reach a LOCAL
+        // root, so `rd.neednet=1 ip=dhcp` has no device to bring up otherwise.
+        let nic = if include_clevis && !nic_driver.is_empty() {
+            format!("add_drivers+=\" {} \"\n", nic_driver)
+        } else {
+            String::new()
+        };
         format!(
             "# Managed by ubuntu-autoinstall-agent — do not edit by hand.\n\
-             # Both LUKS unlock subsystems must live in the initramfs so any\n\
-             # enrolled keyslot can be satisfied at the boot prompt:\n\
-             #   clevis    -> Tang (network) unlock\n\
+             # Unlock subsystems + ZFS import must live in the initramfs:\n\
              #   crypt/tpm2/fido2 -> systemd-cryptsetup for TPM2+PIN and YubiKey\n\
-             #   mdraid    -> assemble BIOS/IMSM fake-RAID (md) root before unlock\n\
-             add_dracutmodules+=\" crypt tpm2-tss{clevis}{mdraid} \"\n\
+             #   clevis+network   -> Tang (network) unlock (needs NIC driver, below)\n\
+             #   mdraid           -> assemble BIOS/IMSM fake-RAID (md) root before unlock\n\
+             #   zfs              -> import rpool/bpool\n\
+             add_dracutmodules+=\" crypt tpm2-tss zfs{clevis}{mdraid} \"\n\
              {mdadm_extra}\
+             {nic}\
              # cryptsetup token plugins + libfido2 so TPM2/FIDO2 slots resolve in initrd\n\
              install_optional_items+=\" /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-tpm2.so /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-fido2.so /usr/lib/*/libfido2.so* \"\n"
         )
@@ -751,7 +764,22 @@ impl<'a> SystemConfigurator<'a> {
         }
         info!("Configuring dracut modules for clevis + systemd-cryptsetup (TPM2/FIDO2)");
         let is_md = config.disk_device.starts_with("/dev/md");
-        let conf = Self::build_dracut_crypt_conf(!config.tang_servers.is_empty(), is_md);
+        // Detect the boot NIC's kernel driver (for Tang network unlock) from the
+        // live env — the config interface name matches (predictable naming).
+        let nic_driver = self
+            .runner
+            .execute_with_output(&format!(
+                "basename \"$(readlink -f /sys/class/net/{}/device/driver 2>/dev/null)\" 2>/dev/null || true",
+                config.network_interface
+            ))
+            .await
+            .unwrap_or_default();
+        let nic_driver = nic_driver.trim();
+        if !config.tang_servers.is_empty() {
+            info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
+        }
+        let conf =
+            Self::build_dracut_crypt_conf(!config.tang_servers.is_empty(), is_md, nic_driver);
         let cmd = format!(
             "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
             conf
@@ -989,7 +1017,7 @@ mod tests {
 
     #[test]
     fn test_dracut_crypt_conf_includes_both_subsystems() {
-        let conf = SystemConfigurator::build_dracut_crypt_conf(true, true);
+        let conf = SystemConfigurator::build_dracut_crypt_conf(true, true, "ixgbe");
         let modules = dracut_modules_line(&conf);
         // Both unlock subsystems must be enabled in the initramfs module list.
         assert!(modules.contains("clevis"), "Tang unlock (clevis) missing: {modules}");
@@ -997,6 +1025,14 @@ mod tests {
         assert!(modules.contains("tpm2-tss"), "TPM2 support missing: {modules}");
         // md-backed target -> mdraid must be present to assemble the array.
         assert!(modules.contains("mdraid"), "mdraid module missing for md target: {modules}");
+        // zfs module must be present so rpool/bpool import in the initramfs.
+        assert!(modules.contains("zfs"), "zfs module missing: {modules}");
+        // Tang unlock needs the network stack + the NIC driver in the initramfs.
+        assert!(modules.contains("network"), "network module missing for Tang: {modules}");
+        assert!(
+            conf.contains("add_drivers+=\" ixgbe \""),
+            "NIC driver not forced into initramfs for Tang: {conf}"
+        );
         // FIDO2 token plugin is pulled via install_optional_items, not a module.
         assert!(
             conf.contains("libcryptsetup-token-systemd-fido2.so"),
@@ -1006,11 +1042,15 @@ mod tests {
 
     #[test]
     fn test_dracut_crypt_conf_omits_clevis_and_mdraid_when_not_needed() {
-        let conf = SystemConfigurator::build_dracut_crypt_conf(false, false);
+        let conf = SystemConfigurator::build_dracut_crypt_conf(false, false, "");
         let modules = dracut_modules_line(&conf);
         assert!(
             !modules.contains("clevis"),
             "clevis module should be absent with no Tang servers: {modules}"
+        );
+        assert!(
+            !modules.contains("network"),
+            "network module should be absent with no Tang servers: {modules}"
         );
         assert!(
             !modules.contains("mdraid"),
