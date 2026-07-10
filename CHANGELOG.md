@@ -1,11 +1,21 @@
 <!-- file: CHANGELOG.md -->
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!-- guid: chnglog1-0000-0000-0000-000000000001 -->
 <!-- last-edited: 2026-07-10 -->
 
 # Changelog
 
 All notable changes to `ubuntu-autoinstall-agent` are documented here.
+
+## [Unreleased] — constellation planning package (2026-07-10, docs only)
+
+Planned (did NOT build) the rebuild into a Rust microservice constellation
+(`uaa` + `uaa-control` + `uaa-web` + `uaa-pxe`, gRPC/tonic via protox, CRDB
+registry, PKI agent enrollment, GitHub-OAuth RBAC, signed self-update): master
+design spec (25 locked decisions, adversarial 3-lens judge panel), taskboard plan
+with computed same-file collision matrix and 9 dependency waves, breakdown, roadmap,
+and **42 weak-model-proof TASK briefs** across 10 workstreams (all passed cold-read
+verification). Docs only — no code changes; the briefs are the execution interface.
 
 ## [Unreleased] — install-ops execution (2026-07-10)
 

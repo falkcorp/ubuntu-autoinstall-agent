@@ -1,13 +1,15 @@
 <!-- file: docs/agent-tasks/testing-gates/orchestration.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: a002e635-cace-41b4-8c80-1531cd825ce0 -->
-<!-- last-edited: 2026-07-09 -->
+<!-- last-edited: 2026-07-10 -->
 
 # testing-gates — orchestration
 
-Coordinator playbook for the `testing-gates` workstream (2 tasks). Waves below are the
-GLOBAL install-ops waves — this workstream occupies waves 1 and 2 and must respect the
-cross-workstream merge it waits on.
+Coordinator playbook for the `testing-gates` workstream (4 tasks: TASK-01/02 from the
+install-ops operation, TASK-03/04 from the 2026-07-10 constellation continuation). The
+first wave section below uses the GLOBAL install-ops waves; the constellation section
+uses the constellation operation's GLOBAL waves
+(`.claude/state/plan-op-constellation-skeleton.json` `.global_waves`).
 
 ## Wave order for this workstream
 
@@ -32,6 +34,32 @@ gate:** an operator must still run `sudo ./scripts/vm-validate.sh` on a Linux ho
 server 172.16.2.30 or any amd64 Linux box — macOS lacks KVM) and see `GATE: PASS` before
 any hardware attempt. THIS SCRIPT PASSING IS THE GATE — no hardware attempt or
 len-serv-003 wipe before it passes.
+
+## Constellation wave order (2026-07-10 continuation)
+
+Execution mode (skeleton, quoted): "SINGLE-AGENT for TG-03 (harness judgment); TG-04
+anytime after CP-01" — trigger: 1 task per local wave; 0 same-file collisions.
+
+1. **Constellation wave 2 — TASK-04 (constellation-ci).** Dispatch any time after
+   `core-proto/CP-01` (constellation wave 1, the workspace conversion) is merged to
+   `origin/main`. Single net-new file `.github/workflows/constellation-ci.yml`; collides
+   with nothing; Haiku-class.
+2. **Constellation wave 8 — TASK-03 (constellation-e2e-vm).** SINGLE-AGENT, Sonnet-class
+   (harness-composition judgment). Do NOT dispatch until constellation waves 4–7 are
+   merged: `install-plane/IP-04` (parity fixtures), `pki/PK-01` (install CA +
+   EnrollService), `pki/PK-02` (agent enroll client), `uaa-web/WB-02` (placement RPCs),
+   `uaa-pxe/PX-01` (pxe crate). Dispatching early produces a gate that cannot launch the
+   services it validates. Net-new `scripts/vm-validate-constellation.sh` + append-only
+   `docs/vm-validation.md` edit; `scripts/vm-validate.sh` must remain byte-identical
+   (`git diff origin/main -- scripts/vm-validate.sh` empty is an acceptance check).
+
+**After TASK-03 merges, the deliverable is again the runnable gate, not a passed gate:**
+an operator runs `./scripts/vm-validate-constellation.sh` on a Linux host with KVM,
+swtpm, AND `cockroach` on PATH (documented host dependency — the script exits 3 with a
+loud "GATE NOT RUN" error if cockroach is absent) and must see `GATE: PASS`. That pass
+is the constellation **M5 gate** — the gate before ANY hardware — and is also the
+precondition for `tooling-port/TP-05` (Python/shell retirement, which additionally needs
+the operator-confirmed M6 cutover + 2-week window).
 
 ## Protocol (verbatim — do not paraphrase)
 
@@ -71,4 +99,27 @@ flowchart LR
     TG01[testing-gates TASK-01<br/>qemu-swtpm-harness<br/>net-new files]
   end
   IR01 --> TG01
+```
+
+## Constellation dependency graph
+
+Edges mean "waits for merge of". All non-TG nodes are EXTERNAL (other constellation
+workstreams); waves are the constellation operation's GLOBAL waves. No edge between
+TG04 and TG03 — their file sets are disjoint.
+
+```mermaid
+flowchart LR
+  subgraph CWave2[Constellation wave 2]
+    TG04[testing-gates TASK-04<br/>constellation-ci<br/>.github/workflows/constellation-ci.yml]
+  end
+  subgraph CWave8[Constellation wave 8]
+    TG03[testing-gates TASK-03<br/>constellation-e2e-vm<br/>scripts/vm-validate-constellation.sh]
+  end
+  CP01[core-proto CP-01<br/>workspace conversion<br/>EXTERNAL wave 1] --> TG04
+  IP04[install-plane IP-04<br/>parity fixtures<br/>EXTERNAL wave 5] --> TG03
+  PK01[pki PK-01<br/>install CA + EnrollService<br/>EXTERNAL wave 4] --> TG03
+  PK02[pki PK-02<br/>agent enroll client<br/>EXTERNAL wave 3] --> TG03
+  WB02[uaa-web WB-02<br/>placement RPCs<br/>EXTERNAL wave 7] --> TG03
+  PX01[uaa-pxe PX-01<br/>pxe crate<br/>EXTERNAL wave 6] --> TG03
+  TG03 --> TP05[tooling-port TP-05<br/>retire python+shell<br/>EXTERNAL wave 9 ⛔ operator-gated]
 ```

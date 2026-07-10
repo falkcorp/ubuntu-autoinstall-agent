@@ -1,9 +1,45 @@
 <!-- file: docs/agent-tasks/README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: f97394a1-66ba-4684-9aee-b99879edb817 -->
-<!-- last-edited: 2026-07-09 -->
+<!-- last-edited: 2026-07-10 -->
 
-# Agent tasks — install-ops planning package (2026-07-09)
+# Agent tasks — master index
+
+Two planning packages share this tree and the [ORCHESTRATION.md](ORCHESTRATION.md)
+protocol:
+
+1. **install-ops (2026-07-09)** — ✅ COMPLETE: 6 workstreams, 20 briefs, 6 waves, all
+   shipped (311 tests on main). Kept below as the historical index.
+2. **constellation (2026-07-10)** — the Rust microservice rebuild: 10 workstreams,
+   42 briefs, 9 waves. Master task table, collision matrix, and wave table live in
+   [`../specs/constellation-plan.md`](../specs/constellation-plan.md) (single source —
+   not duplicated here); bucket sort + fan-out strategy in
+   [`BREAKDOWN-2026-07-10.md`](BREAKDOWN-2026-07-10.md); sequencing in
+   [`../constellation/00-ROADMAP.md`](../constellation/00-ROADMAP.md).
+
+## Constellation workstreams (2026-07-10)
+
+| Workstream | Spec | Tasks | Focus |
+|---|---|---|---|
+| [core-proto](core-proto/) | [design](../specs/constellation-design.md) · [plan](../specs/constellation-plan.md) | 6 | cargo workspace (⚠ CP-01), uaa-proto/protox, FleetConfig, mDNS, self-update, musl matrix |
+| [control](control/) | same | 8 | uaa-control crate (⚠ CT-01), registry+import/export, OAuth/RBAC, audit chain, SAGA, reinstall, operator API, SPA |
+| [install-plane](install-plane/) | same | 4 | :25000 Python parity (seeds, lifecycle, inventory, fixtures+dashboard) |
+| [pki](pki/) | same | 4 | install CA + EnrollService, agent client, mTLS/CRL/service certs, CA-in-seed |
+| [uaa-web](uaa-web/) | same | 4 | webroot owner: :8081 serve, placement RPCs, ISO jobs, publish+manifest |
+| [uaa-pxe](uaa-pxe/) | same | 4 | dnsmasq hostsdir boot config, health, discovery inbox, DNS |
+| [luks-keys](luks-keys/) | same | 3 | `uaa luks` FIDO2 keyslots (⚠ LK-02 rotate/guard), registry sync — NOT auth |
+| [remote-power](remote-power/) (cont.) | [design](../specs/remote-power-design.md) + constellation spec | +2 | AMD DASH, Intel AMT + WoL (mock-validated only) |
+| [tooling-port](tooling-port/) | constellation spec | 5 | iso remaster, config place/inject (⚠ TP-02), image build, vm-validate, ⛔gated retirement |
+| [testing-gates](testing-gates/) (cont.) | [design](../specs/qemu-validation-design.md) + constellation spec | +2 | constellation e2e VM gate (M5), constellation CI |
+
+Constellation baseline at planning time: main @ f8fe1f7, `cargo test --lib --offline`
+= **311 passed**. ⚠ review-critical four: CP-01, CT-01, LK-02, TP-02 (Opus-class,
+line-by-line coordinator review, never downgrade). ⛔ TP-05 dispatches only after the
+operator confirms the M6 cutover (Bucket 3).
+
+---
+
+# install-ops planning package (2026-07-09) — ✅ complete
 
 Master index for the post-USB-bootstrap operation: 6 workstreams, 20 task briefs,
 6 dependency waves. Protocol: [ORCHESTRATION.md](ORCHESTRATION.md). Hardware-blocked

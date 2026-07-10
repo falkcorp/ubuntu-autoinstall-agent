@@ -1,7 +1,7 @@
 <!-- file: docs/agent-tasks/testing-gates/README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: b65fa13d-a27b-47cb-9bd7-13e56b2aa485 -->
-<!-- last-edited: 2026-07-09 -->
+<!-- last-edited: 2026-07-10 -->
 
 # Workstream — testing gates (QEMU/swtpm VM validation + LocalClient tests)
 
@@ -25,6 +25,13 @@ without it the VM install fails in Phase 2 on `/dev/vdap1`).
 |------|--------|-------|----------|--------|------|------|
 | TASK-01 | todo:qemu-gate | scripts/vm-validate.sh: QEMU+swtpm VM gate (virtio /dev/vda + TPM2) resolving both VERIFY-ON-VM markers - the gate before ANY hardware attempt | P1 | L | Sonnet-class | 2 |
 | TASK-02 | todo:local-tests | Unit tests for LocalClient / local install flow (CommandExecutor seam) - today 0 tests exercise LocalClient | P2 | M | Sonnet-class | 1 |
+| TASK-03 | ws10-gates | Constellation e2e VM gate: vm-validate-constellation.sh — loopback control/web/pxe + single-node cockroach + temp CA; enroll→approve→cert→install→verify sweep | P1 | L | Sonnet-class | constellation 8 |
+| TASK-04 | ws10-gates | constellation-ci.yml: workspace clippy + test + SPA build check on PRs | P2 | S | Haiku-class | constellation 2 |
+
+> **Constellation continuation (2026-07-10):** TASK-03/TASK-04 belong to the follow-on
+> *constellation* operation (`docs/specs/constellation-design.md`); their Wave numbers are
+> the constellation operation's GLOBAL waves, not the original install-ops waves used by
+> TASK-01/TASK-02 above. TASK-03 is the **M5 gate** — THE gate before any hardware.
 
 ## Wave table
 
@@ -36,6 +43,17 @@ Waves are GLOBAL across the install-ops operation (see the operation collision m
 |---|---|---|---|
 | 1 | TASK-02 | none | single file `src/network/local.rs` — appears in no collision row, disjoint from every wave-1 sibling (`install-server/TASK-01`, `install-server/TASK-04`, `installer-robustness/TASK-01`, `installer-robustness/TASK-02`, `installer-robustness/TASK-06`, `installer-robustness/TASK-08`) |
 | 2 | TASK-01 | `installer-robustness/TASK-01` merged + siblings rebased | net-new files only (`scripts/vm-validate.sh`, `docs/vm-validation.md`, `examples/configs/install/vm-test.yaml`) — the wave-2 placement is a functional dependency (partition-suffix helper must be on `origin/main`), not a file collision |
+
+### Constellation waves (2026-07-10 continuation)
+
+Waves below are GLOBAL across the constellation operation (see
+`.claude/state/plan-op-constellation-skeleton.json` `.global_waves` and the constellation
+BREAKDOWN). Again counter-intuitive order: TASK-04 executes long before TASK-03.
+
+| Wave | Tasks | Prereq | Parallel-safe because |
+|---|---|---|---|
+| constellation 2 | TASK-04 | constellation wave 1 (`core-proto/CP-01` workspace conversion) merged + siblings rebased | single net-new file `.github/workflows/constellation-ci.yml` — no testing-gates file appears in the constellation collision matrix |
+| constellation 8 | TASK-03 | constellation waves 4–7 merged (`install-plane/IP-04` parity fixtures, `pki/PK-01`+`PK-02` enrollment, `uaa-web/WB-02` placement, `uaa-pxe/PX-01`) | net-new script `scripts/vm-validate-constellation.sh` + an append-only edit to `docs/vm-validation.md`; the wave-8 slot is purely functional (the services it launches must exist), not a file collision |
 
 ## Ground rules
 
@@ -77,5 +95,23 @@ global waves. The only ordering constraint is the hard dependency
 what makes the virtio `/dev/vda` install survivable — Phase 2/3 fail on `/dev/vdapN`
 without it). TASK-01 must not start until that PR is merged to `origin/main` and this
 workstream's worktrees are rebased.
+
+### Constellation continuation (TASK-03 / TASK-04)
+
+No testing-gates file appears in the constellation collision matrix either: TASK-04
+creates only `.github/workflows/constellation-ci.yml`; TASK-03 creates only
+`scripts/vm-validate-constellation.sh` and appends to `docs/vm-validation.md` (a file no
+other constellation task touches). TASK-03 SOURCES helpers from `scripts/vm-validate.sh`
+and never modifies it. Ordering constraints are purely functional: TASK-04 waits on
+`core-proto/CP-01` (workspace layout); TASK-03 waits on constellation waves 4–7
+(`IP-04`, `PK-01`, `PK-02`, `WB-02`, `PX-01` merged — the services the gate launches).
+Constellation ground rules for these two tasks: TASK-04 additionally validates its YAML
+(`python3 -c "import yaml; yaml.safe_load(open('.github/workflows/constellation-ci.yml'))"`);
+TASK-03 additionally runs `bash -n scripts/vm-validate-constellation.sh` (+ shellcheck
+if installed); the cargo gate baseline for the constellation era is 311 tests.
+
+**Execution mode:** "SINGLE-AGENT for TG-03 (harness judgment); TG-04 anytime after
+CP-01" — trigger: 1 task per local wave (`waves_local` = `[["TG-04"], ["TG-03"]]`);
+0 same-file collisions inside or outside the workstream.
 
 See [ORCHESTRATION.md](../ORCHESTRATION.md) (one level up) for the coordinator + worker protocol.
