@@ -1,7 +1,7 @@
 // file: src/network/ssh_installer/system_setup.rs
-// version: 2.10.0
+// version: 2.11.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-09
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -526,6 +526,25 @@ impl<'a> SystemConfigurator<'a> {
         Ok(())
     }
 
+    /// BootOrder script: network entries first, ubuntu second, rest after.
+    /// Regexes are copied VERBATIM from set_boot_order() in
+    /// installer-image/nocloud/uaa-usb-bootstrap.sh so USB and chroot behave
+    /// identically. Every failure path exits 0 (non-fatal by design).
+    fn build_boot_order_cmd() -> String {
+        let script = r#"command -v efibootmgr >/dev/null 2>&1 || { echo "uaa: efibootmgr not present; skipping boot order"; exit 0; }; entries="$(efibootmgr 2>/dev/null)" || { echo "uaa: efibootmgr unreadable (legacy BIOS?); skipping boot order"; exit 0; }; net="$(echo "$entries" | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]].*\(PXE\|[Nn]etwork\|IPv[46]\).*/\1/p" | tr "\n" ",")"; ubuntu="$(echo "$entries" | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]][Uu]buntu.*/\1/p" | tr "\n" ",")"; rest="$(echo "$entries" | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]].*/\1/p" | tr "\n" ",")"; order="$(echo "${net}${ubuntu}${rest}" | tr "," "\n" | grep -v "^$" | awk "!seen[\$0]++" | paste -sd, -)"; [ -n "$order" ] || { echo "uaa: no EFI boot entries found; skipping boot order"; exit 0; }; efibootmgr -o "$order" && echo "uaa: BootOrder set: $order" || echo "uaa: efibootmgr -o failed (non-fatal)"; exit 0"#;
+        format!("chroot /mnt/targetos bash -lc '{}'", script)
+    }
+
+    /// Best-effort UEFI boot order (network first, ubuntu second). Non-fatal:
+    /// legacy-BIOS / no-efivars hosts log and continue; Phase 5 still completes.
+    async fn set_uefi_boot_order(&mut self) -> Result<()> {
+        self.log_and_execute(
+            "Set UEFI BootOrder (network first, ubuntu second)",
+            &Self::build_boot_order_cmd(),
+        )
+        .await
+    }
+
     /// Configure GRUB in chroot — adds Tang network parameters when using dracut.
     pub async fn configure_grub_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Configuring GRUB in chroot");
@@ -602,6 +621,12 @@ impl<'a> SystemConfigurator<'a> {
             "Updating GRUB config",
             "chroot /mnt/targetos bash -lc 'update-grub'",
         ).await?;
+
+        // Best-effort: order NVRAM entries network-first, ubuntu-second. Mirrors
+        // set_boot_order() in uaa-usb-bootstrap.sh. MUST stay non-fatal (let _ =):
+        // legacy-BIOS hosts have no efivars, and grub-install --no-nvram/--removable
+        // fallbacks mean the "ubuntu" entry may not exist.
+        let _ = self.set_uefi_boot_order().await;
 
         Ok(())
     }
@@ -1025,6 +1050,46 @@ mod tests {
         assert!(cmd.contains("grep -i \"PARTTYPE=\\\""));
         assert!(cmd.contains(guid));
         assert!(cmd.ends_with("'"));
+    }
+
+    #[test]
+    fn test_boot_order_cmd_matches_usb_script_regexes() {
+        let cmd = SystemConfigurator::build_boot_order_cmd();
+        assert!(cmd.contains("PXE"));
+        assert!(cmd.contains("[Nn]etwork"));
+        assert!(cmd.contains("IPv[46]"));
+        assert!(cmd.contains("[Uu]buntu"));
+        assert!(cmd.contains("[0-9A-Fa-f]\\{4\\}"));
+        assert!(cmd.contains("efibootmgr -o"));
+    }
+
+    #[test]
+    fn test_boot_order_cmd_is_chrooted_and_nonfatal() {
+        let cmd = SystemConfigurator::build_boot_order_cmd();
+        assert!(cmd.starts_with("chroot /mnt/targetos bash -lc"));
+
+        // Extract the payload between the outer single quotes of `bash -lc '...'`
+        // and verify no interior single quote breaks out of that argument.
+        let marker = "bash -lc '";
+        let start = cmd.find(marker).expect("bash -lc marker present") + marker.len();
+        assert!(cmd.ends_with('\''));
+        let inner = &cmd[start..cmd.len() - 1];
+        assert!(!inner.contains('\''));
+
+        // Every skip path (efibootmgr missing, unreadable, no entries) plus the
+        // final trailing statement exits 0 — non-fatal by design.
+        assert!(cmd.matches("exit 0").count() >= 4);
+    }
+
+    #[test]
+    fn test_boot_order_cmd_attempts_order_when_entries_exist() {
+        let cmd = SystemConfigurator::build_boot_order_cmd();
+        // The `efibootmgr -o` invocation is guarded ONLY by `[ -n "$order" ]`,
+        // never by the ubuntu entry existing — anti-over-suppression: an
+        // absent-ubuntu order (net,rest) must still reach efibootmgr -o.
+        assert!(cmd.contains(
+            "[ -n \"$order\" ] || { echo \"uaa: no EFI boot entries found; skipping boot order\"; exit 0; }; efibootmgr -o \"$order\""
+        ));
     }
 
     #[test]
