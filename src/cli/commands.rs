@@ -1,5 +1,5 @@
 // file: src/cli/commands.rs
-// version: 2.8.0
+// version: 2.9.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-10
 
@@ -282,7 +282,23 @@ pub async fn ssh_install_command(
     hold_on_failure: bool,
     pause_after_storage: bool,
     report_url: Option<String>,
+    phases: Option<String>,
+    from_phase: Option<u8>,
 ) -> Result<()> {
+    use crate::network::ssh_installer::installer::PhaseSelection;
+
+    // Build the phase selection up front so a bad --phases/--from-phase spec
+    // fails BEFORE any connection or investigation side effects.
+    let selection = match (phases.as_deref(), from_phase) {
+        (Some(spec), _) => {
+            PhaseSelection::parse(spec).map_err(crate::error::AutoInstallError::ValidationError)?
+        }
+        (None, Some(n)) => {
+            PhaseSelection::from_phase(n).map_err(crate::error::AutoInstallError::ValidationError)?
+        }
+        (None, None) => PhaseSelection::full(),
+    };
+
     let username = username.unwrap_or_else(|| "ubuntu".to_string());
 
     info!(
@@ -360,7 +376,12 @@ pub async fn ssh_install_command(
 
     info!("Starting full ZFS+LUKS Ubuntu installation...");
     installer
-        .perform_installation_with_options_and_pause(&config, hold_on_failure, pause_after_storage)
+        .perform_installation_with_options_and_pause(
+            &config,
+            hold_on_failure,
+            pause_after_storage,
+            &selection,
+        )
         .await?;
 
     info!("SSH installation completed successfully!");
@@ -385,7 +406,23 @@ pub async fn local_install_command(
     pause_after_storage: bool,
     force: bool,
     report_url: Option<String>,
+    phases: Option<String>,
+    from_phase: Option<u8>,
 ) -> Result<()> {
+    use crate::network::ssh_installer::installer::PhaseSelection;
+
+    // Build the phase selection up front so a bad --phases/--from-phase spec
+    // fails BEFORE any root check or destructive work.
+    let selection = match (phases.as_deref(), from_phase) {
+        (Some(spec), _) => {
+            PhaseSelection::parse(spec).map_err(crate::error::AutoInstallError::ValidationError)?
+        }
+        (None, Some(n)) => {
+            PhaseSelection::from_phase(n).map_err(crate::error::AutoInstallError::ValidationError)?
+        }
+        (None, None) => PhaseSelection::full(),
+    };
+
     let hostname = hostname.unwrap_or_else(|| "ubuntu-local".to_string());
 
     info!("Starting local Ubuntu installation on current system");
@@ -513,7 +550,12 @@ pub async fn local_install_command(
 
     info!("Starting full ZFS+LUKS Ubuntu installation locally...");
     installer
-        .perform_installation_with_options_and_pause(&config, hold_on_failure, pause_after_storage)
+        .perform_installation_with_options_and_pause(
+            &config,
+            hold_on_failure,
+            pause_after_storage,
+            &selection,
+        )
         .await?;
 
     info!("Local installation completed successfully!");
@@ -547,6 +589,8 @@ pub async fn install_command(
     pause_after_storage: bool,
     force: bool,
     report_url: Option<String>,
+    phases: Option<String>,
+    from_phase: Option<u8>,
 ) -> Result<()> {
     match remote {
         Some(ref host) => {
@@ -560,6 +604,8 @@ pub async fn install_command(
                 hold_on_failure,
                 pause_after_storage,
                 report_url,
+                phases,
+                from_phase,
             )
             .await
         }
@@ -573,6 +619,8 @@ pub async fn install_command(
                 pause_after_storage,
                 force,
                 report_url,
+                phases,
+                from_phase,
             )
             .await
         }
@@ -1326,6 +1374,8 @@ users:
             false, // hold_on_failure
             false, // pause_after_storage
             None,  // report_url
+            None,  // phases
+            None,  // from_phase
         )
         .await;
 
@@ -1349,6 +1399,8 @@ users:
             false, // hold_on_failure
             false, // pause_after_storage
             None,  // report_url
+            None,  // phases
+            None,  // from_phase
         )
         .await;
 
@@ -1386,6 +1438,8 @@ users:
             false, // pause_after_storage
             false, // force
             None,  // report_url
+            None,  // phases
+            None,  // from_phase
         )
         .await;
 
@@ -1408,6 +1462,8 @@ users:
             false, // pause_after_storage
             false, // force
             None,  // report_url
+            None,  // phases
+            None,  // from_phase
         )
         .await;
 
