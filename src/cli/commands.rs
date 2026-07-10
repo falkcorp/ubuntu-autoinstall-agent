@@ -1,7 +1,7 @@
 // file: src/cli/commands.rs
-// version: 2.5.0
+// version: 2.6.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-09
+// last-edited: 2026-07-10
 
 //! Command implementations for the CLI
 
@@ -596,8 +596,23 @@ fn create_local_installation_config(
     hostname: &str,
     system_info: &SystemInfo,
 ) -> Result<InstallationConfig> {
-    // Detect primary disk (usually the largest disk)
-    let disk_device = detect_primary_disk(&system_info.disk_info)?;
+    // Detect primary disk (usually the largest disk) by enumerating block
+    // devices on the LIVE target — never guessed from /dev/sd* conventions.
+    let lsblk_output = std::process::Command::new("lsblk")
+        .args(["--json", "-b", "-o", "NAME,TYPE,SIZE"])
+        .output()
+        .map_err(|_| {
+            crate::error::AutoInstallError::ValidationError(
+                "cannot enumerate block devices on the live target — refusing to guess disk_device (use --config)".to_string(),
+            )
+        })?;
+    if !lsblk_output.status.success() {
+        return Err(crate::error::AutoInstallError::ValidationError(
+            "cannot enumerate block devices on the live target — refusing to guess disk_device (use --config)".to_string(),
+        ));
+    }
+    let lsblk_json = String::from_utf8_lossy(&lsblk_output.stdout);
+    let disk_device = detect_primary_disk(&lsblk_json)?;
 
     // Detect network configuration
     let (interface, address, gateway) = detect_network_config(&system_info.network_info)?;
@@ -631,23 +646,88 @@ fn create_local_installation_config(
     })
 }
 
-/// Detect the primary disk for installation
-fn detect_primary_disk(disk_info: &str) -> Result<String> {
-    // Parse lsblk output to find the primary disk
-    // This is a simplified implementation - you might want to make it more robust
-    for line in disk_info.lines() {
-        if line.contains("disk") && !line.contains("loop") && !line.contains("sr") {
-            if let Some(device) = line.split_whitespace().next() {
-                if device.starts_with("nvme") || device.starts_with("sd") {
-                    return Ok(format!("/dev/{}", device));
+/// Detect the primary disk for installation by parsing `lsblk --json -b -o
+/// NAME,TYPE,SIZE` output (from the live target — never guessed).
+///
+/// md arrays (RAID) take precedence over their member disks: an IMSM/mdadm
+/// array is listed as a `"children"` entry under EVERY member disk, so we
+/// recurse and dedupe by name, then prefer the largest md candidate over any
+/// plain disk. If no md array is present, the largest `TYPE=disk` device
+/// (nvme/sd/vd/...) is selected. `loop`, `rom`, and `part` types are excluded.
+fn detect_primary_disk(lsblk_json: &str) -> Result<String> {
+    let root: serde_json::Value = serde_json::from_str(lsblk_json).map_err(|e| {
+        crate::error::AutoInstallError::ValidationError(format!(
+            "failed to parse lsblk JSON output: {}",
+            e
+        ))
+    })?;
+
+    let blockdevices = root["blockdevices"].as_array().ok_or_else(|| {
+        crate::error::AutoInstallError::ValidationError(
+            "lsblk JSON output missing 'blockdevices' array".to_string(),
+        )
+    })?;
+
+    // (name, size_bytes)
+    let mut disk_candidates: Vec<(String, u64)> = Vec::new();
+    let mut md_candidates: Vec<(String, u64)> = Vec::new();
+
+    fn size_of(dev: &serde_json::Value) -> u64 {
+        dev["size"]
+            .as_u64()
+            .or_else(|| dev["size"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0)
+    }
+
+    fn walk(
+        dev: &serde_json::Value,
+        disk_candidates: &mut Vec<(String, u64)>,
+        md_candidates: &mut Vec<(String, u64)>,
+    ) {
+        let name = dev["name"].as_str().unwrap_or("").to_string();
+        let dev_type = dev["type"].as_str().unwrap_or("");
+
+        if !name.is_empty() && dev_type != "loop" && dev_type != "rom" && dev_type != "part" {
+            let size = size_of(dev);
+            if dev_type.starts_with("raid") || name.starts_with("md") {
+                if !md_candidates.iter().any(|(n, _)| n == &name) {
+                    md_candidates.push((name.clone(), size));
                 }
+            } else if dev_type == "disk" {
+                disk_candidates.push((name.clone(), size));
+            }
+        }
+
+        if let Some(children) = dev["children"].as_array() {
+            for child in children {
+                walk(child, disk_candidates, md_candidates);
             }
         }
     }
 
-    Err(crate::error::AutoInstallError::ValidationError(
-        "Could not detect primary disk for installation".to_string(),
-    ))
+    for dev in blockdevices {
+        walk(dev, &mut disk_candidates, &mut md_candidates);
+    }
+
+    let chosen = if !md_candidates.is_empty() {
+        md_candidates
+            .into_iter()
+            .max_by_key(|(_, size)| *size)
+            .map(|(name, _)| name)
+    } else {
+        disk_candidates
+            .into_iter()
+            .max_by_key(|(_, size)| *size)
+            .map(|(name, _)| name)
+    };
+
+    match chosen {
+        Some(name) if name.starts_with('/') => Ok(name),
+        Some(name) => Ok(format!("/dev/{}", name)),
+        None => Err(crate::error::AutoInstallError::ValidationError(
+            "could not detect primary disk from lsblk output".to_string(),
+        )),
+    }
 }
 
 /// Detect network configuration
@@ -1160,5 +1240,67 @@ users:
         config.luks_key = "a-real-passphrase".to_string();
         config.root_password = "a-real-password".to_string();
         assert!(validate_config_secrets(&config).is_ok());
+    }
+
+    #[test]
+    fn test_detect_primary_disk_nvme() {
+        let json = r#"{"blockdevices": [
+            {"name": "nvme0n1", "type": "disk", "size": 512110190592}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/nvme0n1");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_ignores_loop_and_rom() {
+        let json = r#"{"blockdevices": [
+            {"name": "sda", "type": "disk", "size": 250059350016},
+            {"name": "loop0", "type": "loop", "size": 4096},
+            {"name": "sr0", "type": "rom", "size": 1073741312}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/sda");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_virtio() {
+        let json = r#"{"blockdevices": [
+            {"name": "vda", "type": "disk", "size": 21474836480}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/vda");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_prefers_md_over_members() {
+        let json = r#"{"blockdevices": [
+            {"name": "sda", "type": "disk", "size": 500107862016, "children": [
+                {"name": "md126", "type": "raid1", "size": 499000000000}
+            ]},
+            {"name": "sdb", "type": "disk", "size": 500107862016, "children": [
+                {"name": "md126", "type": "raid1", "size": 499000000000}
+            ]}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/md126");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_picks_largest() {
+        let json = r#"{"blockdevices": [
+            {"name": "sda", "type": "disk", "size": 250059350016},
+            {"name": "nvme0n1", "type": "disk", "size": 512110190592}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/nvme0n1");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_size_as_string() {
+        let json = r#"{"blockdevices": [
+            {"name": "sda", "type": "disk", "size": "500107862016"}
+        ]}"#;
+        assert_eq!(detect_primary_disk(json).unwrap(), "/dev/sda");
+    }
+
+    #[test]
+    fn test_detect_primary_disk_empty_errors() {
+        let json = r#"{"blockdevices": []}"#;
+        assert!(detect_primary_disk(json).is_err());
     }
 }
