@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/luks_keys.rs
-// version: 1.1.2
+// version: 1.2.0
 // guid: 2aa8e08c-f451-4463-962a-5fa2d970dd7a
 // last-edited: 2026-07-10
 
@@ -301,6 +301,413 @@ pub async fn enroll_fido2(
     append_state(state_path, record.clone())?;
 
     Ok(record)
+}
+
+// ── Tang t=2-of-3 cold-start quorum guard (spec Decision 14 / C8) ─────────────
+
+/// The 3 Tang servers backing every SSS t=2-of-3 binding
+/// (PLAN-zfs-luks-multikey.md). Overridable for tests.
+pub const DEFAULT_TANG_URLS: [&str; 3] = [
+    "http://172.16.2.45",
+    "http://172.16.2.46",
+    "http://172.16.2.47",
+];
+
+/// The `curl` adv-probe command run for one Tang server through the executor.
+/// A healthy Tang answers `<url>/adv` with a JWS advertisement JSON; `-sf`
+/// makes curl exit non-zero (→ executor `Err`, counted invalid) on any HTTP
+/// error, and `--max-time 5` bounds a hung server.
+fn tang_adv_command(url: &str) -> String {
+    format!("curl -sf --max-time 5 {url}/adv")
+}
+
+/// The keyslot-wipe command. `systemd-cryptenroll --wipe-slot` (not
+/// `cryptsetup luksKillSlot`) so no passphrase prompt is needed under
+/// `sudo -n`.
+fn wipe_slot_command(luks_dev: &str, slot: u32) -> String {
+    format!("sudo -n systemd-cryptenroll --wipe-slot={slot} {luks_dev}")
+}
+
+/// The clevis SSS re-bind command run against ONE fleet host's executor during
+/// a Tang server-key rotation sweep.
+fn clevis_regen_command(luks_dev: &str, slot: u32) -> String {
+    format!("sudo -n clevis luks regen -d {luks_dev} -s {slot} -q")
+}
+
+/// Compare a typed-hostname override against the target. Strips ONE trailing
+/// `\r\n` or `\n` (a human's `read`/echo newline), then byte-equality — no
+/// lowercasing, no trimming, no substring, no `y`/`yes`. `None`, `Some("")`,
+/// `Some("yes")`, and a case-mismatched hostname all return `false`.
+fn override_matches(override_confirmation: Option<&str>, target_hostname: &str) -> bool {
+    match override_confirmation {
+        Some(s) => {
+            let s = s
+                .strip_suffix("\r\n")
+                .or_else(|| s.strip_suffix('\n'))
+                .unwrap_or(s);
+            s == target_hostname
+        }
+        None => false,
+    }
+}
+
+/// Probe each Tang adv via `curl -sf --max-time 5 <url>/adv` through the
+/// executor and return the count that answered with a non-empty advertisement.
+/// A probe failure (executor `Err` OR empty body) counts as invalid — it is
+/// NEVER propagated as an `Err`; a degraded fleet must surface as a low count,
+/// not a hard error, so the caller's fail-closed logic runs.
+pub async fn check_tang_quorum(
+    executor: &mut dyn crate::network::CommandExecutor,
+    tang_urls: &[&str],
+) -> crate::error::Result<usize> {
+    let mut valid = 0usize;
+    for url in tang_urls {
+        let cmd = tang_adv_command(url);
+        match executor.execute_with_output(&cmd).await {
+            Ok(body) if !body.trim().is_empty() => valid += 1,
+            _ => {}
+        }
+    }
+    Ok(valid)
+}
+
+/// Fail-closed gate for EVERY destructive op in this module. Passes when
+/// `check_tang_quorum >= 2`, OR when `override_confirmation` equals the exact
+/// target hostname (see [`override_matches`]). A `valid < 2` fleet with a
+/// wrong/empty/`None` override returns `Err(SystemError)` naming the counts
+/// and the typed-hostname rule. NEVER logs the override value.
+pub async fn require_tang_quorum(
+    executor: &mut dyn crate::network::CommandExecutor,
+    tang_urls: &[&str],
+    target_hostname: &str,
+    override_confirmation: Option<&str>,
+) -> crate::error::Result<()> {
+    let valid = check_tang_quorum(executor, tang_urls).await?;
+    if valid >= 2 {
+        return Ok(());
+    }
+    if override_matches(override_confirmation, target_hostname) {
+        // Log the fact and the count only — never the override string itself.
+        tracing::warn!(
+            "luks: Tang quorum {valid}/{} below t=2 but bypassed by typed-hostname override for {target_hostname}",
+            tang_urls.len()
+        );
+        return Ok(());
+    }
+    Err(AutoInstallError::SystemError(format!(
+        "Tang cold-start quorum not met: {valid} of {} advertisements valid (need >= 2). \
+         Refusing every destructive keyslot op fail-closed. To override, the operator must \
+         type the exact target hostname '{target_hostname}'.",
+        tang_urls.len()
+    )))
+}
+
+// ── State-file read/update helpers (LK-01 atomic tmp+rename contract) ─────────
+
+/// Read the JSON array at `state_path` (missing or empty file => `vec![]`).
+fn read_records(state_path: &std::path::Path) -> crate::error::Result<Vec<LuksCredentialRecord>> {
+    if !state_path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents = std::fs::read_to_string(state_path)?;
+    if contents.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(serde_json::from_str(&contents)?)
+}
+
+/// Write `records` back atomically: serialize to `<state_path>.tmp`, then
+/// `std::fs::rename` over the target. Same contract as LK-01's `append_state`
+/// (never truncate-then-write in place).
+fn write_records_atomic(
+    state_path: &std::path::Path,
+    records: &[LuksCredentialRecord],
+) -> crate::error::Result<()> {
+    let json = serde_json::to_string_pretty(records)?;
+    let mut tmp_name = state_path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = std::path::PathBuf::from(tmp_name);
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, state_path)?;
+    Ok(())
+}
+
+/// Look up the active (un-revoked) keyslot bound to `yubikey_serial`.
+fn lookup_active_slot(
+    state_path: &std::path::Path,
+    yubikey_serial: &str,
+) -> crate::error::Result<u32> {
+    let records = read_records(state_path)?;
+    let record = records
+        .iter()
+        .find(|r| r.yubikey_serial == yubikey_serial && r.revoked_at.is_none())
+        .ok_or_else(|| {
+            AutoInstallError::ConfigError(format!(
+                "no active LUKS credential recorded for YubiKey serial '{yubikey_serial}'"
+            ))
+        })?;
+    record.luks_keyslot.ok_or_else(|| {
+        AutoInstallError::ConfigError(format!(
+            "recorded credential for serial '{yubikey_serial}' has no keyslot; cannot revoke"
+        ))
+    })
+}
+
+/// Set `revoked_at` (RFC3339) on the FIRST active record for `yubikey_serial`
+/// and persist via the atomic tmp+rename write.
+fn mark_revoked(state_path: &std::path::Path, yubikey_serial: &str) -> crate::error::Result<()> {
+    let mut records = read_records(state_path)?;
+    let target = records
+        .iter_mut()
+        .find(|r| r.yubikey_serial == yubikey_serial && r.revoked_at.is_none())
+        .ok_or_else(|| {
+            AutoInstallError::ConfigError(format!(
+                "no active LUKS credential recorded for YubiKey serial '{yubikey_serial}' to revoke"
+            ))
+        })?;
+    target.revoked_at = Some(chrono::Utc::now().to_rfc3339());
+    write_records_atomic(state_path, &records)
+}
+
+// ── revoke ────────────────────────────────────────────────────────────────────
+
+/// Internal wipe leg shared by [`revoke_fido2`] and [`rotate_fido2`]. Assumes
+/// the Tang quorum has ALREADY been proven this call. Applies the last-method
+/// guard (guard #2), then wipes, verifies the token is gone, and records
+/// `revoked_at`. NEVER re-probes quorum.
+///
+/// Last-method guard: count the fido2 tokens whose keyslot is NOT the one being
+/// wiped. Zero remaining => the wipe would leave the header with no
+/// systemd-fido2 unlock method at all — refuse (`ConfigError`) unless the
+/// typed-hostname override is supplied. Revoking 1 of 3 (2 remain) never trips.
+async fn wipe_slot_guarded(
+    executor: &mut dyn crate::network::CommandExecutor,
+    luks_dev: &str,
+    yubikey_serial: &str,
+    slot: u32,
+    target_hostname: &str,
+    override_confirmation: Option<&str>,
+    state_path: &std::path::Path,
+) -> crate::error::Result<()> {
+    // Guard #2: last-method. Read-only luksDump — not a destructive command.
+    let before = executor.execute_with_output(&dump_command(luks_dev)).await?;
+    let would_remain = parse_fido2_tokens(&before)
+        .into_iter()
+        .filter(|t| t.keyslot != Some(slot))
+        .count();
+    if would_remain == 0 && !override_matches(override_confirmation, target_hostname) {
+        return Err(AutoInstallError::ConfigError(format!(
+            "refusing to wipe keyslot {slot}: it is the LAST systemd-fido2 token in {luks_dev} \
+             and revoking it would leave the disk with no FIDO2 unlock method. To override, the \
+             operator must type the exact target hostname '{target_hostname}'."
+        )));
+    }
+
+    // Destructive: wipe the keyslot.
+    executor.execute(&wipe_slot_command(luks_dev, slot)).await?;
+
+    // Verify the token is GONE before we record the revocation.
+    let after = executor.execute_with_output(&dump_command(luks_dev)).await?;
+    if parse_fido2_tokens(&after).iter().any(|t| t.keyslot == Some(slot)) {
+        return Err(AutoInstallError::SystemError(format!(
+            "wipe-slot ran but a systemd-fido2 token still binds keyslot {slot} on {luks_dev}"
+        )));
+    }
+
+    mark_revoked(state_path, yubikey_serial)?;
+    Ok(())
+}
+
+/// Wipe the keyslot bound to `yubikey_serial` (looked up in the state file).
+///
+/// Guards, in order, each BEFORE any wipe command: (1)
+/// [`require_tang_quorum`] (fail-closed t=2-of-3), then (2) the last-method
+/// guard (see [`wipe_slot_guarded`]). Then `sudo -n systemd-cryptenroll
+/// --wipe-slot=<n> <dev>`, verify via luksDump the token is gone, and set
+/// `revoked_at` on the state record via the atomic tmp+rename write.
+#[allow(clippy::too_many_arguments)] // signature fixed by luks-keys/TASK-02 brief
+pub async fn revoke_fido2(
+    executor: &mut dyn crate::network::CommandExecutor,
+    luks_dev: &str,
+    yubikey_serial: &str,
+    target_hostname: &str,
+    tang_urls: &[&str],
+    override_confirmation: Option<&str>,
+    state_path: &std::path::Path,
+) -> crate::error::Result<()> {
+    validate_luks_dev(luks_dev)?;
+    if yubikey_serial.is_empty() {
+        return Err(AutoInstallError::ConfigError(
+            "YubiKey serial must not be empty".to_string(),
+        ));
+    }
+
+    // Guard #1: fail-closed quorum, BEFORE any destructive command.
+    require_tang_quorum(executor, tang_urls, target_hostname, override_confirmation).await?;
+
+    let slot = lookup_active_slot(state_path, yubikey_serial)?;
+    wipe_slot_guarded(
+        executor,
+        luks_dev,
+        yubikey_serial,
+        slot,
+        target_hostname,
+        override_confirmation,
+        state_path,
+    )
+    .await
+}
+
+// ── rotate (enroll-NEW-then-revoke-OLD — never reverse, spec C8) ──────────────
+
+/// ENROLL-NEW-THEN-REVOKE-OLD — never reverse (spec C8). Runs
+/// [`require_tang_quorum`] ONCE at entry (a rotation must not start against a
+/// degraded fleet), then calls LK-01's [`enroll_fido2`] for `new_serial`; ONLY
+/// on its `Ok` (the new token is proven present in the LUKS header) does the
+/// revoke leg run against `old_serial`. An enroll-leg failure returns its
+/// `Err` with the OLD credential completely untouched and no wipe issued.
+#[allow(clippy::too_many_arguments)] // signature fixed by luks-keys/TASK-02 brief
+pub async fn rotate_fido2(
+    executor: &mut dyn crate::network::CommandExecutor,
+    luks_dev: &str,
+    old_serial: &str,
+    new_serial: &str,
+    role: CredentialRole,
+    passphrase: &str,
+    target_hostname: &str,
+    tang_urls: &[&str],
+    override_confirmation: Option<&str>,
+    state_path: &std::path::Path,
+) -> crate::error::Result<LuksCredentialRecord> {
+    validate_luks_dev(luks_dev)?;
+    if old_serial.is_empty() || new_serial.is_empty() {
+        return Err(AutoInstallError::ConfigError(
+            "old and new YubiKey serials must not be empty".to_string(),
+        ));
+    }
+
+    // Quorum proven ONCE at entry — covers both the enroll and revoke legs of
+    // this single rotation call.
+    require_tang_quorum(executor, tang_urls, target_hostname, override_confirmation).await?;
+
+    // Resolve the old keyslot BEFORE enrolling so a bad/unknown old serial
+    // fails with the old credential still fully intact (nothing enrolled yet).
+    let old_slot = lookup_active_slot(state_path, old_serial)?;
+
+    // ENROLL NEW FIRST. enroll_fido2 self-verifies the new token appears in the
+    // header; on any failure it returns Err and appends nothing — old key
+    // untouched.
+    let new_record = enroll_fido2(executor, luks_dev, role, new_serial, passphrase, state_path).await?;
+
+    // Only now — new key PROVEN present — retire the old one. Quorum already
+    // proven this call, so the wipe leg re-checks only the last-method guard
+    // (which cannot trip here: the freshly enrolled token remains).
+    wipe_slot_guarded(
+        executor,
+        luks_dev,
+        old_serial,
+        old_slot,
+        target_hostname,
+        override_confirmation,
+        state_path,
+    )
+    .await?;
+
+    Ok(new_record)
+}
+
+// ── rotate-tang: fleet sweep-before-retire state machine (Decision 14) ────────
+
+/// Enforces sweep-before-retire in STATE, not prose. Constructed with the full
+/// fleet host list; [`TangRotation::retire_old_key`] is unreachable (returns
+/// `Err`) until every host is marked rebound. Server-side Tang key retirement
+/// is an operator action outside this binary — this type gates and DESCRIBES
+/// it, it never executes it.
+#[derive(Debug, Clone)]
+pub struct TangRotation {
+    /// host -> rebound? Ordered so `pending_hosts` is deterministic.
+    hosts: std::collections::BTreeMap<String, bool>,
+}
+
+impl TangRotation {
+    /// An empty fleet is a config bug (a sweep over nobody is not a free pass
+    /// to retire) => `ConfigError`.
+    pub fn new(fleet_hosts: &[String]) -> crate::error::Result<Self> {
+        if fleet_hosts.is_empty() {
+            return Err(AutoInstallError::ConfigError(
+                "TangRotation requires a non-empty fleet host list; a sweep over zero hosts must \
+                 not be able to authorize old-key retirement"
+                    .to_string(),
+            ));
+        }
+        let hosts = fleet_hosts
+            .iter()
+            .map(|h| (h.clone(), false))
+            .collect::<std::collections::BTreeMap<String, bool>>();
+        Ok(Self { hosts })
+    }
+
+    /// Re-bind ONE host's SSS pin via `sudo -n clevis luks regen -d <dev> -s
+    /// <slot> -q`, using an `executor` already connected to that host. Gated by
+    /// [`require_tang_quorum`] against the host (the NEW Tang key must already
+    /// be advertised — quorum with the new key present proves re-bind can
+    /// succeed). On `Ok` the host is marked rebound. Unknown host =>
+    /// `ConfigError`.
+    pub async fn rebind_host(
+        &mut self,
+        executor: &mut dyn crate::network::CommandExecutor,
+        host: &str,
+        luks_dev: &str,
+        slot: u32,
+    ) -> crate::error::Result<()> {
+        validate_luks_dev(luks_dev)?;
+        if !self.hosts.contains_key(host) {
+            return Err(AutoInstallError::ConfigError(format!(
+                "host '{host}' is not part of this Tang rotation fleet"
+            )));
+        }
+        // The new Tang key must already be advertised for this host's binding —
+        // no typed-hostname override here: a re-bind against a degraded fleet
+        // would produce an SSS pin that cannot meet quorum on next boot.
+        require_tang_quorum(executor, &DEFAULT_TANG_URLS, host, None).await?;
+
+        executor
+            .execute(&clevis_regen_command(luks_dev, slot))
+            .await?;
+        self.hosts.insert(host.to_string(), true);
+        Ok(())
+    }
+
+    /// Hosts that have NOT yet been re-bound, sorted.
+    pub fn pending_hosts(&self) -> Vec<String> {
+        self.hosts
+            .iter()
+            .filter(|(_, rebound)| !**rebound)
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
+    /// Return the retire PLAN string ONLY when [`pending_hosts`](Self::pending_hosts)
+    /// is empty; otherwise `Err(SystemError)` listing the un-rebound hosts.
+    /// This never executes retirement (no executor argument) — sweep-before-
+    /// retire is unreachable-early by construction.
+    pub fn retire_old_key(&self) -> crate::error::Result<String> {
+        let pending = self.pending_hosts();
+        if !pending.is_empty() {
+            return Err(AutoInstallError::SystemError(format!(
+                "cannot retire the old Tang server key: {} of {} fleet host(s) not yet re-bound: {}",
+                pending.len(),
+                self.hosts.len(),
+                pending.join(", ")
+            )));
+        }
+        Ok(format!(
+            "All {} fleet host(s) re-bound to the new Tang key. Safe to retire the old server-side \
+             Tang key (operator action, outside this binary): rotate keys in /var/db/tang on the \
+             retiring Tang server and run `tang-show-keys`/`systemctl restart tangd.socket`.",
+            self.hosts.len()
+        ))
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -682,5 +1089,442 @@ Keyslots:
         let raw: serde_json::Value = serde_json::from_str(&contents).expect("valid json");
         assert_eq!(raw[0]["role"], "primary");
         assert!(raw[0]["revoked_at"].is_null());
+    }
+
+    // ── LK-02: Tang quorum guard + revoke/rotate/rotate-tang ─────────────────
+
+    const TANG_A: &str = "http://tang-a";
+    const TANG_B: &str = "http://tang-b";
+    const TANG_C: &str = "http://tang-c";
+    const TANG_URLS: [&str; 3] = [TANG_A, TANG_B, TANG_C];
+    const HOST: &str = "len-serv-001";
+    /// A non-empty stand-in for a real JWS advertisement body.
+    const ADV: &str = r#"{"payload":"e30","signatures":[{"protected":"e30"}]}"#;
+
+    /// luksDump with two systemd-fido2 tokens (slots 2 and 5).
+    const DUMP_TWO: &str = "\
+Tokens:
+  1: systemd-fido2
+        Keyslot:    2
+  3: systemd-fido2
+        Keyslot:    5
+Keyslots:
+  2: luks2
+  5: luks2
+";
+    /// luksDump with one systemd-fido2 token (slot 5) — slot 2 gone.
+    const DUMP_ONE_SLOT5: &str = "\
+Tokens:
+  3: systemd-fido2
+        Keyslot:    5
+Keyslots:
+  5: luks2
+";
+    /// luksDump with a single systemd-fido2 token (slot 2) — the last method.
+    const DUMP_ONLY_SLOT2: &str = "\
+Tokens:
+  1: systemd-fido2
+        Keyslot:    2
+Keyslots:
+  2: luks2
+";
+    /// luksDump with zero fido2 tokens.
+    const DUMP_NONE: &str = "\
+Tokens:
+  0: clevis
+        Keyslot:    1
+Keyslots:
+  1: luks2
+";
+
+    /// Seed a state file with one active credential (serial, role, slot).
+    fn seed_state(state_path: &std::path::Path, serial: &str, role: CredentialRole, slot: u32) {
+        let records = vec![LuksCredentialRecord {
+            yubikey_serial: serial.to_string(),
+            role,
+            luks_keyslot: Some(slot),
+            enrolled_at: "2026-07-10T00:00:00Z".to_string(),
+            revoked_at: None,
+        }];
+        std::fs::write(state_path, serde_json::to_string_pretty(&records).unwrap()).unwrap();
+    }
+
+    fn count_wipes(recorded: &[String]) -> usize {
+        recorded.iter().filter(|c| c.contains("--wipe-slot")).count()
+    }
+
+    // ── check_tang_quorum / require_tang_quorum ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_quorum_counts_valid_advs() {
+        // 3 mocked adv responses, one (TANG_C) failing (empty) → count == 2.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&tang_adv_command(TANG_C), "");
+        let valid = check_tang_quorum(&mut mock, &TANG_URLS).await.unwrap();
+        assert_eq!(valid, 2);
+    }
+
+    #[tokio::test]
+    async fn test_quorum_fail_closed() {
+        // 1-of-3 valid, no override → require_tang_quorum Err naming counts.
+        let mut mock = MockExecutor::new().queue(&tang_adv_command(TANG_A), ADV);
+        let err = require_tang_quorum(&mut mock, &TANG_URLS, HOST, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AutoInstallError::SystemError(_)));
+        let msg = err.to_string();
+        assert!(msg.contains('1') && msg.contains('3'));
+        assert!(msg.contains("hostname"));
+
+        // Downstream revoke_fido2 on the same degraded fleet records ZERO
+        // wipe commands.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        seed_state(&state_path, "12345678", CredentialRole::Primary, 2);
+        let mut mock = MockExecutor::new().queue(&tang_adv_command(TANG_A), ADV);
+        let err = revoke_fido2(
+            &mut mock,
+            DEV,
+            "12345678",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AutoInstallError::SystemError(_)));
+        assert_eq!(count_wipes(&mock.recorded), 0);
+    }
+
+    #[tokio::test]
+    async fn test_override_exact_hostname_only() {
+        // valid < 2 for every sub-case; only the EXACT hostname bypasses.
+        // Fresh mock per sub-assertion (each re-probes the quorum).
+        let ok = require_tang_quorum(
+            &mut MockExecutor::new().queue(&tang_adv_command(TANG_A), ADV),
+            &TANG_URLS,
+            HOST,
+            Some(HOST),
+        )
+        .await;
+        assert!(ok.is_ok(), "exact hostname must bypass fail-closed guard");
+
+        // Exact hostname with a trailing newline (a human's echo) still bypasses.
+        let ok_nl = require_tang_quorum(
+            &mut MockExecutor::new().queue(&tang_adv_command(TANG_A), ADV),
+            &TANG_URLS,
+            HOST,
+            Some("len-serv-001\n"),
+        )
+        .await;
+        assert!(ok_nl.is_ok());
+
+        for bad in [Some("yes"), Some(""), Some("LEN-SERV-001"), None] {
+            let err = require_tang_quorum(
+                &mut MockExecutor::new().queue(&tang_adv_command(TANG_A), ADV),
+                &TANG_URLS,
+                HOST,
+                bad,
+            )
+            .await;
+            assert!(err.is_err(), "override {bad:?} must NOT bypass the guard");
+        }
+    }
+
+    // ── revoke_fido2 ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_revoke_last_method_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        seed_state(&state_path, "serial-last", CredentialRole::Primary, 2);
+
+        // Header with exactly 1 fido2 token (slot 2), quorum OK (2-of-3),
+        // no override → ConfigError, ZERO wipe commands.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&dump_command(DEV), DUMP_ONLY_SLOT2);
+        let err = revoke_fido2(
+            &mut mock,
+            DEV,
+            "serial-last",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AutoInstallError::ConfigError(_)));
+        assert!(err.to_string().contains("LAST"));
+        assert_eq!(count_wipes(&mock.recorded), 0);
+
+        // Same situation WITH the exact-hostname override → wipe proceeds.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&dump_command(DEV), DUMP_ONLY_SLOT2)
+            .queue(&dump_command(DEV), DUMP_NONE);
+        revoke_fido2(
+            &mut mock,
+            DEV,
+            "serial-last",
+            HOST,
+            &TANG_URLS,
+            Some(HOST),
+            &state_path,
+        )
+        .await
+        .expect("override must let the last-method wipe proceed");
+        assert_eq!(count_wipes(&mock.recorded), 1);
+        assert!(mock.recorded.contains(&wipe_slot_command(DEV, 2)));
+    }
+
+    #[tokio::test]
+    async fn test_revoke_sets_revoked_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        // Serial bound to slot 5; a second fido2 token (slot 2) also present so
+        // the last-method guard does not trip.
+        seed_state(&state_path, "serial-5", CredentialRole::Backup1, 5);
+
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&dump_command(DEV), DUMP_TWO) // last-method count
+            .queue(&dump_command(DEV), DUMP_ONLY_SLOT2); // verify: slot 5 gone, slot 2 remains
+        revoke_fido2(
+            &mut mock,
+            DEV,
+            "serial-5",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .expect("2-of-3 quorum revoke should succeed");
+
+        // Wipe recorded exactly once, with the right slot.
+        assert_eq!(count_wipes(&mock.recorded), 1);
+        assert!(mock.recorded.contains(&wipe_slot_command(DEV, 5)));
+
+        // State record's revoked_at is now Some; no .tmp left behind (rename).
+        let records = read_records(&state_path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].revoked_at.is_some());
+        let mut tmp = state_path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(!std::path::PathBuf::from(tmp).exists());
+    }
+
+    // ── rotate_fido2 ─────────────────────────────────────────────────────────
+
+    /// Build the dump-response queue for a full rotation: enroll before/after
+    /// then revoke last-method/verify.
+    fn queue_rotation_dumps(mock: MockExecutor) -> MockExecutor {
+        mock.queue(&dump_command(DEV), DUMP_ONLY_SLOT2) // enroll BEFORE (slot 2 only)
+            .queue(&dump_command(DEV), DUMP_TWO) // enroll AFTER (new slot 5 appeared)
+            .queue(&dump_command(DEV), DUMP_TWO) // revoke last-method (2 remain)
+            .queue(&dump_command(DEV), DUMP_ONE_SLOT5) // revoke verify (slot 2 gone)
+    }
+
+    #[tokio::test]
+    async fn test_rotate_order_enroll_then_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        seed_state(&state_path, "old-serial", CredentialRole::Primary, 2);
+
+        let mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&tang_adv_command(TANG_C), ADV);
+        let mut mock = queue_rotation_dumps(mock);
+
+        rotate_fido2(
+            &mut mock,
+            DEV,
+            "old-serial",
+            "new-serial",
+            CredentialRole::Backup1,
+            "test-passphrase",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .expect("rotation should succeed");
+
+        // The recorded sequence must show the enroll (cryptenroll) command
+        // strictly BEFORE any --wipe-slot.
+        let enroll_cmd = build_enroll_command(DEV, "test-passphrase").unwrap();
+        let enroll_idx = mock
+            .recorded
+            .iter()
+            .position(|c| *c == enroll_cmd)
+            .expect("enroll command recorded");
+        let wipe_idx = mock
+            .recorded
+            .iter()
+            .position(|c| c.contains("--wipe-slot"))
+            .expect("wipe command recorded");
+        assert!(
+            enroll_idx < wipe_idx,
+            "enroll (idx {enroll_idx}) must precede wipe (idx {wipe_idx})"
+        );
+        assert_eq!(count_wipes(&mock.recorded), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rotate_enroll_failure_keeps_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        seed_state(&state_path, "old-serial", CredentialRole::Primary, 2);
+
+        // Enroll leg fails: before and after dumps identical → no new token.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&tang_adv_command(TANG_C), ADV)
+            .queue(&dump_command(DEV), DUMP_ONLY_SLOT2)
+            .queue(&dump_command(DEV), DUMP_ONLY_SLOT2);
+        let err = rotate_fido2(
+            &mut mock,
+            DEV,
+            "old-serial",
+            "new-serial",
+            CredentialRole::Backup1,
+            "test-passphrase",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AutoInstallError::SystemError(_)));
+
+        // ZERO wipes, old state record unchanged (still active), no new record.
+        assert_eq!(count_wipes(&mock.recorded), 0);
+        let records = read_records(&state_path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].yubikey_serial, "old-serial");
+        assert!(records[0].revoked_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rotate_happy_path() {
+        // Anti-over-suppression: full 3-of-3 quorum, healthy header, valid
+        // passphrase → rotation completes through EVERY guard.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("luks-credentials.json");
+        seed_state(&state_path, "old-serial", CredentialRole::Primary, 2);
+
+        let mock = MockExecutor::new()
+            .queue(&tang_adv_command(TANG_A), ADV)
+            .queue(&tang_adv_command(TANG_B), ADV)
+            .queue(&tang_adv_command(TANG_C), ADV);
+        let mut mock = queue_rotation_dumps(mock);
+
+        let new_record = rotate_fido2(
+            &mut mock,
+            DEV,
+            "old-serial",
+            "new-serial",
+            CredentialRole::Backup1,
+            "test-passphrase",
+            HOST,
+            &TANG_URLS,
+            None,
+            &state_path,
+        )
+        .await
+        .expect("healthy rotation must not be blocked by the guard stack");
+
+        assert_eq!(new_record.yubikey_serial, "new-serial");
+        assert_eq!(new_record.luks_keyslot, Some(5));
+        assert!(new_record.revoked_at.is_none());
+
+        // New record appended, old record's revoked_at set.
+        let records = read_records(&state_path).unwrap();
+        assert_eq!(records.len(), 2);
+        let old = records.iter().find(|r| r.yubikey_serial == "old-serial").unwrap();
+        let new = records.iter().find(|r| r.yubikey_serial == "new-serial").unwrap();
+        assert!(old.revoked_at.is_some());
+        assert!(new.revoked_at.is_none());
+    }
+
+    // ── TangRotation sweep-before-retire ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_tang_rotation_gates_retire() {
+        let fleet = vec![
+            "len-serv-001".to_string(),
+            "len-serv-002".to_string(),
+            "len-serv-003".to_string(),
+        ];
+        let mut rot = TangRotation::new(&fleet).expect("non-empty fleet");
+
+        // Each rebind_host re-probes quorum against DEFAULT_TANG_URLS, so queue
+        // valid advs for .45/.46 (2-of-3) once PER rebind.
+        let regen = clevis_regen_command(DEV, 3);
+        for host in ["len-serv-001", "len-serv-002"] {
+            let mut mock = MockExecutor::new()
+                .queue(&tang_adv_command(DEFAULT_TANG_URLS[0]), ADV)
+                .queue(&tang_adv_command(DEFAULT_TANG_URLS[1]), ADV);
+            rot.rebind_host(&mut mock, host, DEV, 3).await.unwrap();
+            assert!(mock.recorded.contains(&regen));
+        }
+
+        // After 2 of 3 rebinds, retire is still gated and names the 3rd host.
+        let err = rot.retire_old_key().unwrap_err();
+        assert!(matches!(err, AutoInstallError::SystemError(_)));
+        assert!(err.to_string().contains("len-serv-003"));
+        assert_eq!(rot.pending_hosts(), vec!["len-serv-003".to_string()]);
+
+        // Rebind the last host → retire returns the plan string.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(DEFAULT_TANG_URLS[0]), ADV)
+            .queue(&tang_adv_command(DEFAULT_TANG_URLS[1]), ADV);
+        rot.rebind_host(&mut mock, "len-serv-003", DEV, 3).await.unwrap();
+        let plan = rot.retire_old_key().expect("all hosts rebound → Ok(plan)");
+        assert!(plan.contains("Safe to retire"));
+        assert!(rot.pending_hosts().is_empty());
+    }
+
+    #[test]
+    fn test_tang_rotation_empty_fleet_refuses() {
+        let err = TangRotation::new(&[]).unwrap_err();
+        assert!(matches!(err, AutoInstallError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_tang_rotation_rejects_unknown_host_and_bad_dev() {
+        let fleet = vec!["len-serv-001".to_string()];
+        let mut rot = TangRotation::new(&fleet).unwrap();
+
+        // Unknown host → ConfigError, no command run.
+        let mut mock = MockExecutor::new()
+            .queue(&tang_adv_command(DEFAULT_TANG_URLS[0]), ADV)
+            .queue(&tang_adv_command(DEFAULT_TANG_URLS[1]), ADV);
+        let err = rot
+            .rebind_host(&mut mock, "unknown-host", DEV, 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AutoInstallError::ConfigError(_)));
+
+        // Injection-y device path is rejected before anything runs.
+        let mut mock = MockExecutor::new();
+        let err = rot
+            .rebind_host(&mut mock, "len-serv-001", "/dev/sda; rm -rf /", 3)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AutoInstallError::ConfigError(_)));
+        assert_eq!(mock.recorded.len(), 0);
     }
 }
