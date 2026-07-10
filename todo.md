@@ -1,5 +1,5 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 1.7.0
+# version: 1.8.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-09
 
@@ -87,11 +87,30 @@
   disk. grub-install currently makes `ubuntu` #1. Also flip the server's PXE target for
   the MAC to "boot local/proceed" so netboot doesn't reinstall. Prefer efibootmgr in the
   chroot over ipmitool-from-server for the EFI order.
-- [ ] **USB auto-bootstrap like netboot.** USB live env should, on boot, fetch its config
+- [x] **USB auto-bootstrap like netboot** (code shipped; deploy checklist below). USB live env,
+  on boot with the `uaa.autoinstall` cmdline token, fetches the static agent + its config
   BY MAC from the web util (172.16.2.30 autoinstall-agent.py, same as netboot) and
-  auto-run `uaa install`. On success (USB case) report back so boot order is fixed. Rebuild
-  the USB image, copy to the server for reuse, dd to the stick, test the full flow.
-  SCOPE: OS install only — NO cockroach post-install/join.
+  auto-runs `uaa install`, reports back, best-effort efibootmgr (network #1, ubuntu #2),
+  then powers off (loop-safe). Shipped: `/autoinstall/uaa-config` endpoint (repo mirror of
+  autoinstall-agent.py), `scripts/deploy-usb-configs.sh` (refuses REPLACE_AT_PLACE_TIME),
+  `installer-image/nocloud/uaa-usb-bootstrap.sh` + user-data runcmd gate,
+  `make-ssh-ready-iso.sh --autoinstall`. Without the token the same USB stays
+  SSH-ready-only. SCOPE: OS install only — NO cockroach post-install/join.
+
+  **Deploy checklist for the human (USB auto-bootstrap):**
+  1. Deploy the endpoint: `scp scripts/autoinstall-agent.py 172.16.2.30:/var/www/html/cloud-init/scripts/`
+     then `ssh 172.16.2.30 'sudo systemctl restart autoinstall-agent'`.
+  2. Inject real secrets into staging copies of `examples/configs/install/<host>.yaml`
+     (replace every REPLACE_AT_PLACE_TIME), then on the server run
+     `scripts/deploy-usb-configs.sh --src <staging-dir>` (places `<hexmac>/uaa.yaml`;
+     refuses any file still holding the placeholder).
+  3. Build + copy the static agent: `scripts/build-musl.sh` on a Linux box (or grab the
+     `uaa-amd64` CI artifact), then
+     `sudo install -D -m 0755 <bin> /var/www/html/uaa/uaa-amd64` on the server.
+  4. Rebuild the USB: `scripts/make-ssh-ready-iso.sh --autoinstall <stock.iso>`, then
+     `sudo dd if=<out.iso> of=/dev/sdX bs=4M status=progress conv=fsync`.
+  5. Test the full flow on one host: boot USB → agent+config fetched by MAC →
+     `uaa install` 7/7 → webhook report → poweroff; verify BootOrder + next boot from disk.
 - [ ] **Populate the RESET partition (p2, 4GiB ext4 — subiquity reset/recovery partition).**
   Currently created + formatted but empty. Idea (user 2026-07-09): put a copy of the
   bootable USB + the debootstrap tarball on it, and a GRUB "reset/recover" entry. The reset
@@ -144,8 +163,10 @@
   local mode using `LocalClient`.
 - [ ] **`PackageManager` installs `zsys`** — zsys is deprecated/removed in Ubuntu 24.04+. Remove it
   from package lists when release >= noble.
-- [ ] **Build doesn't produce a static musl binary by default** — for curtin in-target use, the binary
-  must run in a minimal chroot. Add `--target x86_64-unknown-linux-musl` build target and CI step.
+- [x] **Static musl binary** (shipped) — `scripts/build-musl.sh` + CI
+  `.github/workflows/musl-build.yml` build `x86_64-unknown-linux-musl` release and verify it
+  is static (artifact `uaa-amd64`). Human deploys it to the server at
+  `/var/www/html/uaa/uaa-amd64` (the `UAA_AGENT_URL` default the USB bootstrap curls).
 - [ ] **unimatrixone needs mdadm assembly in the target initramfs** — u1's disk is Intel IMSM/BIOS
   fake-RAID assembled by mdadm as `/dev/md126` (single ~885 GiB volume; NOT `/dev/sda`, which is a
   RAID *member*). The installer neither adds `mdadm` to the target package set (`packages.rs` only
