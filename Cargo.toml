@@ -68,16 +68,18 @@ tokio-test = "0.4"
 
 # constellation deps (CP-02) — later crates reference these with workspace = true
 axum = "0.7"
-ed25519-dalek = "2.1"
+base64 = "0.22"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 mdns-sd = "0.13"
 notify = "6.1"
 prost = "0.13"
 prost-types = "0.13"
 protox = "0.7"
+rand = "0.8"
 rcgen = "0.13"
 rust-embed = "8.5"
 rustls = "0.23"
-semver = "1.0"
+semver = { version = "1.0", features = ["serde"] }
 tokio-postgres = "0.7"
 tokio-rustls = "0.26"
 tonic = "0.12"
