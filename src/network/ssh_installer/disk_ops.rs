@@ -1,11 +1,12 @@
 // file: src/network/ssh_installer/disk_ops.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
 //! Disk operations for SSH installation
 
 use super::config::InstallationConfig;
+use super::installer::WipeAuthorization;
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -26,7 +27,15 @@ impl<'a> DiskManager<'a> {
     }
 
     /// Perform complete disk preparation and partitioning
-    pub async fn prepare_disk(&mut self, config: &InstallationConfig) -> Result<()> {
+    ///
+    /// Requires a [`WipeAuthorization`] token (mintable only when Phase 2 is
+    /// selected) because it wipes the disk — the compiler, not convention,
+    /// forbids calling this without a wipe right.
+    pub async fn prepare_disk(
+        &mut self,
+        config: &InstallationConfig,
+        _auth: &WipeAuthorization,
+    ) -> Result<()> {
         info!("Starting disk preparation for {}", config.disk_device);
 
         // Clean up any existing mounts first
@@ -36,7 +45,7 @@ impl<'a> DiskManager<'a> {
         self.destroy_existing_zfs_pools().await?;
 
         // Wipe and partition disk
-        self.wipe_disk(config).await?;
+        self.wipe_disk(config, _auth).await?;
         self.create_partitions(config).await?;
         self.format_partitions(config).await?;
         self.setup_luks_encryption(config).await?;
@@ -56,6 +65,7 @@ impl<'a> DiskManager<'a> {
     pub async fn recover_after_failure_and_wipe(
         &mut self,
         config: &InstallationConfig,
+        _auth: &WipeAuthorization,
     ) -> Result<()> {
         info!("Recovery: cleaning up mounts, closing LUKS, exporting ZFS, and wiping disk");
 
@@ -141,7 +151,7 @@ impl<'a> DiskManager<'a> {
         ).await;
 
         // 6) Finally wipe the disk and GPT
-        self.wipe_disk(config).await?;
+        self.wipe_disk(config, _auth).await?;
 
         Ok(())
     }
@@ -226,7 +236,14 @@ impl<'a> DiskManager<'a> {
     }
 
     /// Wipe the target disk completely
-    async fn wipe_disk(&mut self, config: &InstallationConfig) -> Result<()> {
+    ///
+    /// Guarded by a [`WipeAuthorization`] token so no caller can reach the
+    /// destructive `wipefs`/`sgdisk --zap-all` path without Phase 2 selected.
+    async fn wipe_disk(
+        &mut self,
+        config: &InstallationConfig,
+        _auth: &WipeAuthorization,
+    ) -> Result<()> {
         info!("Wiping target disk");
 
         self.log_and_execute(
@@ -405,6 +422,82 @@ impl<'a> DiskManager<'a> {
         format_result?;
         open_result?;
         // Do not create a filesystem on the LUKS-mapped device; it will back the ZFS rpool.
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-destructive mount-existing-target prep (phase-rerun/TASK-02).
+    // These helpers ASSEMBLE / OPEN existing state so a selective run that skips
+    // Phase 2 can reach an installed disk. They NEVER wipe/format, so they take
+    // no `WipeAuthorization` — they must be callable without wipe rights.
+    // -------------------------------------------------------------------------
+
+    /// Assemble any IMSM/mdraid array that backs the target disk, if the disk is
+    /// an md device (e.g. `/dev/md126`). `mdadm --assemble --scan` exits non-zero
+    /// when there is nothing new to assemble (array already up) — that is success
+    /// here, hence `|| true`. No-op for non-md disks.
+    pub async fn assemble_md_if_needed(&mut self, config: &InstallationConfig) -> Result<()> {
+        if config.disk_device.starts_with("/dev/md") {
+            self.log_and_execute(
+                "Assembling md array for existing target",
+                "mdadm --assemble --scan || true",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Re-open the existing LUKS mapper (`/dev/mapper/luks`) for a selective
+    /// re-run, using the same 0600-keyfile channel as `setup_luks_encryption`
+    /// (never `echo`, never an interpolated passphrase). Idempotent: if the
+    /// mapper is already open it is reused, not reopened. A wrong key is a HARD
+    /// error — nothing half-runs.
+    pub async fn reopen_luks_if_needed(&mut self, config: &InstallationConfig) -> Result<()> {
+        // Idempotency FIRST: reuse an already-open mapper (LUKS-already-open path).
+        if self
+            .runner
+            .check_silent("cryptsetup status luks >/dev/null 2>&1")
+            .await
+            .unwrap_or(false)
+        {
+            info!("LUKS mapper already open; skipping");
+            return Ok(());
+        }
+
+        let key_path = Self::LUKS_SETUP_KEY_PATH;
+        let part = partition_path(&config.disk_device, 4);
+        let shred_cmd = format!("shred -u {} 2>/dev/null || rm -f {}", key_path, key_path);
+
+        // Create the empty 0600 keyfile atomically (carries no secret; safe to log).
+        self.log_and_execute(
+            "Creating LUKS keyfile tempfile",
+            &format!("install -m 0600 {} {}", "/dev/null", key_path),
+        )
+        .await?;
+
+        // Write the passphrase via runner.execute DIRECTLY (never log_and_execute,
+        // never echo) so the secret is never logged. `printf '%s'` writes NO
+        // trailing newline so the keyfile matches the enrolled passphrase exactly.
+        let write_key = format!(
+            "printf '%s' '{}' > {}",
+            config.luks_key.replace('\'', r"'\''"),
+            key_path
+        );
+        if let Err(e) = self.runner.execute(&write_key).await {
+            let _ = self.runner.execute(&shred_cmd).await;
+            return Err(e);
+        }
+
+        // Open via the keyfile; always shred the tempfile regardless of outcome.
+        let open_result = self
+            .log_and_execute(
+                "Reopening LUKS device for re-run",
+                &Self::build_luks_open_cmd(&part, key_path),
+            )
+            .await;
+        let _ = self.runner.execute(&shred_cmd).await;
+        open_result?;
 
         Ok(())
     }

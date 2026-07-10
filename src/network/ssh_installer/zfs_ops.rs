@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/zfs_ops.rs
-// version: 2.4.0
+// version: 2.5.0
 // guid: sshzfs01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -103,6 +103,99 @@ impl<'a> ZfsManager<'a> {
             .await?;
         self.log_and_execute("List ZFS datasets", "zfs list")
             .await?;
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Non-destructive mount-existing-target prep (phase-rerun/TASK-02) — ALL new
+    // code. There is no `zpool import` anywhere else in src/: pools are only ever
+    // CREATED fresh in Phase 3. These helpers IMPORT + MOUNT an existing install
+    // so a selective run that skips Phases 2-3 can reach the target. They never
+    // create, destroy, wipe, or export anything.
+    // -------------------------------------------------------------------------
+
+    /// Import the existing `rpool` THEN `bpool` (in that order) for a selective
+    /// re-run. Each pool is skipped if already imported (reusing preflight's
+    /// exact `zpool list -H <pool>` check so mocks and preflight agree). Imports
+    /// use `-N` (defer ALL mounting to [`mount_target_for_rerun`], keeping the
+    /// load-bearing mount order ours) and `-R /mnt/targetos` (altroot). A missing
+    /// pool is a HARD error — fail-closed before any phase runs.
+    pub async fn import_pools_for_rerun(&mut self) -> Result<()> {
+        for pool in ["rpool", "bpool"] {
+            if self
+                .runner
+                .check_silent(&format!("zpool list -H {} >/dev/null 2>&1", pool))
+                .await
+                .unwrap_or(false)
+            {
+                info!("{} already imported; skipping import", pool);
+                continue;
+            }
+            self.log_and_execute(
+                &format!("Importing {} (altroot, no automount)", pool),
+                &format!("zpool import -N -R /mnt/targetos {}", pool),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Mount an imported target in the LOAD-BEARING order: `/` (rpool ROOT)
+    /// BEFORE `/boot` (bpool BOOT) BEFORE the ESP. Reversed order shadows `/boot`
+    /// and breaks grub-probe (root cause fixed by faea48e; see the create-order
+    /// comment on `create_zfs_pools`). Every mount is `mountpoint -q … ||`-guarded
+    /// so partial-mount state re-runs idempotently.
+    pub async fn mount_target_for_rerun(&mut self, esp_partition: &str) -> Result<()> {
+        // 1) Discover the root dataset (rpool/ROOT/ubuntu_<uuid>).
+        let root_dataset = self
+            .runner
+            .execute_with_output(
+                "zfs list -H -o name -r rpool/ROOT | grep -m1 '^rpool/ROOT/ubuntu_'",
+            )
+            .await?;
+        let root_dataset = root_dataset.trim();
+        if root_dataset.is_empty() {
+            return Err(crate::error::AutoInstallError::InstallationError(
+                "no rpool/ROOT/ubuntu_* dataset found — is this an installed target?".to_string(),
+            ));
+        }
+
+        // 2) Mount `/` FIRST.
+        self.log_and_execute(
+            "Mount root dataset (/) first",
+            &format!("mountpoint -q /mnt/targetos || zfs mount {}", root_dataset),
+        )
+        .await?;
+
+        // 3) THEN `/boot` (derive bpool/BOOT/ubuntu_<uuid> from the same uuid
+        //    suffix; use the TRIMMED last path component so no stray newline
+        //    leaks into the dataset name on real targets).
+        let uuid_suffix = root_dataset.rsplit('/').next().unwrap_or(root_dataset);
+        let boot_dataset = format!("bpool/BOOT/{}", uuid_suffix);
+        self.log_and_execute(
+            "Mount boot dataset (/boot) after root",
+            &format!(
+                "mountpoint -q /mnt/targetos/boot || zfs mount {}",
+                boot_dataset
+            ),
+        )
+        .await?;
+
+        // 4) THEN remaining child datasets (nest under the mounted `/`, cannot
+        //    shadow `/boot`).
+        self.log_and_execute("Mount remaining child datasets", "zfs mount -a || true")
+            .await?;
+
+        // 5) THEN the ESP, LAST.
+        self.log_and_execute(
+            "Mount ESP last",
+            &format!(
+                "mkdir -p /mnt/targetos/boot/efi; mountpoint -q /mnt/targetos/boot/efi || mount {} /mnt/targetos/boot/efi",
+                esp_partition
+            ),
+        )
+        .await?;
+
         Ok(())
     }
 

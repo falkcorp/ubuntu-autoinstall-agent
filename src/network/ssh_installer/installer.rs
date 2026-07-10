@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.8.0
+// version: 2.9.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -260,6 +260,13 @@ impl SshInstaller {
             info!("✓ Preflight checks passed");
         }
 
+        // Non-destructive mount-existing-target prep: runs when Phase 2/3 are
+        // skipped but a later phase needs a mounted target. Fail-closed — a hard
+        // prep failure aborts BEFORE any selected phase runs.
+        if selection.needs_luks_reopen() || selection.needs_pool_import() {
+            self.mount_existing_target(config, selection).await?;
+        }
+
         macro_rules! run_phase {
             ($label:expr, $fut:expr) => {{
                 match $fut.await {
@@ -290,8 +297,8 @@ impl SshInstaller {
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
-        if let Some(_wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config));
+        if let Some(wipe_auth) = selection.authorize_wipe() {
+            run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config, &wipe_auth));
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
@@ -383,6 +390,13 @@ impl SshInstaller {
             }
         }
 
+        // Non-destructive mount-existing-target prep: runs when Phase 2/3 are
+        // skipped but a later phase needs a mounted target. Fail-closed — a hard
+        // prep failure aborts BEFORE any selected phase runs.
+        if selection.needs_luks_reopen() || selection.needs_pool_import() {
+            self.mount_existing_target(config, selection).await?;
+        }
+
         if selection.contains(0) {
             run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
         } else {
@@ -393,8 +407,8 @@ impl SshInstaller {
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
-        if let Some(_wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config));
+        if let Some(wipe_auth) = selection.authorize_wipe() {
+            run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config, &wipe_auth));
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
@@ -586,18 +600,98 @@ impl SshInstaller {
                 Some(_auth) => {
                     info!("Preflight: Phase 2 selected — recovering (wipe authorized)");
                     let mut disk_manager = DiskManager::new(&mut *self.runner);
-                    let _ = disk_manager.recover_after_failure_and_wipe(config).await;
+                    let _ = disk_manager
+                        .recover_after_failure_and_wipe(config, &_auth)
+                        .await;
                 }
                 None => {
-                    return Err(crate::error::AutoInstallError::ValidationError(
-                        "Residual install state detected and Phase 2 is not selected; refusing to wipe. \
-                         Non-destructive mount-existing-target prep lands in phase-rerun/TASK-02."
-                            .to_string(),
-                    ));
+                    // Selective mode omitting Phase 2: residual state is the
+                    // EXPECTED input for a re-run. Log and continue — NEVER wipe.
+                    // The non-destructive mount-existing-target prep (below,
+                    // gated on needs_luks_reopen/needs_pool_import) reuses this
+                    // state. This bypass is reachable ONLY with an explicit
+                    // selection; every flagless run has authorize_wipe() == Some
+                    // and wipes on residual exactly as before.
+                    info!(
+                        "Preflight: residual state detected (bpool={} rpool={} luks={} mounts={}) — expected in selective mode; NOT wiping",
+                        has_bpool, has_rpool, luks_active, target_has_mounts
+                    );
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Non-destructive prep so a selective run that skips Phases 2-3 can reach an
+    /// EXISTING installed disk. Normalizes stale mounts (umount only), assembles
+    /// md, re-opens LUKS (idempotent), imports `rpool` then `bpool`, and mounts
+    /// `/` then `/boot` then the ESP — the order is load-bearing (faea48e). It
+    /// NEVER wipes, formats, `zpool export`s, or `cryptsetup close`s: healthy
+    /// residual state is the EXPECTED input and is reused, not torn down. Called
+    /// AFTER preflight, BEFORE the first selected phase; a hard failure aborts
+    /// the run fail-closed.
+    async fn mount_existing_target(
+        &mut self,
+        config: &InstallationConfig,
+        selection: &PhaseSelection,
+    ) -> Result<()> {
+        info!("Prep: mounting existing target for selective re-run");
+
+        // 1) Normalize stale state: replay ONLY the umount inverse ops from
+        //    SystemConfigurator::final_cleanup. NEVER zpool export / cryptsetup
+        //    close — healthy pools and mappers are reused, not torn down.
+        for cmd in [
+            "umount -R /mnt/targetos/sys || true",
+            "umount -R /mnt/targetos/proc || true",
+            "umount -R /mnt/targetos/dev || true",
+            "umount -R /mnt/targetos/run || true",
+            "umount /mnt/targetos/boot/efi || true",
+        ] {
+            let _ = self.runner.execute(cmd).await;
+        }
+
+        // 2) Assemble md + re-open LUKS (idempotent) when a later phase needs it.
+        if selection.needs_luks_reopen() {
+            let mut dm = DiskManager::new(&mut *self.runner);
+            dm.assemble_md_if_needed(config).await?;
+            dm.reopen_luks_if_needed(config).await?;
+        }
+
+        // 3) Import pools (rpool then bpool) + ordered mount when a later phase
+        //    needs a mounted target.
+        if selection.needs_pool_import() {
+            // ESP path: GUID PARTTYPE detection (copied verbatim from
+            // system_setup::build_esp_detection_command — that file is not in
+            // this task's file list); fall back to partition 1 of the configured
+            // disk (suffix-aware) when detection is empty.
+            let esp_guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+            let esp_detect_cmd = format!(
+                "bash -lc 'lsblk -rP -o PATH,PARTTYPE | grep -i \"PARTTYPE=\\\"{0}\\\"\" | head -n1 | sed -n \"s/.*PATH=\\\"\\([^\\\" ]*\\)\\\".*/\\1/p\"'",
+                esp_guid
+            );
+            let detected = self
+                .runner
+                .execute_with_output(&esp_detect_cmd)
+                .await
+                .unwrap_or_default();
+            let esp_partition = if detected.trim().is_empty() {
+                partition_path(&config.disk_device, 1)
+            } else {
+                detected.trim().to_string()
+            };
+
+            let mut zm = ZfsManager::new(&mut *self.runner, &mut self.variables);
+            zm.import_pools_for_rerun().await?;
+            zm.mount_target_for_rerun(&esp_partition).await?;
+        }
+
+        // 4) Chroot bind mounts: do NOTHING here — the idempotent
+        //    `mountpoint -q … || mount --rbind …` blocks in
+        //    configure_system_in_chroot (Phase 4) and configure_grub_in_chroot
+        //    (Phase 5) re-establish them when those phases run.
+
+        info!("Prep: existing target mounted");
         Ok(())
     }
 
@@ -768,10 +862,14 @@ impl SshInstaller {
         Ok(())
     }
 
-    async fn phase_2_disk_preparation(&mut self, config: &InstallationConfig) -> Result<()> {
+    async fn phase_2_disk_preparation(
+        &mut self,
+        config: &InstallationConfig,
+        auth: &WipeAuthorization,
+    ) -> Result<()> {
         info!("Phase 2: Disk preparation");
         let mut dm = DiskManager::new(&mut *self.runner);
-        dm.prepare_disk(config).await?;
+        dm.prepare_disk(config, auth).await?;
         info!("Phase 2 completed");
         Ok(())
     }
@@ -1096,7 +1194,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_selective_run_skips_unselected_phases() {
-        let mock = RecordingExecutor::new();
+        // --phases 5 triggers the non-destructive mount-existing-target prep
+        // (needs_luks_reopen + needs_pool_import), which discovers the root
+        // dataset — preset it so prep completes and Phase 5 actually runs.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zfs list -H -o name -r rpool/ROOT | grep -m1 '^rpool/ROOT/ubuntu_'",
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1190,5 +1294,176 @@ mod tests {
             contains_cmd(&cmds, "wipefs -a"),
             "full install on residual state must still wipe"
         );
+    }
+
+    // ── Mount-existing-target prep (phase-rerun/TASK-02) ──────────────────────
+
+    /// The dataset-discovery command that `mount_target_for_rerun` issues; preset
+    /// its output so prep can complete in the mock.
+    const ROOT_DISCOVER_CMD: &str =
+        "zfs list -H -o name -r rpool/ROOT | grep -m1 '^rpool/ROOT/ubuntu_'";
+
+    #[tokio::test]
+    async fn test_preflight_selective_skips_recovery_wipe() {
+        // Residual rpool present + --phases 5 (omits Phase 2): preflight must
+        // BYPASS the recovery-wipe (log + continue), returning Ok, and issue no
+        // destructive command.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zpool list -H rpool >/dev/null 2>&1",
+            "rpool",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let result = installer.preflight_checks(&cfg, &selection).await;
+        assert!(result.is_ok(), "selective preflight must bypass, not error");
+
+        let cmds = mock.recorded();
+        for forbidden in ["wipefs", "sgdisk --zap-all", "zpool destroy", "cryptsetup close"] {
+            assert!(
+                !contains_cmd(&cmds, forbidden),
+                "selective preflight bypass must not issue {forbidden:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prep_pool_already_imported_skips_import() {
+        // Both pools already imported → import is skipped entirely.
+        let mock = RecordingExecutor::with_responses(&[
+            ("zpool list -H rpool >/dev/null 2>&1", "rpool"),
+            ("zpool list -H bpool >/dev/null 2>&1", "bpool"),
+            (ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123"),
+        ]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            !contains_cmd(&cmds, "zpool import"),
+            "already-imported pools must not be re-imported"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prep_luks_already_open_skips_open() {
+        // Mapper already open → no cryptsetup open is issued.
+        let mock = RecordingExecutor::with_responses(&[
+            ("cryptsetup status luks >/dev/null 2>&1", "active"),
+            (ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123"),
+        ]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            !contains_cmd(&cmds, "cryptsetup open"),
+            "already-open LUKS mapper must not be reopened"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prep_mount_order_root_then_boot_then_esp() {
+        // THE faea48e regression test: / (rpool ROOT) before /boot (bpool BOOT)
+        // before the ESP.
+        let mock = RecordingExecutor::with_responses(&[(
+            ROOT_DISCOVER_CMD,
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        let root = position_cmd(&cmds, "zfs mount rpool/ROOT/ubuntu_abc123")
+            .expect("root mount expected");
+        let boot = position_cmd(&cmds, "zfs mount bpool/BOOT/ubuntu_abc123")
+            .expect("boot mount expected");
+        // Match the ESP *mount* specifically (the normalize step umounts the same
+        // path first, so an unqualified `/mnt/targetos/boot/efi` would mis-match).
+        let esp = position_cmd(&cmds, "mount /dev/nvme0n1p1 /mnt/targetos/boot/efi")
+            .expect("ESP mount expected");
+        assert!(
+            root < boot && boot < esp,
+            "expected root<boot<esp, got {root} {boot} {esp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prep_normalizes_partial_mounts_first() {
+        // The umount inverse ops run BEFORE any import/mount, and prep never
+        // exports a pool.
+        let mock = RecordingExecutor::with_responses(&[(
+            ROOT_DISCOVER_CMD,
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        let last_umount = [
+            "umount -R /mnt/targetos/sys",
+            "umount -R /mnt/targetos/proc",
+            "umount -R /mnt/targetos/dev",
+            "umount -R /mnt/targetos/run",
+            "umount /mnt/targetos/boot/efi",
+        ]
+        .iter()
+        .map(|n| position_cmd(&cmds, n).expect("normalize umount expected"))
+        .max()
+        .unwrap();
+        let first_state_change = [
+            position_cmd(&cmds, "zpool import"),
+            position_cmd(&cmds, "zfs mount"),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .expect("an import or mount expected");
+        assert!(
+            last_umount < first_state_change,
+            "normalize umounts must precede import/mount, got {last_umount} vs {first_state_change}"
+        );
+        assert!(
+            !contains_cmd(&cmds, "zpool export"),
+            "prep must never export a pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prep_import_uses_altroot_no_automount() {
+        // Every zpool import must carry -N (no automount) and -R /mnt/targetos.
+        let mock = RecordingExecutor::with_responses(&[(
+            ROOT_DISCOVER_CMD,
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        let imports: Vec<&String> =
+            cmds.iter().filter(|c| c.contains("zpool import")).collect();
+        assert!(!imports.is_empty(), "prep must import at least one pool");
+        for cmd in imports {
+            assert!(
+                cmd.contains("-N") && cmd.contains("-R /mnt/targetos"),
+                "import must use -N and -R /mnt/targetos: {cmd}"
+            );
+        }
     }
 }
