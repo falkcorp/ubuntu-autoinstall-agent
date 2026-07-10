@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/power/mod.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: 76330c27-93dd-46ab-8265-8b8e9b6a4dc1
 // last-edited: 2026-07-10
 
@@ -14,11 +14,13 @@
 //! that mistake structurally impossible (no `std::process::Command("ipmitool")`
 //! appears anywhere in this crate).
 //!
-//! AMD DASH (Lenovo M715q) is implemented in `power::dash` (RP-02):
-//! `run_power_action` dispatches `AmdDash` hosts there ahead of the
-//! Ipmi-only `validate_ipmi_request` guard. Intel AMT and Wake-on-LAN remain
-//! representable as `PowerMechanism` variants but are UNIMPLEMENTED stubs —
-//! see `docs/agent-tasks/DEFERRED.md`.
+//! AMD DASH (Lenovo M715q) is implemented in `power::dash` (RP-02); Intel AMT
+//! and Wake-on-LAN are implemented in `power::amt_wol` (RP-03).
+//! `run_power_action` dispatches all three mechanisms there ahead of the
+//! Ipmi-only `validate_ipmi_request` guard. No fleet host is registered with
+//! mechanism `intel-amt` or `wol` today (see `docs/agent-tasks/DEFERRED.md`)
+//! — both paths are mechanism-only, ready for the first host added to the
+//! registry/fleet config.
 
 pub mod amt_wol;
 pub mod dash;
@@ -63,11 +65,13 @@ pub enum PowerMechanism {
         /// at runtime via --ipmi-password / UAA_IPMI_PASSWORD.
         username: &'static str,
     },
-    /// AMD DASH (Lenovo M715q) — UNIMPLEMENTED stub.
+    /// AMD DASH (Lenovo M715q) — implemented in `power::dash` (RP-02).
     AmdDash,
-    /// Intel AMT — UNIMPLEMENTED stub.
+    /// Intel AMT — implemented in `power::amt_wol` (RP-03). Mechanism-only:
+    /// no fleet host uses this mechanism today.
     IntelAmt,
-    /// Wake-on-LAN — UNIMPLEMENTED stub.
+    /// Wake-on-LAN — implemented in `power::amt_wol` (RP-03). Mechanism-only:
+    /// no fleet host uses this mechanism today.
     WakeOnLan,
 }
 
@@ -186,10 +190,13 @@ pub fn validate_ipmi_request(
 ///
 /// AmdDash hosts are special-cased here, ahead of the Ipmi-only
 /// `validate_ipmi_request` guard, and handed off to `dash::run_dash_action`
-/// (RP-02). `validate_ipmi_request`'s own `AmdDash` arm is intentionally left
-/// alone: its `Result<(&'static str, &'static str)>` return shape is
-/// Ipmi-specific and shared verbatim with the still-unimplemented IntelAmt/
-/// WakeOnLan arms (RP-03).
+/// (RP-02). IntelAmt and WakeOnLan hosts are special-cased the same way,
+/// handed off to `amt_wol::run_amt_action` / `amt_wol::run_wol_action`
+/// (RP-03). `validate_ipmi_request`'s own `AmdDash`/`IntelAmt`/`WakeOnLan`
+/// arms are intentionally left alone: its `Result<(&'static str, &'static
+/// str)>` return shape is Ipmi-specific and shared verbatim across all three
+/// non-Ipmi mechanisms, none of which it is ever consulted for once the
+/// special-cases below return first.
 pub async fn run_power_action(
     executor: &mut dyn CommandExecutor,
     hostname: &str,
@@ -198,6 +205,14 @@ pub async fn run_power_action(
 ) -> Result<String> {
     if let Some(PowerMechanism::AmdDash) = lookup_host(hostname) {
         return dash::run_dash_action(executor, hostname, ipmi_password, action).await;
+    }
+    if let Some(PowerMechanism::IntelAmt) = lookup_host(hostname) {
+        return amt_wol::run_amt_action(executor, hostname, ipmi_password, action).await;
+    }
+    if let Some(PowerMechanism::WakeOnLan) = lookup_host(hostname) {
+        // No fleet field carries a dedicated MAC yet — `hostname` doubles as
+        // the WoL target MAC. See `amt_wol` module docs.
+        return amt_wol::run_wol_action(executor, hostname, hostname, action).await;
     }
 
     let (bmc_host, username) = validate_ipmi_request(hostname, ipmi_password)?;
