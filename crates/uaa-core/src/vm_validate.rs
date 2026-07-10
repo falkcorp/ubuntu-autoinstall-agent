@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/vm_validate.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: e3044431-725f-4fc3-a710-2f13497fca46
 // last-edited: 2026-07-10
 
@@ -267,8 +267,14 @@ pub fn config_has_placeholder(text: &str) -> bool {
 // test module below can build the same expected strings it asserts against.
 // ---------------------------------------------------------------------
 
+/// Single-quote-wrap a value for safe shell interpolation (POSIX): wrap in
+/// single quotes, and replace each embedded single quote with '\'' .
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn log_path_str(workdir: &Path, name: &str) -> String {
-    format!("{}/logs/{name}", workdir.display())
+    format!("{}/logs/{name}", shq(&workdir.display().to_string()))
 }
 
 fn ssh_cmd(
@@ -305,6 +311,8 @@ fn scp_cmd(
         "-P {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
         opts.ssh_port
     );
+    let local = shq(local);
+    let remote_dst = shq(remote_dst);
     if have_sshpass && user == SSH_USER {
         format!("sshpass -p {SSH_LIVE_PASSWORD} scp {scp_opts} {local} {user}@127.0.0.1:{remote_dst}")
     } else {
@@ -320,10 +328,11 @@ fn wait_for_ssh_cmd(opts: &VmValidateOptions, have_sshpass: bool, user: &str, ov
 }
 
 fn firmware_args(ovmf_code: &str, ovmf_vars: Option<&str>, workdir: &Path) -> String {
+    let ovmf_code = shq(ovmf_code);
     if ovmf_vars.is_some() {
         format!(
             " -drive if=pflash,format=raw,readonly=on,file={ovmf_code} -drive if=pflash,format=raw,file={}/OVMF_VARS.fd",
-            workdir.display()
+            shq(&workdir.display().to_string())
         )
     } else {
         format!(" -bios {ovmf_code}")
@@ -516,10 +525,10 @@ async fn stage1_workspace(
 ) -> std::result::Result<(), String> {
     let log = log_path_str(&opts.workdir, LOG_01_WORKSPACE);
 
-    let disk_img = format!("{}/disk.qcow2", opts.workdir.display());
+    let disk_img = format!("{}/disk.qcow2", shq(&opts.workdir.display().to_string()));
     let create_cmd = format!(
         "qemu-img create -f qcow2 {disk_img} {size} >>{log} 2>&1",
-        size = opts.disk_size
+        size = shq(&opts.disk_size)
     );
     executor
         .execute(&create_cmd)
@@ -528,16 +537,20 @@ async fn stage1_workspace(
     ctx.disk_img = disk_img;
 
     if let Some(vars_src) = ctx.ovmf_vars.clone() {
-        let cp_cmd = format!("cp {vars_src} {}/OVMF_VARS.fd", opts.workdir.display());
+        let cp_cmd = format!(
+            "cp {} {}/OVMF_VARS.fd",
+            shq(&vars_src),
+            shq(&opts.workdir.display().to_string())
+        );
         executor
             .execute(&cp_cmd)
             .await
             .map_err(|e| format!("failed to copy OVMF_VARS — see {log}: {e}"))?;
     }
 
-    let sock = format!("{}/swtpm.sock", opts.workdir.display());
-    let pidfile = format!("{}/swtpm.pid", opts.workdir.display());
-    let tpmstate = format!("{}/tpmstate", opts.workdir.display());
+    let sock = format!("{}/swtpm.sock", shq(&opts.workdir.display().to_string()));
+    let pidfile = format!("{}/swtpm.pid", shq(&opts.workdir.display().to_string()));
+    let tpmstate = format!("{}/tpmstate", shq(&opts.workdir.display().to_string()));
     let launch_cmd = format!(
         "mkdir -p {tpmstate} && swtpm socket --tpmstate dir={tpmstate} --ctrl type=unixio,path={sock} --tpm2 --daemon --pid file={pidfile} >>{log} 2>&1; i=0; while [ ! -f {pidfile} ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done; cat {pidfile} 2>/dev/null"
     );
@@ -585,7 +598,7 @@ async fn stage2_boot_iso(
     let launch_cmd = format!(
         "qemu-system-x86_64 -m 4096 -smp 2{firmware} -drive file={disk},if=virtio,format=qcow2 -cdrom {iso} -boot order=dc -chardev socket,id=chrtpm,path={sock} -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 -netdev user,id=n0,hostfwd=tcp::{port}-:22 -device virtio-net-pci,netdev=n0 -serial file:{serial_log} -display none -no-reboot{kvm} >>{log} 2>&1 & echo $!",
         disk = ctx.disk_img,
-        iso = opts.iso.display(),
+        iso = shq(&opts.iso.display().to_string()),
         sock = ctx.swtpm_sock,
         port = opts.ssh_port,
     );
@@ -798,7 +811,7 @@ async fn stage5_boot_disk(
     // docs/vm-validation.md); a genuine hang here is caught by the
     // boot-timeout FAIL below regardless. Backgrounded (trailing `&`) so it
     // never blocks the SSH wait that follows.
-    let serial_sock = format!("{}/serial-disk.sock", opts.workdir.display());
+    let serial_sock = format!("{}/serial-disk.sock", shq(&opts.workdir.display().to_string()));
     let serial_args = if ctx.have_socat {
         format!(" -chardev socket,id=serial0,path={serial_sock},server=on,wait=off -serial chardev:serial0")
     } else {
@@ -1257,6 +1270,37 @@ Installation completed successfully\n";
             );
         }
         assert!(rendered.contains("GATE: FAIL (stage 2: SSH did not come up within 600s)"));
+    }
+
+    // ── shq / command-string quoting ────────────────────────────────────
+
+    #[test]
+    fn test_shq_wraps_and_escapes_embedded_quotes() {
+        assert_eq!(shq("/tmp/plain"), "'/tmp/plain'");
+        // The distinctive part: an embedded single quote must be escaped as
+        // '\'' (close quote, escaped literal quote, reopen quote) — a naive
+        // wrap-only implementation would leave the embedded quote
+        // unescaped and break out of the quoted span.
+        assert_eq!(shq("/tmp/a'b"), r#"'/tmp/a'\''b'"#);
+    }
+
+    #[test]
+    fn test_scp_cmd_quotes_local_path_against_injection() {
+        let opts = happy_path_opts();
+        let malicious = "/tmp/a b; touch pwned";
+        let cmd = scp_cmd(&opts, false, "root", malicious, "/tmp/uaa");
+
+        // The dangerous `; touch pwned` substring must appear ONLY inside
+        // the single-quoted span produced by `shq`, never as a bare,
+        // shell-interpretable command separator.
+        assert!(
+            cmd.contains(&shq(malicious)),
+            "expected the quoted local path in: {cmd}"
+        );
+        assert!(
+            !cmd.contains("b; touch pwned '"),
+            "the semicolon escaped the quoted span: {cmd}"
+        );
     }
 
     // ── pure evaluators ─────────────────────────────────────────────────
