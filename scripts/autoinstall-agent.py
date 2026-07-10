@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # file: scripts/autoinstall-agent.py
-# version: 1.3.0
+# version: 1.4.0
 # guid: 7b6e4a2c-9f1d-4e8a-b3c6-2d5f8a1c9e07
 # last-edited: 2026-07-10
 """
@@ -30,6 +30,7 @@ import subprocess, tempfile, shutil
 
 IPXE_BOOT_DIR = "/var/www/html/ipxe/boot"
 CLOUD_INIT_BASE = "/var/www/html/cloud-init"
+UAA_BINARY_PATH = "/var/www/html/uaa/uaa-amd64"
 LOG_DIR = "/var/log/cockroach-autoinstall"
 EVENTS_LOG = f"{LOG_DIR}/events.jsonl"
 FILES_DIR = f"{LOG_DIR}/files"
@@ -42,6 +43,19 @@ CA_KEY = "/var/lib/cockroach-autoinstall/.cockroach-ca/ca.key"
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(FILES_DIR, exist_ok=True)
+
+def agent_binary_status(path):
+    """stat the served uaa binary. ABSENT file/dir is the normal, handled
+    case (build-musl.sh only PRINTS the deploy hint) — never an exception."""
+    info = {"path": path, "present": False, "size": None, "mtime": None}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return info
+    info["present"] = True
+    info["size"] = st.st_size
+    info["mtime"] = datetime.utcfromtimestamp(st.st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return info
 
 # ── Machine Registry ─────────────────────────────────────────────────────────
 def load_registry():
@@ -272,6 +286,19 @@ class Handler(BaseHTTPRequestHandler):
             save_registry(reg)
             log(f"DEREGISTERED {mac} ({hostname})")
             self.send_json(200, {"ok": True, "message": f"Deregistered {mac} ({hostname})"})
+            return
+
+        # ── Health / liveness ──
+        if path == "/api/health":
+            reg = load_registry()
+            self.send_json(200, {
+                "status": "ok",
+                "registry_hosts": len(reg),
+                "registry_approved": sum(1 for e in reg.values() if e.get("status") == "approved"),
+                "yubikeys": len(load_yk_registry()),
+                "tang_servers": len(load_tang_registry()),
+                "agent_binary": agent_binary_status(UAA_BINARY_PATH),
+            })
             return
 
         # ── Machine registry ──
