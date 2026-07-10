@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/disk_ops.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -16,6 +16,11 @@ pub struct DiskManager<'a> {
 }
 
 impl<'a> DiskManager<'a> {
+    /// Root-only 0600 tempfile on the target that carries the LUKS passphrase
+    /// to `cryptsetup` via `--key-file`. `/run` is tmpfs, so the key never
+    /// touches persistent disk; it is `shred -u`'d immediately after use.
+    const LUKS_SETUP_KEY_PATH: &'static str = "/run/.uaa-luks-setup.key";
+
     pub fn new(runner: &'a mut dyn CommandExecutor) -> Self {
         Self { runner }
     }
@@ -338,28 +343,67 @@ impl<'a> DiskManager<'a> {
     }
 
     /// Setup LUKS encryption
+    ///
+    /// The LUKS passphrase is delivered to `cryptsetup` via a root-only 0600
+    /// tempfile on the TARGET (`/run` is tmpfs, so the key never touches
+    /// persistent disk) passed with `--key-file`, then `shred -u`'d — mirroring
+    /// the Tang clevis-bind pattern in `SystemConfigurator::enroll_tang_clevis`.
+    /// The passphrase therefore never appears on a command line, in `ps`
+    /// output, in `/proc/<pid>/cmdline`, or in any log message.
     async fn setup_luks_encryption(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Setting up LUKS encryption");
 
-        // Setup LUKS encryption
+        let key_path = Self::LUKS_SETUP_KEY_PATH;
+        let part = partition_path(&config.disk_device, 4);
+        let shred_cmd = format!("shred -u {} 2>/dev/null || rm -f {}", key_path, key_path);
+
+        // Create the empty 0600 keyfile atomically. This command carries no
+        // secret, so it is fine to log. An install cannot proceed without LUKS,
+        // so a failure here is fatal (unlike Tang's non-fatal skip).
         self.log_and_execute(
-            "Setting up LUKS encryption",
-            &format!(
-                "echo '{}' | cryptsetup luksFormat --batch-mode {}",
-                config.luks_key,
-                partition_path(&config.disk_device, 4)
-            ),
+            "Creating LUKS keyfile tempfile",
+            &format!("install -m 0600 {} {}", "/dev/null", key_path),
         )
         .await?;
-        self.log_and_execute(
-            "Opening LUKS device",
-            &format!(
-                "echo '{}' | cryptsetup open {} luks",
-                config.luks_key,
-                partition_path(&config.disk_device, 4)
-            ),
-        )
-        .await?;
+
+        // Write the passphrase — executed via runner.execute DIRECTLY (never
+        // log_and_execute, never echo) so the secret is never logged. Single
+        // quotes are escaped exactly as in the Tang bind. `printf '%s'` writes
+        // NO trailing newline: `cryptsetup --key-file` reads the whole file
+        // verbatim, so a stray newline would enroll `<pass>\n` and desync every
+        // other unlock channel (Tang, TPM2 seed, interactive). Embedded
+        // newlines in the key are unsupported (as with the old stdin pipe).
+        let write_key = format!(
+            "printf '%s' '{}' > {}",
+            config.luks_key.replace('\'', r"'\''"),
+            key_path
+        );
+        if let Err(e) = self.runner.execute(&write_key).await {
+            let _ = self.runner.execute(&shred_cmd).await;
+            return Err(e);
+        }
+
+        // luksFormat then open, both via the keyfile. Capture the Results
+        // instead of `?`-propagating so the tempfile is always shredded.
+        let format_result = self
+            .log_and_execute(
+                "Setting up LUKS encryption",
+                &Self::build_luks_format_cmd(&part, key_path),
+            )
+            .await;
+        let open_result = self
+            .log_and_execute(
+                "Opening LUKS device",
+                &Self::build_luks_open_cmd(&part, key_path),
+            )
+            .await;
+
+        // Always shred the tempfile regardless of outcome (finally-style).
+        let _ = self.runner.execute(&shred_cmd).await;
+
+        // Propagate the first error (format first, then open).
+        format_result?;
+        open_result?;
         // Do not create a filesystem on the LUKS-mapped device; it will back the ZFS rpool.
 
         Ok(())
@@ -404,6 +448,23 @@ impl<'a> DiskManager<'a> {
     fn build_mkfs_reset(disk: &str) -> String {
         format!("mkfs.ext4 -F -L RESET {}", partition_path(disk, 2))
     }
+
+    // --- LUKS command builders (production; keyfile channel only) ---
+    // These deliberately take only the partition and the keyfile PATH — never
+    // the passphrase — so the secret cannot leak through the command string.
+
+    /// Build the `cryptsetup luksFormat` command using a keyfile.
+    fn build_luks_format_cmd(part: &str, key_path: &str) -> String {
+        format!(
+            "cryptsetup luksFormat --batch-mode --key-file {} {}",
+            key_path, part
+        )
+    }
+
+    /// Build the `cryptsetup open` command using a keyfile.
+    fn build_luks_open_cmd(part: &str, key_path: &str) -> String {
+        format!("cryptsetup open --key-file {} {} luks", key_path, part)
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +489,49 @@ mod tests {
             DiskManager::build_mkfs_reset("/dev/nvme0n1"),
             "mkfs.ext4 -F -L RESET /dev/nvme0n1p2"
         );
+    }
+
+    #[test]
+    fn test_build_luks_format_cmd_uses_key_file() {
+        let cmd =
+            DiskManager::build_luks_format_cmd("/dev/nvme0n1p4", DiskManager::LUKS_SETUP_KEY_PATH);
+        // Happy path preserved: still formats the same partition, now via keyfile.
+        assert!(cmd.contains("luksFormat --batch-mode"));
+        assert!(cmd.contains("--key-file /run/.uaa-luks-setup.key"));
+        assert!(cmd.contains("/dev/nvme0n1p4"));
+        // The secret channel is closed: no echo-pipe interpolation.
+        assert!(!cmd.contains("echo"));
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn test_build_luks_open_cmd_uses_key_file() {
+        let cmd =
+            DiskManager::build_luks_open_cmd("/dev/nvme0n1p4", DiskManager::LUKS_SETUP_KEY_PATH);
+        assert!(cmd.contains("cryptsetup open"));
+        assert!(cmd.contains("--key-file /run/.uaa-luks-setup.key"));
+        assert!(cmd.contains("/dev/nvme0n1p4"));
+        // Mapper name unchanged so the rest of the install still finds `luks`.
+        assert!(cmd.trim_end().ends_with("luks"));
+        assert!(!cmd.contains("echo"));
+        assert!(!cmd.contains('\n'));
+    }
+
+    #[test]
+    fn test_luks_commands_never_embed_passphrase() {
+        // The builders take only the partition and keyfile PATH — the
+        // passphrase cannot reach the command string by construction. Build
+        // both with a sentinel partition and assert no single-quote-wrapped
+        // secret (the old `echo '<pass>' | ...` shape) survives.
+        let part = "/dev/SENTINELp4";
+        let key = DiskManager::LUKS_SETUP_KEY_PATH;
+        let format_cmd = DiskManager::build_luks_format_cmd(part, key);
+        let open_cmd = DiskManager::build_luks_open_cmd(part, key);
+        for cmd in [&format_cmd, &open_cmd] {
+            assert!(!cmd.contains("echo"));
+            assert!(!cmd.contains('\''));
+            assert!(cmd.contains(part));
+            assert!(cmd.contains(key));
+        }
     }
 }

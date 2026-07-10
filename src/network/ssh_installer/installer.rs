@@ -1,5 +1,5 @@
 // file: src/network/ssh_installer/installer.rs
-// version: 2.5.0
+// version: 2.6.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-10
 
@@ -481,7 +481,10 @@ impl SshInstaller {
             ("DISK", config.disk_device.as_str()),
             ("TIMEZONE", config.timezone.as_str()),
             ("HOSTNAME", config.hostname.as_str()),
-            ("LUKS_KEY", config.luks_key.as_str()),
+            // NOTE: the LUKS passphrase is intentionally NOT exported here. It
+            // is delivered to cryptsetup via a 0600 keyfile in
+            // DiskManager::setup_luks_encryption; exporting it would put the
+            // secret on a command line and in /proc/<pid>/environ.
             ("ROOT_PASSWORD", config.root_password.as_str()),
             ("NET_ET_INTERFACE", config.network_interface.as_str()),
             ("NET_ET_ADDRESS", config.network_address.as_str()),
