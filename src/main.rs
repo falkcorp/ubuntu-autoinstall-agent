@@ -1,7 +1,7 @@
 // file: src/main.rs
-// version: 2.3.0
+// version: 2.4.0
 // guid: h8i9j0k1-l2m3-4567-8901-234567hijklm
-// last-edited: 2026-06-21
+// last-edited: 2026-07-09
 
 //! Ubuntu AutoInstall Agent - Main entry point
 
@@ -118,11 +118,13 @@ async fn main() -> Result<()> {
             } => {
                 local_install_command(
                     hostname,
+                    None, // config_path (use `install --config` for config-driven local installs)
                     investigate_only,
                     dry_run,
                     hold_on_failure,
                     pause_after_storage,
                     force,
+                    None, // report_url
                 )
                 .await
             }

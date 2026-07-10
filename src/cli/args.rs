@@ -1,5 +1,5 @@
 // file: src/cli/args.rs
-// version: 2.5.0
+// version: 2.6.0
 // guid: f6g7h8i9-j0k1-2345-6789-012345fghijk
 // last-edited: 2026-07-09
 
@@ -116,7 +116,7 @@ pub enum Commands {
 
         #[arg(
             long,
-            help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook); remote installs only"
+            help = "POST per-phase status to this webhook URL (e.g. http://172.16.2.30:25000/api/webhook)"
         )]
         report_url: Option<String>,
     },
