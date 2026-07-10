@@ -766,15 +766,40 @@ impl<'a> SystemConfigurator<'a> {
         let is_md = config.disk_device.starts_with("/dev/md");
         // Detect the boot NIC's kernel driver (for Tang network unlock) from the
         // live env — the config interface name matches (predictable naming).
-        let nic_driver = self
-            .runner
-            .execute_with_output(&format!(
-                "basename \"$(readlink -f /sys/class/net/{}/device/driver 2>/dev/null)\" 2>/dev/null || true",
-                config.network_interface
-            ))
-            .await
-            .unwrap_or_default();
-        let nic_driver = nic_driver.trim();
+        // SECURITY: network_interface may come from a server-fetched config in the
+        // USB/netboot flow, so validate it as a real iface name (no shell
+        // metacharacters) before interpolating, and validate the returned driver
+        // before it lands in the dracut conf. Otherwise skip forcing a driver.
+        let iface = config.network_interface.as_str();
+        let iface_ok = !iface.is_empty()
+            && iface.len() <= 15
+            && iface
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'));
+        let nic_driver = if iface_ok {
+            let drv = self
+                .runner
+                .execute_with_output(&format!(
+                    "basename \"$(readlink -f /sys/class/net/{}/device/driver 2>/dev/null)\" 2>/dev/null || true",
+                    iface
+                ))
+                .await
+                .unwrap_or_default();
+            let drv = drv.trim().to_string();
+            if !drv.is_empty()
+                && drv
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                drv
+            } else {
+                String::new()
+            }
+        } else {
+            warn!("network_interface '{}' failed validation; not forcing a NIC driver into initramfs", iface);
+            String::new()
+        };
+        let nic_driver = nic_driver.as_str();
         if !config.tang_servers.is_empty() {
             info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
         }
