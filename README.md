@@ -1,8 +1,9 @@
 # Ubuntu AutoInstall Agent
 
 <!-- file: README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 123e4567-e89b-12d3-a456-426614174000 -->
+<!-- last-edited: 2026-07-10 -->
 
 A robust, automated Ubuntu server deployment tool written in Rust that creates golden images and deploys them with LUKS full disk encryption.
 
@@ -15,6 +16,10 @@ A robust, automated Ubuntu server deployment tool written in Rust that creates g
 - 🌐 **Flexible Deployment**: SSH and netboot/PXE deployment methods
 - ⚡ **Fast & Reliable**: 10x faster than shell-based approaches
 - 🛡️ **Memory Safe**: Written in Rust for maximum safety and performance
+
+## Architecture: Path A vs Path B
+
+The agent provides two installer code paths: **Path A** (`src/autoinstall/`) renders cloud-init/subiquity user-data and verifies deployments; **Path B** (`src/network/ssh_installer/`) is the proven 7-phase direct ZFS-on-LUKS installer that executes over SSH or locally. Use Path A for rendering and placing netboot seeds; use Path B for new ZFS-on-LUKS machine provisioning. See [docs/architecture-path-split.md](docs/architecture-path-split.md) for full details, including guardrails for future development.
 
 ## Quick Start
 
