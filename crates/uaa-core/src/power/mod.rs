@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/power/mod.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 76330c27-93dd-46ab-8265-8b8e9b6a4dc1
 // last-edited: 2026-07-10
 
@@ -14,9 +14,11 @@
 //! that mistake structurally impossible (no `std::process::Command("ipmitool")`
 //! appears anywhere in this crate).
 //!
-//! AMD DASH (Lenovo M715q), Intel AMT, and Wake-on-LAN are representable as
-//! `PowerMechanism` variants but are UNIMPLEMENTED stubs — see
-//! `docs/agent-tasks/DEFERRED.md`.
+//! AMD DASH (Lenovo M715q) is implemented in `power::dash` (RP-02):
+//! `run_power_action` dispatches `AmdDash` hosts there ahead of the
+//! Ipmi-only `validate_ipmi_request` guard. Intel AMT and Wake-on-LAN remain
+//! representable as `PowerMechanism` variants but are UNIMPLEMENTED stubs —
+//! see `docs/agent-tasks/DEFERRED.md`.
 
 pub mod amt_wol;
 pub mod dash;
@@ -181,12 +183,23 @@ pub fn validate_ipmi_request(
 /// `validate_ipmi_request` returns before any `executor` call, so the mock
 /// records zero commands on unknown-host, stub-mechanism, and missing-password
 /// paths.
+///
+/// AmdDash hosts are special-cased here, ahead of the Ipmi-only
+/// `validate_ipmi_request` guard, and handed off to `dash::run_dash_action`
+/// (RP-02). `validate_ipmi_request`'s own `AmdDash` arm is intentionally left
+/// alone: its `Result<(&'static str, &'static str)>` return shape is
+/// Ipmi-specific and shared verbatim with the still-unimplemented IntelAmt/
+/// WakeOnLan arms (RP-03).
 pub async fn run_power_action(
     executor: &mut dyn CommandExecutor,
     hostname: &str,
     action: PowerAction,
     ipmi_password: Option<&str>,
 ) -> Result<String> {
+    if let Some(PowerMechanism::AmdDash) = lookup_host(hostname) {
+        return dash::run_dash_action(executor, hostname, ipmi_password, action).await;
+    }
+
     let (bmc_host, username) = validate_ipmi_request(hostname, ipmi_password)?;
     // Non-empty by construction of validate_ipmi_request's Ipmi arm.
     let password = ipmi_password.expect("validate_ipmi_request guarantees Some(non-empty)");
@@ -331,12 +344,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_run_power_action_dash_stub() {
+    async fn test_run_power_action_dash_dispatches_to_dash_module() {
+        // AmdDash hosts (len-serv-00N) no longer hit the stub error — they
+        // are dispatched to `dash::run_dash_action` (RP-02). A missing
+        // password still fails closed, but the error now names the DASH
+        // credential mechanism, not DEFERRED.md, and comes from the dash
+        // module's own guard, not `stub_error`.
         let mut mock = MockExecutor::new(&[]);
-        let result =
-            run_power_action(&mut mock, "len-serv-001", PowerAction::On, Some("test-secret")).await;
-        let err = result.expect_err("AmdDash stub must fail");
-        assert!(err.to_string().contains("docs/agent-tasks/DEFERRED.md"));
+        let result = run_power_action(&mut mock, "len-serv-001", PowerAction::On, None).await;
+        let err = result.expect_err("missing DASH password must fail");
+        assert!(err.to_string().contains("UAA_DASH_PASSWORD"));
+        assert!(!err.to_string().contains("docs/agent-tasks/DEFERRED.md"));
         assert_eq!(mock.recorded.len(), 0);
     }
 
