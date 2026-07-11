@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/machine_plane/mod.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: eee7b5c0-24d0-4406-b5f6-68d5bac52cae
 // last-edited: 2026-07-10
 
@@ -29,8 +29,8 @@ pub fn router() -> Router {
             "/healthz",
             get(|| async { Json(json!({ "service": "uaa-control", "listener": "machine-plane" })) }),
         )
-    // IP-01: .merge(seeds::router()) [reverted — handler trait bound; re-dispatch]
+        .merge(seeds::router()) // IP-01
         .merge(lifecycle::router()) // IP-02
-    // IP-03: .merge(inventory::router())
+        .merge(inventory::router()) // IP-03
     // IP-04: .merge(dashboard::router())
 }

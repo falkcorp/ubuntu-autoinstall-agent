@@ -1,5 +1,5 @@
 # file: crates/uaa-control/Cargo.toml
-# version: 1.1.0
+# version: 1.1.1
 # guid: 1e1a4386-a459-4a97-8baf-c942283b3107
 # last-edited: 2026-07-10
 
@@ -54,10 +54,13 @@ rand = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+# Wave-4 remainder: PKI CA/EnrollService (PK-01), cert-gen tempdir (IP-03)
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser = { workspace = true, features = ["verify"] }
+tempfile = { workspace = true }
 # Sibling crates
 uaa-proto = { path = "../uaa-proto" }
 uaa-core = { path = "../uaa-core" }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio-test = { workspace = true }

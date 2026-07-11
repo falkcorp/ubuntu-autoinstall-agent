@@ -112,7 +112,15 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let operator = bind(config.operator_port).await?;
 
     let machine = tokio::spawn(async move {
-        axum::serve(machine_listener, crate::machine_plane::router()).await
+        // ConnectInfo::<SocketAddr> is required: the /autoinstall/* seed handlers
+        // (IP-01) read the client's TCP peer address for `ip neigh` MAC resolution
+        // (Python parity). Without into_make_service_with_connect_info they 500.
+        axum::serve(
+            machine_listener,
+            crate::machine_plane::router()
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
     });
     let grpc = tokio::spawn(async move { axum::serve(grpc, health_router("grpc")).await });
     let enroll = tokio::spawn(async move { axum::serve(enroll, health_router("enroll")).await });
