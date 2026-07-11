@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/make-ssh-ready-iso.sh
-# version: 1.2.0
+# version: 1.3.0
 # guid: 5d2b7f18-9c04-4a6e-8b31-2f7a0c9d6e42
-# last-edited: 2026-07-09
+# last-edited: 2026-07-11
 #
 # Re-master a stock Ubuntu Server ISO into an auto-SSH-ready installer USB.
 #
@@ -97,8 +97,11 @@ sed_inplace() {
 patch_cfg() {
   local f="$1"
   if grep -q "ds=nocloud" "$f"; then echo "  ($f already patched)"; return; fi
-  # Insert right after the vmlinuz path on each linux/linuxefi line.
-  sed_inplace 's#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\1 ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0#' "$f"
+  # Insert right after the vmlinuz path on each linux/linuxefi line. Keeps the
+  # local VGA console (tty0) alive but adds ttyS0 so IPMI SOL can see boot/
+  # cloud-init progress (matches scripts/create-autoinstall-iso.sh's netboot
+  # path) — without this, SOL shows nothing even on a live, reachable host.
+  sed_inplace 's#(linux(efi)?[[:space:]]+/casper/vmlinuz)#\1 ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0 console=tty0 console=ttyS0,115200n8#' "$f"
   echo "  patched $f"
 }
 # Opt-in: bake the uaa.autoinstall token (+ optional uaa.on_done=) so the seed's
