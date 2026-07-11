@@ -1,7 +1,7 @@
 <!-- file: CLAUDE.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: b3c4d5e6-f7a8-4b9c-0d1e-2f3a4b5c6d7e -->
-<!-- last-edited: 2026-07-10 -->
+<!-- last-edited: 2026-07-11 -->
 
 # ubuntu-autoinstall-agent
 
@@ -18,19 +18,17 @@ Key files:
 
 ## Documentation Conventions
 
-**Executive summaries** (org-wide pattern, originated in `audiobook-organizer`):
-`docs/status/YYYY-MM-DD-<slug>-executive-summary.md`. Plain-language,
-non-technical/stakeholder-facing prose — explain what a bug/feature was, why
-it mattered, and the fix in terms a non-engineer can follow; no unexplained
-jargon. Structure: 4-line header; `# Executive Summary: <Title>`;
-`**Shipped:**` line with PR link(s)/range + count; `**Related doc:**` link to
-the technical/operational companion doc (kept separate — e.g.
-`docs/constellation/`, `docs/specs/`, `docs/plans/`); one-paragraph scope
-intro; `## Executive Summary` as bullets, one per theme (bold lead phrase,
-plain explanation, why it matters, PR numbers as evidence); for
-security-relevant or data-loss-risk work, add a `## Highest-risk items`
-callout naming those items explicitly in plain language.
+Org-wide pattern, originated in `audiobook-organizer` and adopted here in
+full:
 
-Keep the plain-language executive summary and the technical/operational
-status doc as **separate files**, cross-linked — never merge engineering
-detail into the executive summary or vice versa.
+- **Executive summaries** — `docs/executive-summaries/`, convention in
+  [`docs/process/executive-summaries.md`](docs/process/executive-summaries.md).
+  Polished, stakeholder-facing narrative; plain language, no jargon, no
+  file paths in the body.
+- **Status reports** — `docs/status/`, convention in
+  [`docs/process/status-reports.md`](docs/process/status-reports.md).
+  Terse, internal/operational; file:line references and jargon are fine.
+
+The two are not mutually exclusive — a large execution wave usually
+produces both, cross-linked. Read both convention docs before writing
+either; do not improvise the structure.
