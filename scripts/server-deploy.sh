@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/server-deploy.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 9e2f4a71-0b6d-4c8e-9a3f-1d5c7e8b2f60
 # last-edited: 2026-07-11
 #
@@ -30,12 +30,14 @@
 #                                            # to re-run at will.
 #   ./scripts/server-deploy.sh --rollback    # reverse --cutover
 #
-# Why uaa-control.service is safe to restart before --cutover: main.rs binds :25000
-# directly (dev fallback) whenever it is not socket-activated, so before --cutover
-# (uaa-control.socket not enabled) it will fail to bind :25000 (already held by the
-# Python autoinstall-agent.service), systemd's burst limiter parks it in `failed`
-# after a few rapid retries, and the Python service is never touched. Annoying to see
-# in `--status`, harmless. See crates/uaa-control/src/listeners.rs for the bind logic.
+# Why the default run does not start uaa-control.service before --cutover:
+# uaa-control.service has `Requires=uaa-control.socket` (crates/uaa-control/systemd),
+# so starting the service always pulls in the socket first. Pre-cutover the socket's
+# :25000 is already held by the Python autoinstall-agent.service, so the socket job
+# fails outright — not a crash-loop, systemd just refuses the dependency and the
+# Python service is never touched. The default run detects this (socket inactive) and
+# leaves uaa-control stopped after staging the binary; nothing to fix, that's expected
+# until you run --cutover. See crates/uaa-control/src/listeners.rs for the bind logic.
 
 set -euo pipefail
 
@@ -127,24 +129,29 @@ stage() {
 }
 
 restart_control() {
-    log "restarting uaa-control.service"
-    sudo systemctl restart uaa-control.service
-    sleep 1
-    sudo systemctl status uaa-control.service --no-pager -l || true
+    if systemctl is-active --quiet uaa-control.socket; then
+        log "restarting uaa-control.service (socket already active — post-cutover)"
+        sudo systemctl restart uaa-control.service
+        sleep 1
+        systemctl status uaa-control.service || true
+    else
+        log "uaa-control.socket not active yet (pre-cutover) — binary staged, service left stopped"
+        log "run './scripts/server-deploy.sh --cutover' when ready to hand :25000 to uaa-control"
+    fi
 }
 
 status() {
     echo "--- autoinstall-agent.service (legacy Python, owns :25000 until --cutover) ---"
-    sudo systemctl status autoinstall-agent.service --no-pager -l || true
+    systemctl status autoinstall-agent.service || true
     echo
     echo "--- uaa-control.service ---"
-    sudo systemctl status uaa-control.service --no-pager -l || true
+    systemctl status uaa-control.service || true
     echo
     echo "--- uaa-control.socket ---"
-    sudo systemctl status uaa-control.socket --no-pager -l || true
+    systemctl status uaa-control.socket || true
     echo
     echo "--- health checks ---"
-    for port in 7443 7444 8443; do
+    for port in 25000 7443 7444 8443; do
         curl -s -m 2 "http://127.0.0.1:${port}/healthz" && echo || echo "port ${port}: no response"
     done
 }
@@ -152,10 +159,11 @@ status() {
 cutover() {
     log "cutover: stopping Python autoinstall-agent.service, handing :25000 to uaa-control.socket"
     sudo systemctl stop autoinstall-agent.service
-    sudo systemctl enable --now uaa-control.socket
+    sudo systemctl enable uaa-control.socket
+    sudo systemctl start uaa-control.socket
     sudo systemctl restart uaa-control.service
     sleep 1
-    if curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:25000/ | grep -qE '^[23]'; then
+    if curl -s -m 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:25000/healthz | grep -qE '^[23]'; then
         log "cutover OK: :25000 answering via uaa-control"
     else
         log "cutover health check FAILED — rolling back to Python"
@@ -166,7 +174,8 @@ cutover() {
 
 rollback() {
     log "rollback: stopping uaa-control.socket, restarting Python autoinstall-agent.service"
-    sudo systemctl disable --now uaa-control.socket 2>/dev/null || sudo systemctl stop uaa-control.socket
+    sudo systemctl stop uaa-control.socket 2>/dev/null || true
+    sudo systemctl disable uaa-control.socket 2>/dev/null || true
     sudo systemctl start autoinstall-agent.service
 }
 
