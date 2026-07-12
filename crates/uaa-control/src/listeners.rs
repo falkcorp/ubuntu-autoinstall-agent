@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/listeners.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 4275dc4f-c0cb-479b-9f5c-5a444ed312f7
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Listener wiring + systemd socket activation (spec Decision 24).
 //!
@@ -10,11 +10,12 @@
 //!     socket activation so a self-update restart never drops the listening socket;
 //!   * `:7443` — gRPC mTLS (services + enrolled agents);
 //!   * `:7444` — enrollment JSON (install-CA-pinned);
-//!   * `:8443` — operator JSON+OpenAPI + SPA.
+//!   * `:8443` — operator JSON API (first CT-07 slice, see `operator::handlers`'s
+//!     module doc for what's real vs. stubbed) + SPA hosting (`operator::web_ui`).
 //!
-//! The three TLS planes land here as bind-and-health scaffolds: each serves only
-//! `GET /healthz`; routes and TLS termination arrive with the follower tasks
-//! (PK-03/CT-07). Ports bind plain for now (TLS is a runtime concern; tests bind :0).
+//! `:7443`/`:7444` remain bind-and-health scaffolds: each serves only `GET /healthz`;
+//! routes and TLS termination arrive with follower tasks (PK-03). `:8443` now serves
+//! its real router. Ports bind plain for now (TLS is a runtime concern; tests bind :0).
 
 use std::os::unix::io::RawFd;
 
@@ -124,8 +125,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     });
     let grpc = tokio::spawn(async move { axum::serve(grpc, health_router("grpc")).await });
     let enroll = tokio::spawn(async move { axum::serve(enroll, health_router("enroll")).await });
-    let operator =
-        tokio::spawn(async move { axum::serve(operator, health_router("operator")).await });
+    let operator = tokio::spawn(async move { axum::serve(operator, crate::operator::router()).await });
 
     // Any listener exiting is fatal; surface the first error.
     let (m, g, e, o) = tokio::try_join!(machine, grpc, enroll, operator)?;
