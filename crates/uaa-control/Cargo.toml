@@ -1,7 +1,7 @@
 # file: crates/uaa-control/Cargo.toml
-# version: 1.1.1
+# version: 1.2.0
 # guid: 1e1a4386-a459-4a97-8baf-c942283b3107
-# last-edited: 2026-07-10
+# last-edited: 2026-07-11
 
 [package]
 name = "uaa-control"
@@ -44,6 +44,7 @@ sha2 = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 # Wave-4 fillers: OAuth/RBAC (CT-03), audit chain (CT-04), parity endpoints (IP-01/02)
 reqwest = { workspace = true }

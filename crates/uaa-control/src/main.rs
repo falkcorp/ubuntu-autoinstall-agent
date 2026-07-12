@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/main.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 608d78f5-ac4c-43a5-b29f-e9008a300858
-// last-edited: 2026-07-10
+// last-edited: 2026-07-11
 
 //! Thin entrypoint for the `uaa-control` daemon. All logic lives in `uaa_control`
 //! (the library) so `cargo test --lib --offline` exercises it. `serve` is the default
@@ -47,9 +47,21 @@ fn not_yet_implemented(cmd: &str, owner: &str) -> ! {
     std::process::exit(1);
 }
 
-/// Minimal tracing init without pulling extra deps into the workspace table.
+/// Install a real tracing subscriber writing to stdout (captured by the
+/// systemd journal under `journalctl -u uaa-control`). Without this call,
+/// every `tracing::info!`/`warn!`/etc. in the whole binary is a silent no-op
+/// — including the machine-plane AUTOINSTALL/UAA-CONFIG DENIED/served logs
+/// this daemon's only debug signal depends on (surfaced 2026-07-11: a stalled
+/// hardware autoinstall attempt left zero log evidence, indistinguishable
+/// from "request never arrived").
+///
+/// Level defaults to `info` (so those logs show up out of the box) and is
+/// overridable via `RUST_LOG` (e.g. `RUST_LOG=uaa_control=debug`).
 fn tracing_subscriber_init() {
-    // uaa-core already depends on tracing-subscriber; uaa-control keeps the binary
-    // thin and lets tracing default to a no-op subscriber if none is installed. A
-    // richer subscriber is a runtime/deploy concern (Bucket-3), not scaffold code.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 }
