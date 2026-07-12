@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/seeds.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 448eead2-d3b6-4765-8e21-2a7421d3b55e
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Machine-plane seed placement + boot-target intent (:25000 parity).
 //!
@@ -39,6 +39,10 @@ use axum::{
 
 use uaa_core::network::{CommandExecutor, LocalClient};
 
+use crate::db::{store::StatePaths, BootTarget, MachineRow, MachineStatus};
+
+use super::lifecycle::{self, normalize_mac, Registry};
+
 /// Webroot base (mirrors Python's `CLOUD_INIT_BASE`, `:32`). Only the
 /// production [`default_state`] reads this constant; tests always inject a
 /// tempdir webroot via [`AppState`] directly.
@@ -69,14 +73,18 @@ pub fn mac_to_hex(mac: &str) -> String {
 /// Returns:
 /// - `None` — no MAC resolved (empty `client_ip`, executor error, or no
 ///   `lladdr` match).
-/// - `Some((hexmac, None))` — MAC resolved but `<webroot>/<hexmac>` is not a
-///   directory.
-/// - `Some((hexmac, Some(dir)))` — MAC resolved and the directory exists.
+/// - `Some((mac, hexmac, None))` — MAC resolved but `<webroot>/<hexmac>` is
+///   not a directory.
+/// - `Some((mac, hexmac, Some(dir)))` — MAC resolved and the directory exists.
+///
+/// The colon-form `mac` (constellation addition, absent from the Python
+/// return shape) lets callers record every resolved MAC into the machine
+/// registry regardless of directory outcome — see [`record_seen_mac`].
 pub async fn resolve_cloud_init_dir(
     executor: &mut (dyn CommandExecutor + Send),
     webroot: &Path,
     client_ip: &str,
-) -> Option<(String, Option<PathBuf>)> {
+) -> Option<(String, String, Option<PathBuf>)> {
     if client_ip.is_empty() {
         return None;
     }
@@ -87,7 +95,7 @@ pub async fn resolve_cloud_init_dir(
     let mac = mac_from_neighbor_output(&out)?;
     let hexmac = mac_to_hex(&mac);
     let dir = webroot.join(&hexmac);
-    Some((hexmac, dir.is_dir().then_some(dir)))
+    Some((mac, hexmac, dir.is_dir().then_some(dir)))
 }
 
 // ── Router state ────────────────────────────────────────────────────────
@@ -97,23 +105,31 @@ pub async fn resolve_cloud_init_dir(
 /// concurrent requests — the factory sidesteps that without a lock.
 type ExecutorFactory = Arc<dyn Fn() -> Box<dyn CommandExecutor + Send> + Send + Sync>;
 
-/// Router state: webroot base + the executor factory. Tests substitute both
-/// fields — a tempdir webroot and a factory returning a recording
-/// `MockExecutor` clone — so handler logic never touches a live shell or
-/// CockroachDB.
+/// Router state: webroot base + the executor factory + the machine registry.
+/// Tests substitute all three — a tempdir webroot, a factory returning a
+/// recording `MockExecutor` clone, and an in-memory mock registry — so
+/// handler logic never touches a live shell, CockroachDB, or the real
+/// `/var/lib/uaa` snapshot.
 #[derive(Clone)]
 struct AppState {
     webroot: Arc<PathBuf>,
     executor_factory: ExecutorFactory,
+    registry: Arc<dyn Registry>,
 }
 
 /// Production state: real webroot constant + a fresh [`LocalClient`] (already
 /// `CommandExecutor`-typed, `crates/uaa-core/src/network/executor.rs`) per
-/// request — never a subprocess call written in this file.
+/// request — never a subprocess call written in this file — plus the SAME
+/// on-disk snapshot `machine_plane::lifecycle` reads/writes, so a MAC seen
+/// here is immediately visible to `/api/register`, `/api/approve`, and the
+/// dashboard.
 fn default_state() -> AppState {
     AppState {
         webroot: Arc::new(PathBuf::from(CLOUD_INIT_BASE)),
-        executor_factory: Arc::new(|| Box::new(LocalClient::new()) as Box<dyn CommandExecutor + Send>),
+        executor_factory: Arc::new(|| {
+            Box::new(LocalClient::new()) as Box<dyn CommandExecutor + Send>
+        }),
+        registry: Arc::new(lifecycle::FileRegistry::new(StatePaths::default())),
     }
 }
 
@@ -128,7 +144,10 @@ fn text_200(payload: Vec<u8>) -> Response {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
             (header::CONTENT_LENGTH, len.to_string()),
         ],
         payload,
@@ -142,6 +161,12 @@ fn text_200(payload: Vec<u8>) -> Response {
 /// (no neighbor entry / no directory registered) as `Err`. Shared by all
 /// five handlers so the DENIED-reason logging (client_ip + hexmac only,
 /// never file contents) lives in one place.
+///
+/// Constellation addition: whenever a MAC resolves at all — including the
+/// "no cloud-init dir registered" 404 — it is recorded into the machine
+/// registry via [`record_seen_mac`] before this function returns. Only the
+/// "no ARP/NDP neighbor entry" case skips recording: without a resolved MAC
+/// there is nothing to key a row on.
 async fn resolve_or_deny(
     state: &AppState,
     client_ip: &str,
@@ -153,12 +178,68 @@ async fn resolve_or_deny(
             tracing::info!(%endpoint, %client_ip, "AUTOINSTALL DENIED - no ARP/NDP neighbor entry");
             Err(empty_404())
         }
-        Some((hexmac, None)) => {
+        Some((mac, hexmac, None)) => {
+            record_seen_mac(state.registry.as_ref(), &mac, client_ip).await;
             tracing::info!(%endpoint, %client_ip, %hexmac, "AUTOINSTALL DENIED - no cloud-init dir registered");
             Err(empty_404())
         }
-        Some((hexmac, Some(dir))) => Ok((hexmac, dir)),
+        Some((mac, hexmac, Some(dir))) => {
+            record_seen_mac(state.registry.as_ref(), &mac, client_ip).await;
+            Ok((hexmac, dir))
+        }
     }
+}
+
+/// Upsert a durable row for `mac` into the shared registry — the SAME
+/// on-disk snapshot `machine_plane::lifecycle` reads/writes — so every MAC
+/// that contacts the machine plane is dashboard-visible, not just approved
+/// machines (spec constellation addition, 2026-07-11 design ask).
+///
+/// An already-known MAC (registered via `/api/register`, or seen before) has
+/// only `last_seen`/`last_ip`/`updated_at` refreshed — its `status` and
+/// `hostname` are never touched here, so an `Approved` or `Pending` row never
+/// regresses. An unknown MAC gets a fresh [`MachineStatus::Seen`] row: distinct
+/// from `Pending` (which means a human ran the registration flow), it marks
+/// unsolicited contact an operator has never been told about. `/api/approve`
+/// sets `Approved` on any existing row unconditionally, so a `Seen` machine is
+/// approvable straight from the dashboard with no separate registration step.
+async fn record_seen_mac(registry: &dyn Registry, mac: &str, client_ip: &str) {
+    let mac = normalize_mac(mac);
+    let now = now_epoch_string();
+    let row = match registry.get_machine(&mac).await {
+        Some(mut existing) => {
+            existing.last_seen = Some(now.clone());
+            existing.last_ip = Some(client_ip.to_string());
+            existing.updated_at = Some(now);
+            existing
+        }
+        None => MachineRow {
+            mac: mac.clone(),
+            hostname: String::new(),
+            ip: None,
+            r#type: String::new(),
+            status: MachineStatus::Seen,
+            boot_target: BootTarget::LocalDisk,
+            tpm_ek: None,
+            registered_at: None,
+            approved_at: None,
+            last_seen: Some(now.clone()),
+            last_ip: Some(client_ip.to_string()),
+            installed_at: None,
+            last_install_status: None,
+            updated_at: Some(now),
+        },
+    };
+    registry.upsert_machine(row).await;
+}
+
+fn now_epoch_string() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .to_string()
 }
 
 /// Serve one of the four cloud-init seed files. A missing file under an
@@ -263,6 +344,7 @@ pub fn router() -> Router {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use uaa_core::{AutoInstallError, Result as CoreResult};
 
     /// Recording mock executor: returns pre-loaded output strings keyed by
@@ -349,10 +431,55 @@ mod tests {
         SocketAddr::from(([172, 16, 3, 92], 54321))
     }
 
+    /// In-memory [`Registry`] mock — zero filesystem, zero CRDB. Only
+    /// `get_machine`/`upsert_machine` are exercised by seeds.rs handlers; the
+    /// other three trait methods are unreachable stubs here.
+    #[derive(Default)]
+    struct MockRegistry {
+        machines: Mutex<HashMap<String, MachineRow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Registry for MockRegistry {
+        async fn get_machine(&self, mac: &str) -> Option<MachineRow> {
+            self.machines.lock().unwrap().get(mac).cloned()
+        }
+        async fn upsert_machine(&self, machine: MachineRow) {
+            self.machines
+                .lock()
+                .unwrap()
+                .insert(machine.mac.clone(), machine);
+        }
+        async fn find_mac_by_hostname(&self, _hostname: &str) -> Option<String> {
+            None
+        }
+        async fn append_event(&self, _payload: serde_json::Value) {}
+        async fn record_install_event(
+            &self,
+            _mac: &str,
+            _name: &str,
+            _status: &str,
+            _finished_at: &str,
+        ) -> uuid::Uuid {
+            uuid::Uuid::new_v4()
+        }
+    }
+
     fn test_state_with(webroot: PathBuf, mock: MockExecutor) -> AppState {
+        test_state_with_registry(webroot, mock, Arc::new(MockRegistry::default()))
+    }
+
+    fn test_state_with_registry(
+        webroot: PathBuf,
+        mock: MockExecutor,
+        registry: Arc<dyn Registry>,
+    ) -> AppState {
         AppState {
             webroot: Arc::new(webroot),
-            executor_factory: Arc::new(move || Box::new(mock.clone()) as Box<dyn CommandExecutor + Send>),
+            executor_factory: Arc::new(move || {
+                Box::new(mock.clone()) as Box<dyn CommandExecutor + Send>
+            }),
+            registry,
         }
     }
 
@@ -423,7 +550,11 @@ mod tests {
         let resp = handle_user_data(State(state), ConnectInfo(client_addr())).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "text/plain; charset=utf-8"
         );
         let payload = body_bytes(resp).await;
@@ -449,13 +580,20 @@ mod tests {
         std::fs::create_dir_all(&hex_dir).unwrap();
         std::fs::write(hex_dir.join("user-data"), b"#cloud-config\nhostname: foo\n").unwrap();
         // Placeholder only -- never a real secret in this repo.
-        std::fs::write(hex_dir.join("uaa.yaml"), b"disk_device: REPLACE_AT_PLACE_TIME\n").unwrap();
+        std::fs::write(
+            hex_dir.join("uaa.yaml"),
+            b"disk_device: REPLACE_AT_PLACE_TIME\n",
+        )
+        .unwrap();
         let mock = MockExecutor::new(&[(neigh_cmd().as_str(), REACHABLE)]);
         let state = test_state_with(dir.path().to_path_buf(), mock);
 
         let resp = handle_user_data(State(state.clone()), ConnectInfo(client_addr())).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_bytes(resp).await, b"#cloud-config\nhostname: foo\n".to_vec());
+        assert_eq!(
+            body_bytes(resp).await,
+            b"#cloud-config\nhostname: foo\n".to_vec()
+        );
 
         let resp = handle_uaa_config(State(state), ConnectInfo(client_addr())).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -484,5 +622,113 @@ mod tests {
         // above (an unmatched neighbor command returns an empty response,
         // which also has no `lladdr` match).
         assert!(mac_from_neighbor_output("").is_none());
+    }
+
+    // ── MAC recording (constellation addition) ───────────────────────────
+
+    const MAC: &str = "6c:4b:90:bc:39:b3";
+
+    #[tokio::test]
+    async fn test_seen_mac_recorded_even_without_hexmac_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // MAC resolves via ARP, but no hexmac dir was ever placed -> 404.
+        let mock = MockExecutor::new(&[(neigh_cmd().as_str(), REACHABLE)]);
+        let registry = Arc::new(MockRegistry::default());
+        let state = test_state_with_registry(dir.path().to_path_buf(), mock, registry.clone());
+
+        let resp = handle_user_data(State(state), ConnectInfo(client_addr())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let row = registry
+            .get_machine(MAC)
+            .await
+            .expect("MAC must be recorded even on 404");
+        assert_eq!(row.status, MachineStatus::Seen);
+        assert_eq!(row.last_ip.as_deref(), Some(CLIENT_IP));
+        assert!(row.last_seen.is_some());
+        assert_eq!(
+            row.hostname, "",
+            "unsolicited MAC has no known hostname yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seen_mac_recorded_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(HEXMAC)).unwrap();
+        let mock = MockExecutor::new(&[(neigh_cmd().as_str(), REACHABLE)]);
+        let registry = Arc::new(MockRegistry::default());
+        let state = test_state_with_registry(dir.path().to_path_buf(), mock, registry.clone());
+
+        let resp = handle_user_data(State(state), ConnectInfo(client_addr())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row = registry
+            .get_machine(MAC)
+            .await
+            .expect("MAC must be recorded on success too");
+        assert_eq!(row.status, MachineStatus::Seen);
+    }
+
+    #[tokio::test]
+    async fn test_no_neighbor_entry_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = MockExecutor::new(&[(neigh_cmd().as_str(), "172.16.3.92 dev eth0 FAILED")]);
+        let registry = Arc::new(MockRegistry::default());
+        let state = test_state_with_registry(dir.path().to_path_buf(), mock, registry.clone());
+
+        let _ = handle_user_data(State(state), ConnectInfo(client_addr())).await;
+
+        assert!(
+            registry.machines.lock().unwrap().is_empty(),
+            "no MAC resolved -> nothing to key a row on"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_existing_machine_status_preserved_on_seed_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(HEXMAC)).unwrap();
+        let mock = MockExecutor::new(&[(neigh_cmd().as_str(), REACHABLE)]);
+        let registry = Arc::new(MockRegistry::default());
+        registry
+            .upsert_machine(MachineRow {
+                mac: MAC.to_string(),
+                hostname: "len-serv-001".to_string(),
+                ip: Some("10.0.0.1".to_string()),
+                r#type: "lenovo".to_string(),
+                status: MachineStatus::Approved,
+                boot_target: crate::db::BootTarget::LocalDisk,
+                tpm_ek: None,
+                registered_at: Some("1000".to_string()),
+                approved_at: Some("1001".to_string()),
+                last_seen: Some("sentinel-old".to_string()),
+                last_ip: Some("10.0.0.1".to_string()),
+                installed_at: None,
+                last_install_status: None,
+                updated_at: None,
+            })
+            .await;
+        let state = test_state_with_registry(dir.path().to_path_buf(), mock, registry.clone());
+
+        let resp = handle_user_data(State(state), ConnectInfo(client_addr())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row = registry.get_machine(MAC).await.unwrap();
+        assert_eq!(
+            row.status,
+            MachineStatus::Approved,
+            "status must not regress"
+        );
+        assert_eq!(
+            row.hostname, "len-serv-001",
+            "hostname must not be clobbered"
+        );
+        assert_ne!(
+            row.last_seen.as_deref(),
+            Some("sentinel-old"),
+            "last_seen refreshed"
+        );
+        assert_eq!(row.last_ip.as_deref(), Some(CLIENT_IP));
     }
 }
