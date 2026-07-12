@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/mod.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: e43975b3-71de-4377-8ea5-ccd77fe75bc6
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Registry data-layer root for uaa-control.
 //!
@@ -65,10 +65,19 @@ impl From<BootTarget> for String {
     }
 }
 
-/// Machine approval lifecycle (`pending|approved|revoked`), Unknown-preserving.
+/// Machine approval lifecycle (`seen|pending|approved|revoked`), Unknown-preserving.
+///
+/// `Seen` (constellation addition, not present in the Python ground-truth) marks
+/// a MAC the machine plane observed on the wire (`/autoinstall/*`) that nobody
+/// ever explicitly registered via `/api/register` — distinct from `Pending`,
+/// which means a human ran the registration flow and is now awaiting approval.
+/// `/api/approve/<mac>` treats both identically (sets `Approved` unconditionally
+/// on any existing row), so a `Seen` machine is approvable straight from the
+/// dashboard with no registration step required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum MachineStatus {
+    Seen,
     Pending,
     Approved,
     Revoked,
@@ -78,6 +87,7 @@ pub enum MachineStatus {
 impl From<String> for MachineStatus {
     fn from(s: String) -> Self {
         match s.as_str() {
+            "seen" => Self::Seen,
             "pending" => Self::Pending,
             "approved" => Self::Approved,
             "revoked" => Self::Revoked,
@@ -89,6 +99,7 @@ impl From<String> for MachineStatus {
 impl From<MachineStatus> for String {
     fn from(s: MachineStatus) -> Self {
         match s {
+            MachineStatus::Seen => "seen".to_string(),
             MachineStatus::Pending => "pending".to_string(),
             MachineStatus::Approved => "approved".to_string(),
             MachineStatus::Revoked => "revoked".to_string(),
