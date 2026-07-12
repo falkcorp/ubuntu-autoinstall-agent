@@ -1,7 +1,91 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.1.0
+# version: 2.4.0
 # guid: todo0001-0000-0000-0000-000000000001
-# last-edited: 2026-07-10
+# last-edited: 2026-07-11
+
+## Record every MAC that contacts the machine plane, not just approved ones (raised 2026-07-11)
+
+- [ ] **Every MAC that hits `/autoinstall/*` (or any machine-plane endpoint)
+  should land in the `Registry` as a durable row — status `Pending` if
+  unrecognized — not just a log line.** Confirmed 2026-07-11 while debugging
+  unimatrixone: `crates/uaa-control/src/machine_plane/lifecycle.rs` already has
+  exactly the right model for this (`Registry` trait, `MachineStatus::Pending`,
+  `/api/register` + `/api/checkin`), but `crates/uaa-control/src/machine_plane/
+  seeds.rs` (the `/autoinstall/*` MAC-resolution path the USB/netboot
+  autoinstall flow actually uses) is a completely separate, simpler mechanism
+  — it only checks for a pre-placed `<hexmac>` directory on disk and now logs
+  an `AUTOINSTALL DENIED` line (fixed same day, `tracing_subscriber_init()`
+  was previously a no-op — see git log), but never touches the `Registry` at
+  all. Nothing in `installer-image/nocloud/uaa-usb-bootstrap.sh` or the
+  installer ever calls `/api/register` either, so an unknown/un-approved
+  machine attempting autoinstall is invisible outside ephemeral logs.
+  Goal (per user 2026-07-11): the operator should be able to see EVERY MAC
+  that has ever tried to reach the machine plane in the console — approved,
+  rejected, or (new state, not yet modeled) merely "seen, not yet approved" —
+  so they can match a MAC to physical hardware and approve/reject it there,
+  instead of needing SSH+journalctl access to even know a machine tried.
+  Scope: (1) have `seeds.rs`'s `resolve_or_deny` (or a shared machine-plane
+  layer above both `seeds.rs` and `lifecycle.rs`) upsert a `Pending` (or new
+  `Seen`/`Unregistered`) row into the `Registry` on every request, keyed by
+  MAC; (2) surface these in the Rust `/dashboard` once it's ported (see
+  "Port /dashboard from Python to Rust" below — `crates/uaa-control/src/
+  machine_plane/dashboard.rs` is currently a 9-line stub; the WORKING
+  implementation lives in `scripts/autoinstall-agent.py`'s `render_dashboard`
+  + `/dashboard` route, already on `main`, just in the retired Python service)
+  so pending/approved/rejected machines are distinguishable and actionable
+  from the UI.
+
+## Port /dashboard from Python to Rust uaa-control (raised 2026-07-11)
+
+- [ ] **`scripts/autoinstall-agent.py` already has a working `/dashboard`**
+  (registry table, last-20-events tail, placed-config inventory, agent-binary
+  presence — `render_dashboard()` + the `/dashboard` GET route, commit
+  `4900f93`, already on `main`) but that service is RETIRED
+  (`autoinstall-agent.service` is stopped post-cutover; `uaa-control` owns
+  `:25000` now). `crates/uaa-control/src/machine_plane/dashboard.rs` is a
+  9-line stub (`// STUB — Filled exclusively by install-plane IP-04`) —
+  never actually implemented in Rust, never wired into `listeners.rs`. This
+  is a PORT, not new design: reuse the Python version's shape (display-only
+  HTML, inline CSS, zero JS/forms, every value HTML-escaped) against the
+  Rust `Registry`/`db::store` data instead of the Python JSON-file registry.
+  Pair with the MAC-recording item above so pending machines actually show
+  up once this exists.
+
+## Boot-attempt diagnostics: unfiltered DHCP capture (raised 2026-07-11)
+
+- [ ] **Run a broad (unfiltered-by-MAC) DHCP packet capture on the server during
+  every hardware boot/install attempt, not just `dnsmasq`'s own journal.**
+  `journalctl -u dnsmasq` only shows what dnsmasq itself processed/logged — it
+  can silently miss packets dnsmasq never answers, requests on the wrong
+  broadcast domain, or malformed frames a strict DHCP server ignores.
+  `scripts/capture-uni-boot.sh` already exists but filters to `ether host
+  <mac> or icmp6`, which has the same blind spot if the host's traffic never
+  matches that filter (e.g. wrong/spoofed MAC, or the request never reaches
+  this NIC at all). Add (or extend the existing script with) a companion mode
+  that captures ALL DHCP traffic unfiltered (`port 67 or port 68`, no MAC
+  filter) so we can positively confirm "no DHCP traffic from ANY host arrived
+  here" vs. "traffic arrived but wasn't for the MAC we filtered on" — surfaced
+  2026-07-11 while diagnosing a stalled unimatrixone `--autoinstall` USB boot
+  where dnsmasq logs showed nothing and it wasn't obvious whether that meant
+  no PXE attempt occurred or the capture was just too narrow to see it.
+  Also note: `tcpdump` currently needs interactive `sudo -v` on the server
+  (no NOPASSWD entry, no `cap_net_raw` on the binary) — consider adding a
+  scoped NOPASSWD sudoers entry or `setcap cap_net_raw+eip` so this can be
+  driven non-interactively during an automated retry loop.
+
+## Secrets automation (future, raised 2026-07-11)
+
+- [ ] **uaa should auto-generate per-host secrets (luks_key/root_password/tpm2_pin)
+  instead of a human running `openssl rand` + hand-editing `~/uaa-secrets.yaml`.**
+  Store them encrypted at rest, not as a 0600 plaintext file on the server. Proposed
+  shape: generate a keypair/cert for the secrets store; encrypt each generated secret
+  to that cert; require **clevis Tang SSS quorum (2 of the 3 RPi Tang servers:
+  172.16.2.45/46/47) up** to decrypt, PLUS an operator PIN/password — mirrors the
+  same Tang-quorum trust model already used for LUKS unlock (`PLAN-zfs-luks-multikey.md`),
+  so there's one consistent "2-of-3 Tang + human factor" pattern for both disk unlock
+  and secrets-at-rest. Scope: design the cert/encrypt-to-cert mechanism, a `uaa
+  secrets generate <host>` command, and a `uaa secrets reveal <host>` (or decrypt-at-
+  place-time) path that never writes plaintext to disk longer than the placement step.
 
 ## 📐 constellation planning package (2026-07-10) — PLANNED, not built
 
