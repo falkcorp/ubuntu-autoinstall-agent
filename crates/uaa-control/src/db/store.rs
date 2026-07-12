@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/store.rs
-// version: 1.0.0
+// version: 1.0.1
 // guid: a471e102-2da9-4bf8-8531-1de7595fd24d
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Degraded-mode layer (spec Decision 4).
 //!
@@ -538,7 +538,10 @@ mod tests {
         assert_eq!(apply.applied, vec![e1.event_id, e3.event_id]);
 
         let q = fs::read_to_string(&paths.quarantine).unwrap();
-        assert!(q.contains("this is not valid json"), "corrupt line preserved");
+        assert!(
+            q.contains("this is not valid json"),
+            "corrupt line preserved"
+        );
     }
 
     #[tokio::test]

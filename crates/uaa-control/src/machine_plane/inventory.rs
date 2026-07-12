@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/inventory.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 76633c84-b337-47da-ab77-11cbf0f4b3b5
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Machine-plane operator/inventory endpoints (`:25000` parity, spec Decision 12).
 //!
@@ -534,7 +534,9 @@ fn default_state() -> AppState {
         ipxe_dir: Arc::new(PathBuf::from(IPXE_BOOT_DIR)),
         ca_crt: Arc::new(PathBuf::from(COCKROACH_CA_CRT)),
         ca_key: Arc::new(PathBuf::from(COCKROACH_CA_KEY)),
-        executor_factory: Arc::new(|| Box::new(LocalClient::new()) as Box<dyn CommandExecutor + Send>),
+        executor_factory: Arc::new(|| {
+            Box::new(LocalClient::new()) as Box<dyn CommandExecutor + Send>
+        }),
     }
 }
 
@@ -631,8 +633,19 @@ async fn handle_certs(
     }
 
     let mut executor = (state.executor_factory)();
-    match generate_certs(executor.as_mut(), &state.ca_crt, &state.ca_key, &hostname, &ip).await {
-        Err(err) => json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": err})),
+    match generate_certs(
+        executor.as_mut(),
+        &state.ca_crt,
+        &state.ca_key,
+        &hostname,
+        &ip,
+    )
+    .await
+    {
+        Err(err) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"ok": false, "error": err}),
+        ),
         Ok(certs) => {
             tracing::info!(%hostname, %ip, "CERTS issued");
             json_response(StatusCode::OK, json!({"ok": true, "certs": certs}))
@@ -665,19 +678,36 @@ async fn handle_flip(
     }
     let (ok, msg) = flip_ipxe(state.registry.as_ref(), &state.ipxe_dir, &hostname, &target).await;
     tracing::info!(%hostname, %target, %ok, %msg, "FLIP");
-    let code = if ok { StatusCode::OK } else { StatusCode::NOT_FOUND };
+    let code = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    };
     json_response(code, json!({"ok": ok, "message": msg}))
 }
 
 // ── /api/approve/<mac> (Python `:332-344`) ───────────────────────────────────
 
-async fn handle_approve(State(state): State<AppState>, AxumPath(mac_raw): AxumPath<String>) -> Response {
+async fn handle_approve(
+    State(state): State<AppState>,
+    AxumPath(mac_raw): AxumPath<String>,
+) -> Response {
     let mac = normalize_mac(&mac_raw);
     if state.registry.get_machine(&mac).await.is_none() {
-        return json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "MAC not registered"}));
+        return json_response(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "MAC not registered"}),
+        );
     }
-    match state.registry.approve_machine(&mac, now_epoch_string()).await {
-        None => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "MAC not registered"})),
+    match state
+        .registry
+        .approve_machine(&mac, now_epoch_string())
+        .await
+    {
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "MAC not registered"}),
+        ),
         Some(row) => {
             tracing::info!(%mac, hostname = %row.hostname, "APPROVED");
             json_response(
@@ -690,10 +720,16 @@ async fn handle_approve(State(state): State<AppState>, AxumPath(mac_raw): AxumPa
 
 // ── /api/deregister/<mac> (Python `:347-359`) ────────────────────────────────
 
-async fn handle_deregister(State(state): State<AppState>, AxumPath(mac_raw): AxumPath<String>) -> Response {
+async fn handle_deregister(
+    State(state): State<AppState>,
+    AxumPath(mac_raw): AxumPath<String>,
+) -> Response {
     let mac = normalize_mac(&mac_raw);
     match state.registry.delete_machine(&mac).await {
-        None => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "MAC not registered"})),
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "MAC not registered"}),
+        ),
         Some(row) => {
             tracing::info!(%mac, hostname = %row.hostname, "DEREGISTERED");
             json_response(
@@ -748,10 +784,16 @@ async fn handle_yubikeys_ssh_keys(State(state): State<AppState>) -> Response {
 
 // ── /api/yubikeys/approve/<fingerprint> (Python `:433-446`) ──────────────────
 
-async fn handle_yubikey_approve(State(state): State<AppState>, AxumPath(fp_raw): AxumPath<String>) -> Response {
+async fn handle_yubikey_approve(
+    State(state): State<AppState>,
+    AxumPath(fp_raw): AxumPath<String>,
+) -> Response {
     let fp = fp_raw.to_uppercase();
     match state.registry.approve_yubikey(&fp, now_epoch_i64()).await {
-        None => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "Fingerprint not registered"})),
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "Fingerprint not registered"}),
+        ),
         Some(entry) => {
             tracing::info!(fingerprint = %fp, comment = ?entry.comment, "YUBIKEY APPROVED");
             json_response(
@@ -770,10 +812,16 @@ async fn handle_yubikey_approve(State(state): State<AppState>, AxumPath(fp_raw):
 /// `{"ok":false,"error":"No GPG key..."}` this handler uses for a
 /// well-formed-but-unknown fingerprint.
 fn is_valid_fp_format(fp: &str) -> bool {
-    !fp.is_empty() && fp.chars().all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
+    !fp.is_empty()
+        && fp
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c))
 }
 
-async fn handle_yubikey_pubkey(State(state): State<AppState>, AxumPath(fp): AxumPath<String>) -> Response {
+async fn handle_yubikey_pubkey(
+    State(state): State<AppState>,
+    AxumPath(fp): AxumPath<String>,
+) -> Response {
     if !is_valid_fp_format(&fp) {
         return handle_not_found().await;
     }
@@ -788,7 +836,10 @@ async fn handle_yubikey_pubkey(State(state): State<AppState>, AxumPath(fp): Axum
         }
     };
     if entry.status != "approved" {
-        return json_response(StatusCode::FORBIDDEN, json!({"ok": false, "error": "YubiKey not approved"}));
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "error": "YubiKey not approved"}),
+        );
     }
     let body = entry.gpg_pubkey.unwrap_or_default();
     Response::builder()
@@ -800,13 +851,22 @@ async fn handle_yubikey_pubkey(State(state): State<AppState>, AxumPath(fp): Axum
 
 // ── /api/yubikeys/revoke/<fingerprint> (Python `:467-480`) ───────────────────
 
-async fn handle_yubikey_revoke(State(state): State<AppState>, AxumPath(fp_raw): AxumPath<String>) -> Response {
+async fn handle_yubikey_revoke(
+    State(state): State<AppState>,
+    AxumPath(fp_raw): AxumPath<String>,
+) -> Response {
     let fp = fp_raw.to_uppercase();
     match state.registry.revoke_yubikey(&fp, now_epoch_i64()).await {
-        None => json_response(StatusCode::NOT_FOUND, json!({"ok": false, "error": "Fingerprint not registered"})),
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "Fingerprint not registered"}),
+        ),
         Some(entry) => {
             tracing::info!(fingerprint = %fp, comment = ?entry.comment, "YUBIKEY REVOKED");
-            json_response(StatusCode::OK, json!({"ok": true, "message": format!("Revoked {fp}")}))
+            json_response(
+                StatusCode::OK,
+                json!({"ok": true, "message": format!("Revoked {fp}")}),
+            )
         }
     }
 }
@@ -817,7 +877,10 @@ async fn handle_tang_servers(State(state): State<AppState>) -> Response {
     let tang = state.registry.list_tang().await;
     let mut map = serde_json::Map::new();
     for row in tang {
-        map.insert(row.hostname.clone(), serde_json::to_value(&row).unwrap_or(Value::Null));
+        map.insert(
+            row.hostname.clone(),
+            serde_json::to_value(&row).unwrap_or(Value::Null),
+        );
     }
     json_response(StatusCode::OK, Value::Object(map))
 }
@@ -846,17 +909,32 @@ async fn handle_yubikey_register(State(state): State<AppState>, body: Bytes) -> 
         .to_uppercase()
         .replace(' ', "");
     if fp.is_empty() {
-        return json_response(StatusCode::BAD_REQUEST, json!({"ok": false, "error": "fingerprint required"}));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({"ok": false, "error": "fingerprint required"}),
+        );
     }
 
     let entry = YubikeyEntry {
         fingerprint: fp.clone(),
-        gpg_pubkey: data.get("gpg_pubkey").and_then(Value::as_str).map(str::to_string),
-        ssh_pubkey: data.get("ssh_pubkey").and_then(Value::as_str).map(str::to_string),
-        comment: data.get("comment").and_then(Value::as_str).map(str::to_string),
-        serial: data.get("serial").and_then(Value::as_str).map(str::to_string),
-        status: String::new(),  // overwritten by upsert_yubikey_register
-        registered_at: None,    // overwritten by upsert_yubikey_register
+        gpg_pubkey: data
+            .get("gpg_pubkey")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ssh_pubkey: data
+            .get("ssh_pubkey")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        comment: data
+            .get("comment")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        serial: data
+            .get("serial")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        status: String::new(), // overwritten by upsert_yubikey_register
+        registered_at: None,   // overwritten by upsert_yubikey_register
         approved_at: None,
         revoked_at: None,
     };
@@ -882,15 +960,27 @@ async fn handle_tang_checkin(State(state): State<AppState>, body: Bytes) -> Resp
         Err(r) => return r,
     };
 
-    let hostname = data.get("hostname").and_then(Value::as_str).unwrap_or("").to_string();
-    let ip = data.get("ip").and_then(Value::as_str).unwrap_or("").to_string();
+    let hostname = data
+        .get("hostname")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ip = data
+        .get("ip")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let tang_url = data
         .get("tang_url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("http://{ip}"));
     let adv_keys = data.get("adv_keys").cloned();
-    let adv_keys_count = adv_keys.as_ref().and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+    let adv_keys_count = adv_keys
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
 
     let row = TangServerRow {
         hostname: hostname.clone(),
@@ -1031,7 +1121,11 @@ mod tests {
         }
     }
 
-    fn test_state(registry: Arc<dyn Registry>, ipxe_dir: PathBuf, recorded: Arc<Mutex<Vec<String>>>) -> AppState {
+    fn test_state(
+        registry: Arc<dyn Registry>,
+        ipxe_dir: PathBuf,
+        recorded: Arc<Mutex<Vec<String>>>,
+    ) -> AppState {
         AppState {
             registry,
             ipxe_dir: Arc::new(ipxe_dir),
@@ -1089,7 +1183,9 @@ mod tests {
     }
 
     async fn body_json(resp: Response) -> Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -1134,13 +1230,19 @@ mod tests {
         let resp = handle_certs(
             State(state),
             AxumPath("ghost-host".to_string()),
-            Query(CertsQuery { ip: None, mac: None }),
+            Query(CertsQuery {
+                ip: None,
+                mac: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let v = body_json(resp).await;
         assert_eq!(v["ok"], false);
-        assert_eq!(v["error"], "Not registered. Run register-len-server.sh first.");
+        assert_eq!(
+            v["error"],
+            "Not registered. Run register-len-server.sh first."
+        );
     }
 
     #[tokio::test]
@@ -1157,7 +1259,10 @@ mod tests {
         let resp = handle_certs(
             State(state),
             AxumPath("pending-host".to_string()),
-            Query(CertsQuery { ip: None, mac: None }),
+            Query(CertsQuery {
+                ip: None,
+                mac: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1184,7 +1289,10 @@ mod tests {
         let resp = handle_certs(
             State(state),
             AxumPath("ok-host".to_string()),
-            Query(CertsQuery { ip: Some("10.0.0.9".to_string()), mac: None }),
+            Query(CertsQuery {
+                ip: Some("10.0.0.9".to_string()),
+                mac: None,
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1207,7 +1315,11 @@ mod tests {
     #[tokio::test]
     async fn test_flip_install_requires_approved() {
         let dir = tempdir().unwrap();
-        write_ipxe(dir.path(), "mac-aabbccddeeff.ipxe", "#!ipxe\nset menu-default pxe-install\nboot\n");
+        write_ipxe(
+            dir.path(),
+            "mac-aabbccddeeff.ipxe",
+            "#!ipxe\nset menu-default pxe-install\nboot\n",
+        );
         let registry = Arc::new(MockRegistry::default());
         registry.machines.lock().unwrap().insert(
             "aa:bb:cc:dd:ee:ff".to_string(),
@@ -1219,7 +1331,9 @@ mod tests {
         let resp = handle_flip(
             State(state.clone()),
             AxumPath("flip-host".to_string()),
-            Query(FlipQuery { target: Some("custom-autoinstall".to_string()) }),
+            Query(FlipQuery {
+                target: Some("custom-autoinstall".to_string()),
+            }),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1234,7 +1348,9 @@ mod tests {
         let resp2 = handle_flip(
             State(state),
             AxumPath("flip-host".to_string()),
-            Query(FlipQuery { target: Some("custom-autoinstall".to_string()) }),
+            Query(FlipQuery {
+                target: Some("custom-autoinstall".to_string()),
+            }),
         )
         .await;
         assert_eq!(resp2.status(), StatusCode::OK);
@@ -1247,7 +1363,11 @@ mod tests {
     #[tokio::test]
     async fn test_flip_local_disk_no_registration_needed() {
         let dir = tempdir().unwrap();
-        write_ipxe(dir.path(), "some-file.ipxe", "#!ipxe\nset hostname unreg-host\nset menu-default pxe-install\nboot\n");
+        write_ipxe(
+            dir.path(),
+            "some-file.ipxe",
+            "#!ipxe\nset hostname unreg-host\nset menu-default pxe-install\nboot\n",
+        );
         let registry = Arc::new(MockRegistry::default());
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let state = test_state(registry, dir.path().to_path_buf(), recorded);
@@ -1401,7 +1521,12 @@ mod tests {
 
     // ── yubikeys ──────────────────────────────────────────────────────
 
-    fn sample_yubikey(fp: &str, status: &str, gpg: Option<&str>, ssh: Option<&str>) -> YubikeyEntry {
+    fn sample_yubikey(
+        fp: &str,
+        status: &str,
+        gpg: Option<&str>,
+        ssh: Option<&str>,
+    ) -> YubikeyEntry {
         YubikeyEntry {
             fingerprint: fp.to_string(),
             gpg_pubkey: gpg.map(str::to_string),
@@ -1421,7 +1546,12 @@ mod tests {
         let registry = Arc::new(MockRegistry::default());
         registry.yubikeys.lock().unwrap().insert(
             "DEADBEEF".to_string(),
-            sample_yubikey("DEADBEEF", "approved", Some("-----BEGIN PGP PUBLIC KEY-----\nabc\n"), Some("ssh-ed25519 AAAA")),
+            sample_yubikey(
+                "DEADBEEF",
+                "approved",
+                Some("-----BEGIN PGP PUBLIC KEY-----\nabc\n"),
+                Some("ssh-ed25519 AAAA"),
+            ),
         );
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let state = test_state(registry, dir.path().to_path_buf(), recorded);
@@ -1430,22 +1560,31 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         let entry = &v["DEADBEEF"];
-        assert!(entry.get("gpg_pubkey").is_none(), "gpg_pubkey must be stripped from listing");
+        assert!(
+            entry.get("gpg_pubkey").is_none(),
+            "gpg_pubkey must be stripped from listing"
+        );
         assert_eq!(entry["status"], "approved");
 
         // /pubkey still returns the armored block for an approved fp.
-        let resp2 = handle_yubikey_pubkey(State(state.clone()), AxumPath("DEADBEEF".to_string())).await;
+        let resp2 =
+            handle_yubikey_pubkey(State(state.clone()), AxumPath("DEADBEEF".to_string())).await;
         assert_eq!(resp2.status(), StatusCode::OK);
         assert_eq!(
             resp2.headers().get("content-type").unwrap(),
             "application/pgp-keys"
         );
-        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("BEGIN PGP PUBLIC KEY"));
 
         // Unapproved fp -> 403 on /pubkey.
         let state2 = state.clone();
-        state2.registry.upsert_yubikey_register(sample_yubikey("ABCDEF01", "pending", Some("armored"), None)).await;
+        state2
+            .registry
+            .upsert_yubikey_register(sample_yubikey("ABCDEF01", "pending", Some("armored"), None))
+            .await;
         let resp3 = handle_yubikey_pubkey(State(state2), AxumPath("ABCDEF01".to_string())).await;
         assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
         let v3 = body_json(resp3).await;
@@ -1492,9 +1631,18 @@ mod tests {
         let registry = Arc::new(MockRegistry::default());
         {
             let mut yk = registry.yubikeys.lock().unwrap();
-            yk.insert("A".to_string(), sample_yubikey("A", "approved", None, Some("ssh-key-a")));
-            yk.insert("B".to_string(), sample_yubikey("B", "pending", None, Some("ssh-key-b")));
-            yk.insert("C".to_string(), sample_yubikey("C", "approved", None, Some("")));
+            yk.insert(
+                "A".to_string(),
+                sample_yubikey("A", "approved", None, Some("ssh-key-a")),
+            );
+            yk.insert(
+                "B".to_string(),
+                sample_yubikey("B", "pending", None, Some("ssh-key-b")),
+            );
+            yk.insert(
+                "C".to_string(),
+                sample_yubikey("C", "approved", None, Some("")),
+            );
         }
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let state = test_state(registry, dir.path().to_path_buf(), recorded);
@@ -1554,8 +1702,10 @@ mod tests {
         let state = test_state(registry, dir.path().to_path_buf(), recorded);
 
         let body = Bytes::from(
-            serde_json::to_vec(&json!({"hostname": "tang1", "ip": "10.0.0.5", "adv_keys": [1, 2, 3]}))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({"hostname": "tang1", "ip": "10.0.0.5", "adv_keys": [1, 2, 3]}),
+            )
+            .unwrap(),
         );
         let resp = handle_tang_checkin(State(state.clone()), body).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1577,7 +1727,8 @@ mod tests {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let state = test_state(registry, dir.path().to_path_buf(), recorded);
 
-        let resp = handle_yubikey_register(State(state.clone()), Bytes::from_static(b"not json")).await;
+        let resp =
+            handle_yubikey_register(State(state.clone()), Bytes::from_static(b"not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp2 = handle_tang_checkin(State(state), Bytes::from_static(b"{bad")).await;
@@ -1596,11 +1747,23 @@ mod tests {
     fn test_reject_flaglike_blocks_argv_injection() {
         // Flag-like identities must be refused before any cert command is built.
         for evil in ["--certs-dir=/evil", "-x", "a b", "a;b", "$(id)", "a/b"] {
-            assert!(reject_flaglike("hostname", evil).is_err(), "allowed: {evil:?}");
+            assert!(
+                reject_flaglike("hostname", evil).is_err(),
+                "allowed: {evil:?}"
+            );
         }
         // Anti-over-suppression: legitimate host/IP tokens still pass.
-        for good in ["len-serv-001", "len-serv-001.jf.local", "172.16.2.30", "fe80::1", "host_1"] {
-            assert!(reject_flaglike("hostname", good).is_ok(), "rejected: {good:?}");
+        for good in [
+            "len-serv-001",
+            "len-serv-001.jf.local",
+            "172.16.2.30",
+            "fe80::1",
+            "host_1",
+        ] {
+            assert!(
+                reject_flaglike("hostname", good).is_ok(),
+                "rejected: {good:?}"
+            );
         }
     }
 
@@ -1608,7 +1771,9 @@ mod tests {
     async fn test_generate_certs_rejects_flaglike_before_exec() {
         // A flag-like hostname records ZERO executor commands (fail-closed before shell-out).
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let mut exec = RecordingExecutor { recorded: recorded.clone() };
+        let mut exec = RecordingExecutor {
+            recorded: recorded.clone(),
+        };
         let ca = Path::new("/tmp/ca.crt");
         let err = generate_certs(&mut exec, ca, ca, "--certs-dir=/evil", "172.16.2.30")
             .await
