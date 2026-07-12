@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/lifecycle.rs
-// version: 1.1.2
+// version: 1.1.3
 // guid: f1273168-f053-480d-8baf-aa653555cb85
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Machine-plane checkin + install-event ingest (WAL append when degraded).
 //!
@@ -84,8 +84,10 @@ pub fn webhook_should_flip(data: &Value) -> bool {
 /// `re.sub(r"set menu-default \S+", f"set menu-default {target}", content)`.
 pub fn flip_ipxe_content(content: &str, target: &str) -> String {
     let re = regex::Regex::new(r"set menu-default \S+").expect("static regex is valid");
-    re.replace_all(content, |_: &regex::Captures| format!("set menu-default {target}"))
-        .into_owned()
+    re.replace_all(content, |_: &regex::Captures| {
+        format!("set menu-default {target}")
+    })
+    .into_owned()
 }
 
 // ── Registry seam (mockable; no direct DB/process access) ───────────────────
@@ -111,7 +113,13 @@ pub trait Registry: Send + Sync {
     /// schema). Mints a fresh `event_id` UUID AT INGEST — the WAL-replay dedup key
     /// (Decision 4a) — and returns it. Also updates the machine's `installed_at` +
     /// `last_install_status`.
-    async fn record_install_event(&self, mac: &str, name: &str, status: &str, finished_at: &str) -> uuid::Uuid;
+    async fn record_install_event(
+        &self,
+        mac: &str,
+        name: &str,
+        status: &str,
+        finished_at: &str,
+    ) -> uuid::Uuid;
 }
 
 /// Real [`Registry`]: backed by CT-01's local snapshot (`SnapshotDoc.machines`)
@@ -165,7 +173,13 @@ impl Registry for FileRegistry {
         }
     }
 
-    async fn record_install_event(&self, mac: &str, name: &str, status: &str, finished_at: &str) -> uuid::Uuid {
+    async fn record_install_event(
+        &self,
+        mac: &str,
+        name: &str,
+        status: &str,
+        finished_at: &str,
+    ) -> uuid::Uuid {
         let payload = json!({
             "mac": mac,
             "name": name,
@@ -310,7 +324,9 @@ async fn handle_register(State(state): State<AppState>, body: Bytes) -> Response
     let last_seen = existing.as_ref().and_then(|m| m.last_seen.clone());
     let last_ip = existing.as_ref().and_then(|m| m.last_ip.clone());
     let installed_at = existing.as_ref().and_then(|m| m.installed_at.clone());
-    let last_install_status = existing.as_ref().and_then(|m| m.last_install_status.clone());
+    let last_install_status = existing
+        .as_ref()
+        .and_then(|m| m.last_install_status.clone());
 
     let row = MachineRow {
         mac: mac.clone(),
@@ -533,7 +549,11 @@ fn save_webhook_file(files_dir: &std::path::Path, hostname: &str, f: &Value) {
 /// hostname, then rewrite `set menu-default \S+` to the given target. A missing
 /// file (or any IO error) returns `(false, "No iPXE file found for {hostname}")`
 /// / a swallowed error message — never propagated.
-async fn flip_ipxe(registry: &dyn Registry, ipxe_dir: &std::path::Path, hostname: &str) -> (bool, String) {
+async fn flip_ipxe(
+    registry: &dyn Registry,
+    ipxe_dir: &std::path::Path,
+    hostname: &str,
+) -> (bool, String) {
     let path = match resolve_ipxe_path(registry, ipxe_dir, hostname).await {
         Some(p) if p.exists() => p,
         _ => return (false, format!("No iPXE file found for {hostname}")),
@@ -670,13 +690,16 @@ mod tests {
             finished_at: &str,
         ) -> uuid::Uuid {
             let event_id = uuid::Uuid::new_v4();
-            self.install_events.lock().unwrap().push(RecordedInstallEvent {
-                event_id,
-                mac: mac.to_string(),
-                name: name.to_string(),
-                status: status.to_string(),
-                finished_at: finished_at.to_string(),
-            });
+            self.install_events
+                .lock()
+                .unwrap()
+                .push(RecordedInstallEvent {
+                    event_id,
+                    mac: mac.to_string(),
+                    name: name.to_string(),
+                    status: status.to_string(),
+                    finished_at: finished_at.to_string(),
+                });
             // Mirror FileRegistry's side effect so tests can assert on it too.
             if let Some(row) = self.machines.lock().unwrap().get_mut(mac) {
                 row.installed_at = Some(finished_at.to_string());
@@ -798,10 +821,18 @@ mod tests {
         assert_eq!(v["status"], "approved");
 
         let updated = registry.get_machine("aa:bb:cc:dd:ee:ff").await.unwrap();
-        assert_eq!(updated.status, MachineStatus::Approved, "approval preserved");
+        assert_eq!(
+            updated.status,
+            MachineStatus::Approved,
+            "approval preserved"
+        );
         assert_eq!(updated.tpm_ek.as_deref(), Some("ek-123"), "EK preserved");
         assert_eq!(updated.hostname, "new-host", "hostname overwritten");
-        assert_eq!(updated.registered_at.as_deref(), Some("1000"), "registered_at preserved");
+        assert_eq!(
+            updated.registered_at.as_deref(),
+            Some("1000"),
+            "registered_at preserved"
+        );
     }
 
     #[tokio::test]
@@ -829,8 +860,10 @@ mod tests {
 
         // First checkin binds the EK.
         let body1 = Bytes::from(
-            serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-1", "ip": "10.0.0.5"}))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-1", "ip": "10.0.0.5"}),
+            )
+            .unwrap(),
         );
         let resp1 = handle_checkin(State(state.clone()), body1).await;
         assert_eq!(resp1.status(), StatusCode::OK);
@@ -845,8 +878,10 @@ mod tests {
 
         // Second checkin with a DIFFERENT EK -> 403, last_seen untouched.
         let body2 = Bytes::from(
-            serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-2", "ip": "10.0.0.6"}))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-2", "ip": "10.0.0.6"}),
+            )
+            .unwrap(),
         );
         let resp2 = handle_checkin(State(state.clone()), body2).await;
         assert_eq!(resp2.status(), StatusCode::FORBIDDEN);
@@ -878,8 +913,10 @@ mod tests {
         let state = test_state_with(registry.clone(), dir.path().to_path_buf());
 
         let body = Bytes::from(
-            serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-1", "ip": "10.0.0.9"}))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({"mac": "aa:bb:cc:dd:ee:ff", "tpm_ek": "ek-1", "ip": "10.0.0.9"}),
+            )
+            .unwrap(),
         );
         let resp = handle_checkin(State(state), body).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -894,7 +931,11 @@ mod tests {
             "legitimate checkin must update last_seen"
         );
         assert_eq!(updated.last_ip.as_deref(), Some("10.0.0.9"));
-        assert_eq!(updated.tpm_ek.as_deref(), Some("ek-1"), "EK unchanged on match");
+        assert_eq!(
+            updated.tpm_ek.as_deref(),
+            Some("ek-1"),
+            "EK unchanged on match"
+        );
     }
 
     // ── /api/webhook ─────────────────────────────────────────────────────
@@ -916,7 +957,11 @@ mod tests {
             .unwrap(),
         );
         let resp = handle_webhook(State(state), body).await;
-        assert_eq!(resp.status(), StatusCode::OK, "flip failure must be swallowed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flip failure must be swallowed"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
 
@@ -959,7 +1004,11 @@ mod tests {
 
         let events = registry.install_events.lock().unwrap();
         assert_eq!(events.len(), 1, "exactly one install_history record");
-        assert_ne!(events[0].event_id, uuid::Uuid::nil(), "event_id must be a minted UUID");
+        assert_ne!(
+            events[0].event_id,
+            uuid::Uuid::nil(),
+            "event_id must be a minted UUID"
+        );
         assert_eq!(events[0].mac, "aa:bb:cc:dd:ee:ff");
     }
 

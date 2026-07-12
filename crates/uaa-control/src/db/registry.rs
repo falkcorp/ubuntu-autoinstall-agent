@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/registry.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 02d40065-96da-4469-b679-b8bfd4f0b8b3
-// last-edited: 2026-07-10
+// last-edited: 2026-07-12
 
 //! Registry CRUD against CockroachDB (the `RegistryStore` trait + tokio-postgres impl).
 //!
@@ -340,7 +340,13 @@ impl RegistryStore for PgRegistryStore {
         self.client
             .execute(
                 SQL_UPSERT_TANG_SERVER,
-                &[&row.hostname, &row.ip, &row.tang_url, &adv_keys, &row.last_seen],
+                &[
+                    &row.hostname,
+                    &row.ip,
+                    &row.tang_url,
+                    &adv_keys,
+                    &row.last_seen,
+                ],
             )
             .await?;
         Ok(())
@@ -352,7 +358,13 @@ impl RegistryStore for PgRegistryStore {
             .client
             .execute(
                 SQL_INSERT_TANG_IF_ABSENT,
-                &[&row.hostname, &row.ip, &row.tang_url, &adv_keys, &row.last_seen],
+                &[
+                    &row.hostname,
+                    &row.ip,
+                    &row.tang_url,
+                    &adv_keys,
+                    &row.last_seen,
+                ],
             )
             .await?;
         Ok(n == 1)
@@ -378,7 +390,10 @@ impl RegistryStore for PgRegistryStore {
     }
 
     async fn list_luks_credentials(&self, mac: &str) -> Result<Vec<LuksCredentialRow>> {
-        let rows = self.client.query(SQL_LIST_LUKS_CREDENTIALS, &[&mac]).await?;
+        let rows = self
+            .client
+            .query(SQL_LIST_LUKS_CREDENTIALS, &[&mac])
+            .await?;
         rows.iter().map(row_to_luks).collect()
     }
 
