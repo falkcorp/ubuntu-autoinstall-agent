@@ -408,35 +408,59 @@ fn default_auth_state() -> Arc<AuthState> {
 }
 
 /// Builds the bootstrap-token stopgap (see `crate::auth`'s module doc) and, if
-/// enabled, generates the process's one outstanding token — logging it and
-/// writing it to [`BOOTSTRAP_TOKEN_FILE`] (0600) so an operator with server
-/// access can retrieve it without grepping logs.
+/// enabled, generates the process's one outstanding token and writes it to
+/// [`BOOTSTRAP_TOKEN_FILE`] (0600) so an operator with server access can
+/// retrieve it. The raw token is deliberately NEVER logged — this file is the
+/// only place it's written to, since log output (journald, any shipped log
+/// aggregation) is a much wider-reach, longer-retained, less access-controlled
+/// surface than one 0600 file.
 fn default_bootstrap_state(auth_state: &AuthState) -> Arc<BootstrapTokenState> {
     let state_dir = auth_state.config().state_dir.clone();
     let bootstrap = Arc::new(BootstrapTokenState::from_env(&state_dir));
     if let Some(token) = bootstrap.generate() {
-        tracing::warn!(
-            %token,
-            "operator plane bootstrap admin token generated (single-use, 15-minute TTL) \
-             — POST {{\"token\": \"...\"}} to /api/auth/bootstrap to log in as admin until \
-             a real GitHub OAuth app is configured (UAA_GITHUB_CLIENT_ID/_SECRET)"
-        );
-        if let Err(err) = write_bootstrap_token_file(&state_dir, &token) {
-            tracing::error!(%err, "failed to write bootstrap token file");
+        let path = state_dir.join(BOOTSTRAP_TOKEN_FILE);
+        match write_bootstrap_token_file(&path, &token) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "operator plane bootstrap admin token generated (single-use, 15-minute \
+                     TTL); read the token from this file and POST {{\"token\": \"...\"}} to \
+                     /api/auth/bootstrap to log in as admin until a real GitHub OAuth app is \
+                     configured (UAA_GITHUB_CLIENT_ID/_SECRET)"
+                );
+            }
+            Err(err) => {
+                tracing::error!(%err, path = %path.display(), "failed to write bootstrap token file");
+            }
         }
     }
     bootstrap
 }
 
-fn write_bootstrap_token_file(state_dir: &Path, token: &str) -> std::io::Result<()> {
-    let path = state_dir.join(BOOTSTRAP_TOKEN_FILE);
-    std::fs::write(&path, format!("{token}\n"))?;
+/// Writes `token` to `path` at 0600, set atomically at file-creation time (no
+/// window where it's briefly world/group-readable) rather than via a
+/// write-then-chmod sequence. Removes any pre-existing file at `path` first
+/// so a local attacker who planted a symlink there can't redirect the write;
+/// `create_new` then fails closed (rather than silently following a symlink)
+/// if anything reappears at that path between the removal and the open.
+fn write_bootstrap_token_file(path: &Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        open_options.mode(0o600);
     }
-    Ok(())
+    let mut file = open_options.open(path)?;
+    file.write_all(format!("{token}\n").as_bytes())
 }
 
 /// The operator API sub-router, mounted under `/api/*`. Merged ahead of
