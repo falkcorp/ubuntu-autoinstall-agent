@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.5.3
+// version: 2.5.4
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 //! Configuration structures for SSH/local installation
 
@@ -11,19 +11,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// Dracut is used on the actual servers (Lenovo M715q) and requires different
 /// regeneration commands + GRUB kernel parameters for Tang network unlock.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum InitramfsType {
     /// dracut — used on the Lenovo servers. Enables rd.neednet + Tang unlock at boot.
+    #[default]
     Dracut,
     /// initramfs-tools — Ubuntu default (cloud images, live ISOs).
     InitramfsTools,
-}
-
-impl Default for InitramfsType {
-    fn default() -> Self {
-        Self::Dracut
-    }
 }
 
 impl InitramfsType {

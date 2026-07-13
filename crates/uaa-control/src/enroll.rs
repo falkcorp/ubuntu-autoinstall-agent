@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/enroll.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 1a81d662-89c9-4e64-8ce9-9aa51fd3a412
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 //! Enrollment plane (`uaa.enroll.v1` gRPC + `:7444` JSON mirror) — CSR submit +
 //! GetCredential poll, idempotent by SPKI fingerprint (spec C6, NORMATIVE).
@@ -880,10 +880,10 @@ mod tests {
                                 saw_real_host = true;
                             }
                         }
-                        x509_parser::extensions::GeneralName::URI(uri) => {
-                            if *uri == "uaa-mac:ff:ff:ff:ff:ff:ff" {
-                                saw_spoofed_mac = true;
-                            }
+                        x509_parser::extensions::GeneralName::URI(uri)
+                            if *uri == "uaa-mac:ff:ff:ff:ff:ff:ff" =>
+                        {
+                            saw_spoofed_mac = true;
                         }
                         _ => {}
                     }
