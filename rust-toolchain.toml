@@ -1,0 +1,21 @@
+# file: rust-toolchain.toml
+# version: 1.0.0
+# guid: 8d3f4a5b-6c7d-4e8f-9a0b-1c2d3e4f5a6b
+# last-edited: 2026-07-13
+#
+# Pins the local dev toolchain so `cargo`/`rustc`/`clippy`/`rustfmt` invoked
+# anywhere in this repo resolve to this exact version, regardless of
+# `rustup default`. Without this, a machine's `stable` can silently drift
+# for months behind CI's — the 2026-07-13 CI break (PR #87) was exactly
+# that: CI's floating `stable` (1.96/1.97) enforced clippy lints a
+# months-stale local `stable` (1.89) never surfaced.
+#
+# CI intentionally tests against the FLOATING `stable`/`stable-1` channels
+# (`.github/workflows/reusable-ci.yml`, matrix-driven — this file has no
+# effect there, by design) to catch exactly this kind of drift early. This
+# pin is for local/dev reproducibility only. Bump it deliberately when
+# adopting a newer toolchain — `rustup update stable` locally, then update
+# the `channel` value below to match — rather than letting it drift.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
