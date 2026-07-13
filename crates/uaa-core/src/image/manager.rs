@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/image/manager.rs
-// version: 1.0.2
+// version: 1.0.3
 // guid: n4o5p6q7-r8s9-0123-4567-890123nopqrs
 
 //! Image lifecycle management
@@ -62,7 +62,7 @@ impl ImageManager {
         }
 
         // Sort by creation date (newest first)
-        images.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        images.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
         Ok(images)
     }
