@@ -1,26 +1,27 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.5.0
+# version: 2.6.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-13
 
-## HIGH RISK: operator plane (:15001) has zero authentication (raised 2026-07-13)
+## RESOLVED: operator plane (:15001) had zero authentication (raised 2026-07-13, fixed 2026-07-13)
 
-- [ ] **`POST /api/enrollments/:fp/approve` performs REAL install-CA certificate
-  issuance with no caller authentication** — anyone who can reach `:15001` can
-  mint a server-identity cert for any pending enrollment. This is the highest-risk
-  gap on the operator plane today: unlike the legacy `:25000` machine plane
-  (read-mostly, matches Python-era exposure), this is a NEW write path that
-  wasn't live before PR #91 (2026-07-13, `feat/wire-enrollments-audit-operator-api`).
-  Shipped deliberately (explicit operator decision, same day: "no login for now,
-  just disable it, or autologin as the admin") to unblock wiring real
-  enrollments/audit without waiting on GitHub OAuth app creation — see
-  `crates/uaa-control/src/operator/handlers.rs`'s module doc for the full
-  rationale. Resolution in progress 2026-07-13: bootstrap a short-lived
-  admin token through the SAME auth/session stack real SSO will eventually use
-  (pattern borrowed from `audiobook-organizer`), with a config switch to
-  disable the bootstrap token once a real GitHub OAuth app exists (spec
-  Decision 19, CT-03). Until that lands, treat `:15001` as fully public —
-  do not expose it outside a trusted network.
+- [x] **`POST /api/enrollments/:fp/approve` performed REAL install-CA
+  certificate issuance with no caller authentication** — fixed on
+  `feat/operator-plane-auth`: `crate::auth`'s existing-but-unmounted CT-03
+  GitHub OAuth + RBAC implementation is now wired onto every `:15001` route
+  (`auth::require_role`, Viewer for reads / Operator for mutations / Admin
+  for the new bootstrap-disable endpoint), plus `GET /auth/login` and
+  `GET /auth/callback` for the real OAuth flow. Since no GitHub OAuth app
+  exists yet, added a narrow, explicit, disable-able exception to that
+  module's own "no login bypass" policy (spec Decision 8): a short-lived,
+  single-use bootstrap token that mints a real session via the SAME signed-
+  cookie mechanism a GitHub login uses, for a fixed non-GitHub identity.
+  Disable-able by env var (`UAA_OPERATOR_DISABLE_BOOTSTRAP_TOKEN`) or by a
+  logged-in admin's own API call once a real OAuth app is configured. New
+  `/login` SPA page offers both the SSO button and the bootstrap-token form.
+  Verified end-to-end with Playwright against a live instance, plus 6 new
+  router-level tests proving unauthenticated reads/mutations now 401. Not
+  yet merged — see PR (branch `feat/operator-plane-auth`).
 
 - [ ] **CI: "New CI System / Test rust stable-1" jobs are broken (raised 2026-07-13)**
   — `rustup toolchain install stable-1` fails with `invalid toolchain name:
