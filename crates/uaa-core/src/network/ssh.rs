@@ -1,14 +1,47 @@
 // file: crates/uaa-core/src/network/ssh.rs
-// version: 1.5.1
+// version: 1.6.0
 // guid: t0u1v2w3-x4y5-6789-0123-456789tuvwxy
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 //! SSH client for remote deployment operations
 
 use crate::Result;
+use regex::Regex;
 use ssh2::Session;
 use std::net::TcpStream;
+use std::sync::OnceLock;
 use tracing::{debug, error, info};
+
+/// Redact known secret-bearing argv shapes before a command reaches any log
+/// line or error value. Two shapes exist in this codebase's power-control
+/// callers today: an `IPMI_PASSWORD='...'` env-var prefix
+/// (`power::build_ipmi_command`) and a `-p '...'` argv flag (dashcli/wsman —
+/// `power::dash`, `power::amt_wol`). Every builder of those commands rejects
+/// a password containing `'`, so `[^']*` always matches exactly the secret
+/// value, never spilling past the closing quote. Applied unconditionally
+/// here (not left to call-site discipline) because a future caller could
+/// easily forget to redact before logging — this is the one seam every
+/// command this client runs passes through.
+fn redact_command(command: &str) -> String {
+    static PATTERNS: OnceLock<[(Regex, &str); 2]> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            (
+                Regex::new(r"IPMI_PASSWORD='[^']*'").expect("static pattern is valid regex"),
+                "IPMI_PASSWORD='***'",
+            ),
+            (
+                Regex::new(r"-p '[^']*'").expect("static pattern is valid regex"),
+                "-p '***'",
+            ),
+        ]
+    });
+    let mut redacted = command.to_string();
+    for (pattern, replacement) in patterns.iter() {
+        redacted = pattern.replace_all(&redacted, *replacement).into_owned();
+    }
+    redacted
+}
 
 /// SSH client for remote operations
 pub struct SshClient {
@@ -114,7 +147,7 @@ impl SshClient {
 
     /// Execute command on remote host
     pub async fn execute(&mut self, command: &str) -> Result<()> {
-        debug!("Executing command: {}", command);
+        debug!("Executing command: {}", redact_command(command));
 
         let session = self.session.as_mut().ok_or_else(|| {
             crate::error::AutoInstallError::SshError("No active SSH session".to_string())
@@ -156,7 +189,7 @@ impl SshClient {
                 error!("STDERR: {}", stderr);
             }
             return Err(crate::error::AutoInstallError::ProcessError {
-                command: command.to_string(),
+                command: redact_command(command),
                 exit_code: Some(exit_status),
                 stderr: if stderr.is_empty() { stdout } else { stderr },
             });
@@ -168,7 +201,7 @@ impl SshClient {
 
     /// Execute command and return output
     pub async fn execute_with_output(&mut self, command: &str) -> Result<String> {
-        debug!("Executing command with output: {}", command);
+        debug!("Executing command with output: {}", redact_command(command));
 
         let session = self.session.as_mut().ok_or_else(|| {
             crate::error::AutoInstallError::SshError("No active SSH session".to_string())
@@ -209,7 +242,7 @@ impl SshClient {
                 error!("STDERR: {}", stderr);
             }
             return Err(crate::error::AutoInstallError::ProcessError {
-                command: command.to_string(),
+                command: redact_command(command),
                 exit_code: Some(exit_status),
                 stderr: if stderr.is_empty() { stdout } else { stderr },
             });
@@ -225,7 +258,7 @@ impl SshClient {
         command: &str,
         description: &str,
     ) -> Result<(i32, String, String)> {
-        info!("Executing: {} -> {}", description, command);
+        info!("Executing: {} -> {}", description, redact_command(command));
 
         let session = self.session.as_mut().ok_or_else(|| {
             crate::error::AutoInstallError::SshError("No active SSH session".to_string())
@@ -475,7 +508,36 @@ use std::io::{Read, Write};
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_sudo;
+    use super::{redact_command, wrap_sudo};
+
+    #[test]
+    fn test_redact_command_hides_ipmi_password() {
+        let cmd = "IPMI_PASSWORD='hunter2' ipmitool -E -I lanplus -H 172.16.3.150 -U ADMIN chassis power on";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("hunter2"));
+        assert_eq!(
+            redacted,
+            "IPMI_PASSWORD='***' ipmitool -E -I lanplus -H 172.16.3.150 -U ADMIN chassis power on"
+        );
+    }
+
+    #[test]
+    fn test_redact_command_hides_dashcli_and_wsman_argv_password() {
+        for cmd in [
+            "dashcli -h 10.0.0.5:5985 -u admin -p 'hunter2' power on",
+            "wsman invoke -h 10.0.0.5 -P 5985 -u admin -p 'hunter2' -a RequestPowerStateChange http://x -k PowerState=2",
+        ] {
+            let redacted = redact_command(cmd);
+            assert!(!redacted.contains("hunter2"), "leaked in: {redacted}");
+            assert!(redacted.contains("-p '***'"), "missing redaction in: {redacted}");
+        }
+    }
+
+    #[test]
+    fn test_redact_command_leaves_non_secret_commands_unchanged() {
+        let cmd = "zpool create rpool /dev/mapper/luks";
+        assert_eq!(redact_command(cmd), cmd);
+    }
 
     #[test]
     fn test_wrap_sudo_disabled_is_passthrough() {
