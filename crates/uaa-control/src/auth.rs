@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/auth.rs
-// version: 1.1.2
+// version: 1.2.0
 // guid: af3dc9c0-def6-46ff-9892-90e54716fe21
 // last-edited: 2026-07-13
 
@@ -47,6 +47,21 @@
 //! Total lockout during a GitHub outage is an accepted, mitigated risk (Decision 8),
 //! not a defect to code around; this section documents the hatch, it does not build
 //! one.
+//!
+//! ## Bootstrap admin token (2026-07-13, explicit temporary exception to Decision 8)
+//!
+//! No GitHub OAuth app exists yet to authenticate against — `AuthConfig::client_id`
+//! is empty until one is created. Rather than leave the operator plane fully
+//! inaccessible until then, [`BootstrapTokenState`] mints a real, HMAC-signed
+//! session (via [`AuthState::mint_bootstrap_session`], the exact same
+//! [`mint_session`] every OAuth login uses) for a single fixed, non-GitHub identity
+//! ([`BOOTSTRAP_ADMIN_LOGIN`]) that [`AuthState::effective_role`] always resolves to
+//! [`Role::Admin`] without ever calling GitHub. This IS the "alternate way to mint a
+//! session" the section above says doesn't exist elsewhere in this file — it exists
+//! narrowly, only here, only for one hardcoded identity string a forged cookie can
+//! never claim without the server's own HMAC key. It is explicitly disable-able two
+//! ways (env var for operators, a self-service admin API for whoever is logged in)
+//! so it can retire the moment a real OAuth app is configured.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -88,6 +103,12 @@ pub const OAUTH_STATE_COOKIE_NAME: &str = "uaa_oauth_state";
 
 /// The HMAC key file's name under [`AuthConfig::state_dir`].
 const HMAC_KEY_FILE: &str = "auth_hmac.key";
+
+/// The one non-GitHub identity [`AuthState::effective_role`] treats as permanent
+/// [`Role::Admin`] — see the module doc's "Bootstrap admin token" section. Not a
+/// real GitHub login; nothing else in this file ever mints a session under this
+/// name except [`AuthState::mint_bootstrap_session`].
+pub const BOOTSTRAP_ADMIN_LOGIN: &str = "bootstrap-admin";
 
 // ── Role + config ───────────────────────────────────────────────────────────────
 
@@ -480,13 +501,31 @@ impl AuthState {
             .insert(login.to_string(), token.to_string());
     }
 
+    /// Mints a session for [`BOOTSTRAP_ADMIN_LOGIN`] using this state's own HMAC
+    /// key — the SAME [`mint_session`] a real OAuth callback calls, so a bootstrap
+    /// cookie and an OAuth cookie are indistinguishable to [`check_access`]/
+    /// [`require_role`]. There is no token/membership to cache — the resulting
+    /// session is never subject to the 5-minute role-cache TTL; see
+    /// [`Self::effective_role`]'s special case for why it doesn't need to be.
+    pub fn mint_bootstrap_session(&self, now_unix: u64) -> String {
+        mint_session(&self.hmac_key, BOOTSTRAP_ADMIN_LOGIN, Role::Admin, now_unix)
+    }
+
     /// The role to apply to the CURRENT request only: a fresh cache hit returns the
     /// cached role with zero GitHub calls; a stale/missing entry re-checks via
     /// [`GithubApi::org_role`]. On ANY failure of that refresh — network error,
     /// missing token, non-member — the role degrades to [`Role::Viewer`] for this
     /// request. The cache itself is left untouched on failure (never poisoned to
     /// Viewer), so the next request retries the refresh rather than being stuck.
+    ///
+    /// [`BOOTSTRAP_ADMIN_LOGIN`] is special-cased ahead of the cache: it has no
+    /// GitHub token to refresh against, so without this it would silently degrade
+    /// to Viewer after [`ROLE_CACHE_TTL`] — a bootstrap-token login is admin for
+    /// its whole session, not just 5 minutes of it.
     async fn effective_role(&self, login: &str) -> Role {
+        if login == BOOTSTRAP_ADMIN_LOGIN {
+            return Role::Admin;
+        }
         if let Some((role, cached_at)) = self.role_cache.lock().unwrap().get(login).copied() {
             if cached_at.elapsed() < ROLE_CACHE_TTL {
                 return role;
@@ -520,6 +559,125 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+// ── Bootstrap admin token (temporary, disable-able Decision-8 exception) ─────────
+
+/// How long a freshly generated bootstrap token remains valid. Short by design —
+/// this is a stopgap for a human with server access to log in once, not a
+/// standing credential; a fresh token is minted (invalidating any old one) every
+/// `uaa-control` process start.
+pub const BOOTSTRAP_TOKEN_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// The marker file (under [`AuthConfig::state_dir`]) an admin-triggered
+/// [`BootstrapTokenState::disable_permanently`] writes — its mere existence keeps
+/// the feature disabled across restarts, same spirit as the HMAC key file.
+const BOOTSTRAP_DISABLED_MARKER: &str = "bootstrap_disabled";
+
+/// Holds the current (at most one outstanding) bootstrap token's SHA-256 hash +
+/// expiry — never the raw value, which is handed back once, at generation time,
+/// for the caller to log/write to disk — plus the two independent ways this
+/// stopgap can be turned off for good.
+pub struct BootstrapTokenState {
+    /// `UAA_OPERATOR_DISABLE_BOOTSTRAP_TOKEN` — an operator's kill switch, checked
+    /// once at startup.
+    disabled_by_env: bool,
+    /// Set by [`Self::disable_permanently`] (a logged-in admin choosing to retire
+    /// this path once real OAuth works) and persisted via
+    /// [`BOOTSTRAP_DISABLED_MARKER`] so it survives a restart.
+    disabled_by_admin: std::sync::atomic::AtomicBool,
+    marker_path: PathBuf,
+    current: Mutex<Option<(String, SystemTime)>>,
+}
+
+impl BootstrapTokenState {
+    /// `state_dir` is the same directory the HMAC key lives in
+    /// ([`AuthConfig::state_dir`]) — the marker file just needs to persist
+    /// alongside it. `disabled_by_env` is read by the caller from
+    /// `UAA_OPERATOR_DISABLE_BOOTSTRAP_TOKEN` (see [`Self::from_env`]) rather
+    /// than inside this constructor, so tests can exercise both states without
+    /// racing on process-global env state across parallel test threads.
+    pub fn new(state_dir: &Path, disabled_by_env: bool) -> Self {
+        let marker_path = state_dir.join(BOOTSTRAP_DISABLED_MARKER);
+        Self {
+            disabled_by_env,
+            disabled_by_admin: std::sync::atomic::AtomicBool::new(marker_path.exists()),
+            marker_path,
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Production constructor: reads `UAA_OPERATOR_DISABLE_BOOTSTRAP_TOKEN` from
+    /// the environment once, at startup.
+    pub fn from_env(state_dir: &Path) -> Self {
+        Self::new(
+            state_dir,
+            std::env::var("UAA_OPERATOR_DISABLE_BOOTSTRAP_TOKEN").is_ok(),
+        )
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.disabled_by_env
+            && !self
+                .disabled_by_admin
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Generates a fresh token, replacing (invalidating) any previous one.
+    /// Returns `None` when disabled — callers must not log or persist anything
+    /// in that case.
+    pub fn generate(&self) -> Option<String> {
+        if !self.enabled() {
+            return None;
+        }
+        let mut raw_bytes = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut raw_bytes)
+            .expect("system RNG unavailable while generating a bootstrap token");
+        let raw = format!("uaabs_{}", BASE64_URL.encode(raw_bytes));
+        let hash = sha256_hex(&raw);
+        let expires_at = SystemTime::now() + BOOTSTRAP_TOKEN_TTL;
+        *self.current.lock().unwrap() = Some((hash, expires_at));
+        Some(raw)
+    }
+
+    /// Single-use: the stored hash is cleared on the FIRST call regardless of
+    /// outcome — a wrong guess must not leave the real token usable afterward.
+    pub fn consume(&self, submitted: &str) -> bool {
+        if !self.enabled() {
+            *self.current.lock().unwrap() = None;
+            return false;
+        }
+        let Some((hash, expires_at)) = self.current.lock().unwrap().take() else {
+            return false;
+        };
+        if SystemTime::now() > expires_at {
+            return false;
+        }
+        ct_eq(sha256_hex(submitted).as_bytes(), hash.as_bytes())
+    }
+
+    /// Permanently retires this stopgap: clears any outstanding token, flips the
+    /// in-memory flag, and writes the marker file so the disable survives a
+    /// restart. Intended to be called from an admin-only API once real OAuth
+    /// login is confirmed working.
+    pub fn disable_permanently(&self) -> std::io::Result<()> {
+        *self.current.lock().unwrap() = None;
+        self.disabled_by_admin
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fs::write(&self.marker_path, b"disabled by admin\n")
+    }
+}
+
+fn sha256_hex(s: &str) -> String {
+    use ring::digest;
+    let digest = digest::digest(&digest::SHA256, s.as_bytes());
+    let mut out = String::with_capacity(64);
+    for b in digest.as_ref() {
+        use std::fmt::Write;
+        write!(&mut out, "{b:02x}").expect("writing to a String never fails");
+    }
+    out
 }
 
 // ── OAuth flow (pure, testable core) ──────────────────────────────────────────────
@@ -590,7 +748,8 @@ pub async fn complete_oauth_callback(
     // /auth/login, compared in constant time — in ADDITION to the single-use
     // server-side store check below. Without this, an attacker who obtains a valid
     // state can replay it into a victim's browser and fixate a session.
-    let cookie_bound = matches!(cookie_state, Some(c) if ct_eq(c.as_bytes(), given_state.as_bytes()));
+    let cookie_bound =
+        matches!(cookie_state, Some(c) if ct_eq(c.as_bytes(), given_state.as_bytes()));
     // Consume the server-side state regardless (single-use), then require BOTH checks.
     let state_valid = {
         let mut states = state.oauth_states.lock().unwrap();
@@ -744,8 +903,11 @@ pub async fn callback_handler(
             resp
         }
         CallbackOutcome::StateMismatch => {
-            let mut resp =
-                (StatusCode::BAD_REQUEST, Json(json!({"error": "state_mismatch"}))).into_response();
+            let mut resp = (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "state_mismatch"})),
+            )
+                .into_response();
             append_clear(&mut resp);
             resp
         }
@@ -767,41 +929,51 @@ pub async fn callback_handler(
     }
 }
 
-/// RBAC middleware factory. Contract for CT-07 (operator plane): mutating routes
-/// wrap with `require_role(Role::Operator)`, read routes with
-/// `require_role(Role::Viewer)`. Reads `Arc<AuthState>` from the request's
-/// `Extension` (mount it globally on the operator router with
+/// RBAC middleware. Contract for CT-07 (operator plane): mutating routes wrap
+/// with `require_role(router, Role::Operator)`, read routes with
+/// `require_role(router, Role::Viewer)`. Reads `Arc<AuthState>` from the
+/// request's `Extension` (mount it globally on the operator router with
 /// `.layer(Extension(auth_state))`).
+///
+/// Takes and returns the `Router<S>` being built (rather than a standalone
+/// layer value) so the middleware closure's concrete type never has to cross
+/// a function boundary as a partially-erased `impl Trait` — naming that type
+/// precisely enough for axum's `Service` bound to resolve at an external call
+/// site turned out to be impractical; applying the layer here, where the
+/// closure's full type is known, sidesteps the problem entirely.
 ///
 /// Behavior: missing/bad/expired cookie -> 401 JSON `{"error":"unauthenticated"}` for
 /// any path starting `/api/`, else a 302 to `/auth/login`; a valid session whose
 /// (possibly-refreshed) role is below `min` -> 403 JSON `{"error":"forbidden"}`;
 /// otherwise the request is forwarded unchanged.
-pub fn require_role(
-    min: Role,
-) -> axum::middleware::FromFnLayer<
-    impl Clone + Send + Sync + 'static,
-    (),
-    (Extension<Arc<AuthState>>, axum::extract::Request),
-> {
-    axum::middleware::from_fn(
+pub fn require_role<S>(router: axum::Router<S>, min: Role) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.route_layer(axum::middleware::from_fn(
         move |Extension(state): Extension<Arc<AuthState>>,
               req: axum::extract::Request,
               next: Next| async move { role_guard(state, min, req, next).await },
-    )
+    ))
 }
 
 async fn role_guard(
     state: Arc<AuthState>,
     min: Role,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let is_api_path = req.uri().path().starts_with("/api/");
     let cookie_value = extract_session_cookie(req.headers());
     let decision = check_access(&state, min, cookie_value.as_deref(), unix_now()).await;
     match decision {
-        AccessDecision::Allow(_) => next.run(req).await,
+        AccessDecision::Allow(session) => {
+            // Lets downstream handlers attribute mutations to the real
+            // logged-in principal (GitHub login, or `BOOTSTRAP_ADMIN_LOGIN`)
+            // instead of a placeholder actor string.
+            req.extensions_mut().insert(session);
+            next.run(req).await
+        }
         AccessDecision::Unauthenticated => {
             if is_api_path {
                 (
@@ -815,6 +987,79 @@ async fn role_guard(
         }
         AccessDecision::Forbidden => {
             (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
+        }
+    }
+}
+
+/// `GET /api/auth/status` — public (no role required): tells the SPA whether a
+/// session is currently authenticated and whether the bootstrap-token path is
+/// still offered, so the `/login` page knows whether to render the token form.
+pub async fn auth_status_handler(
+    Extension(state): Extension<Arc<AuthState>>,
+    Extension(bootstrap): Extension<Arc<BootstrapTokenState>>,
+    headers: HeaderMap,
+) -> Response {
+    let cookie_value = extract_session_cookie(&headers);
+    let authenticated = match cookie_value {
+        Some(v) => verify_session(&state.hmac_key, &v, unix_now()).is_some(),
+        None => false,
+    };
+    Json(json!({
+        "authenticated": authenticated,
+        "bootstrap_token_enabled": bootstrap.enabled(),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapLoginBody {
+    pub token: String,
+}
+
+/// `POST /api/auth/bootstrap` — exchanges a valid, unexpired, not-yet-used
+/// bootstrap token for a real `uaa_session` cookie identical in shape to one a
+/// GitHub OAuth login would mint (see the module doc's "Bootstrap admin token"
+/// section). Wrong/expired/reused token, or the feature disabled -> 401; never
+/// reveals which of those applies (same "no oracle" law as [`verify_session`]).
+pub async fn bootstrap_login_handler(
+    Extension(state): Extension<Arc<AuthState>>,
+    Extension(bootstrap): Extension<Arc<BootstrapTokenState>>,
+    Json(body): Json<BootstrapLoginBody>,
+) -> Response {
+    if !bootstrap.consume(&body.token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid_or_expired_token"})),
+        )
+            .into_response();
+    }
+    let cookie = state.mint_bootstrap_session(unix_now());
+    let cookie_header = format!(
+        "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; Secure; HttpOnly; SameSite=Lax"
+    );
+    let mut resp = Json(json!({"ok": true})).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie_header) {
+        resp.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    resp
+}
+
+/// `POST /api/auth/bootstrap/disable` — admin-only (mount behind
+/// `require_role(Role::Admin)`): lets whoever is currently logged in (via
+/// bootstrap OR real OAuth) permanently retire the bootstrap-token stopgap once
+/// real GitHub OAuth is confirmed working, without needing server/env access.
+pub async fn disable_bootstrap_handler(
+    Extension(bootstrap): Extension<Arc<BootstrapTokenState>>,
+) -> Response {
+    match bootstrap.disable_permanently() {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(err) => {
+            tracing::error!(%err, "failed to persist bootstrap-token disable marker");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to persist disable"})),
+            )
+                .into_response()
         }
     }
 }
@@ -982,8 +1227,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_role_mapping_admin_team() {
-        let (state, _mock, _dir) =
-            test_state(MockGithubApi::healthy("alice", vec!["uaa-admins".to_string()], true));
+        let (state, _mock, _dir) = test_state(MockGithubApi::healthy(
+            "alice",
+            vec!["uaa-admins".to_string()],
+            true,
+        ));
         match login_via_mock(&state).await {
             CallbackOutcome::Success { role, .. } => assert_eq!(role, Role::Admin),
             other => panic!("expected Success(Admin), got {other:?}"),
@@ -1157,5 +1405,92 @@ mod tests {
             matches!(decision, AccessDecision::Allow(_)),
             "a legitimate Operator mutation must pass the guard stack, got {decision:?}"
         );
+    }
+
+    // ── Bootstrap admin token ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_bootstrap_session_grants_admin_forever_no_ttl_degrade() {
+        let (state, _mock, _dir) = test_state(MockGithubApi::healthy("unused", vec![], false));
+        let cookie = state.mint_bootstrap_session(unix_now());
+
+        // Immediately: Admin.
+        let decision = check_access(&state, Role::Admin, Some(&cookie), unix_now()).await;
+        assert!(matches!(decision, AccessDecision::Allow(_)));
+
+        // Long past the 5-minute role-cache TTL a real GitHub-backed session
+        // would degrade at: still Admin, because effective_role special-cases
+        // BOOTSTRAP_ADMIN_LOGIN before ever consulting the cache/token/GitHub.
+        let far_future = unix_now() + ROLE_CACHE_TTL.as_secs() * 10;
+        let decision = check_access(&state, Role::Admin, Some(&cookie), far_future).await;
+        assert!(
+            matches!(decision, AccessDecision::Allow(_)),
+            "bootstrap admin must not degrade like a real session's cached role would, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_token_disabled_by_env_never_generates_or_consumes() {
+        let dir = tempdir().expect("tempdir");
+        let state = BootstrapTokenState::new(dir.path(), true);
+        assert!(!state.enabled());
+        assert!(state.generate().is_none());
+        assert!(!state.consume("anything"));
+    }
+
+    #[test]
+    fn test_bootstrap_token_valid_consume_succeeds_once() {
+        let dir = tempdir().expect("tempdir");
+        let state = BootstrapTokenState::new(dir.path(), false);
+        let raw = state.generate().expect("enabled by default");
+        assert!(raw.starts_with("uaabs_"));
+        assert!(
+            state.consume(&raw),
+            "first consume with the right token must succeed"
+        );
+        assert!(
+            !state.consume(&raw),
+            "single-use: a second consume with the SAME token must fail"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_token_wrong_value_fails_and_still_consumes() {
+        let dir = tempdir().expect("tempdir");
+        let state = BootstrapTokenState::new(dir.path(), false);
+        let raw = state.generate().unwrap();
+        assert!(!state.consume("uaabs_wrong-value"));
+        assert!(
+            !state.consume(&raw),
+            "a wrong guess must not leave the real token usable afterward"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_token_regenerate_invalidates_previous() {
+        let dir = tempdir().expect("tempdir");
+        let state = BootstrapTokenState::new(dir.path(), false);
+        let first = state.generate().unwrap();
+        let _second = state.generate().unwrap();
+        assert!(
+            !state.consume(&first),
+            "regenerating must invalidate the old token"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_disable_permanently_persists_across_new_instances() {
+        let dir = tempdir().expect("tempdir");
+        {
+            let state = BootstrapTokenState::new(dir.path(), false);
+            assert!(state.enabled());
+            state.disable_permanently().expect("write marker");
+            assert!(!state.enabled());
+        }
+        // A freshly constructed state (simulating a restart) must see the
+        // marker file and come up disabled.
+        let restarted = BootstrapTokenState::new(dir.path(), false);
+        assert!(!restarted.enabled());
+        assert!(restarted.generate().is_none());
     }
 }

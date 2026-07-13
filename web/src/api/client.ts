@@ -1,7 +1,7 @@
 // file: web/src/api/client.ts
-// version: 1.0.1
+// version: 1.1.0
 // guid: a7e23f11-4508-4940-aa29-8b66b7a3d28d
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 import {
   ApiError,
@@ -9,6 +9,7 @@ import {
   type ApiErrorBody,
   type AuditEventRow,
   type AuditVerifyResult,
+  type AuthStatus,
   type DiscoveredMacRow,
   type EnrollmentRow,
   type MachineRow,
@@ -20,8 +21,12 @@ export { ApiError, ForbiddenError };
  * Single fetch wrapper used by every typed helper below. Implements the
  * pinned edge-case law (spec C3 + Decision 19), spelled out once here:
  *
- *   - 401 Unauthorized -> redirect the whole page to /auth/login. Session
- *     auth (GitHub OAuth) lives entirely server-side (CT-03); the SPA never
+ *   - 401 Unauthorized -> redirect the whole page to /login (this SPA's own
+ *     login page, NOT the backend's /auth/login OAuth-initiator route
+ *     directly — that 302s straight to GitHub, which is broken/unhelpful
+ *     until a real OAuth app is configured; /login lets the user choose SSO
+ *     or the bootstrap-token stopgap). Session auth (GitHub OAuth or the
+ *     bootstrap token, CT-03) lives entirely server-side; the SPA never
  *     stores a token and never retries — it just bounces to the login page.
  *   - 403 Forbidden -> throw ForbiddenError so the caller can render an
  *     inline "insufficient role" banner. This must NOT redirect, or an
@@ -44,7 +49,7 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   });
 
   if (response.status === 401) {
-    window.location.href = "/auth/login";
+    window.location.href = "/login";
     // The redirect above unwinds the page; this promise never needs to
     // resolve, but TypeScript still requires a return path.
     return new Promise<T>(() => {});
@@ -148,4 +153,37 @@ export function listAudit(): Promise<AuditEventRow[]> {
 
 export function verifyAudit(): Promise<AuditVerifyResult> {
   return apiFetch<AuditVerifyResult>("/api/audit/verify");
+}
+
+// ---- Auth (CT-03: GitHub SSO + a temporary bootstrap-token stopgap) -----
+
+/** Always public — never triggers apiFetch's 401 redirect. */
+export function getAuthStatus(): Promise<AuthStatus> {
+  return apiFetch<AuthStatus>("/api/auth/status");
+}
+
+/** Thrown by {@link bootstrapLogin} on a wrong/expired/reused/disabled token. */
+export class BootstrapLoginError extends Error {}
+
+/**
+ * Exchanges a bootstrap token for a real session cookie. Deliberately does
+ * NOT go through {@link apiFetch} — its global 401 handling is for "your
+ * session expired while using the app" (redirect to /login), which is the
+ * wrong behavior for "you typed the wrong token" (show an inline error on
+ * the login page instead).
+ */
+export async function bootstrapLogin(token: string): Promise<void> {
+  const response = await fetch("/api/auth/bootstrap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!response.ok) {
+    throw new BootstrapLoginError("Invalid, expired, or already-used token.");
+  }
+}
+
+/** Admin-only: permanently retires the bootstrap-token login path. */
+export function disableBootstrapToken(): Promise<void> {
+  return apiFetch<void>("/api/auth/bootstrap/disable", { method: "POST" });
 }
