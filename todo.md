@@ -1,7 +1,42 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.4.0
+# version: 2.5.0
 # guid: todo0001-0000-0000-0000-000000000001
-# last-edited: 2026-07-11
+# last-edited: 2026-07-13
+
+## HIGH RISK: operator plane (:15001) has zero authentication (raised 2026-07-13)
+
+- [ ] **`POST /api/enrollments/:fp/approve` performs REAL install-CA certificate
+  issuance with no caller authentication** — anyone who can reach `:15001` can
+  mint a server-identity cert for any pending enrollment. This is the highest-risk
+  gap on the operator plane today: unlike the legacy `:25000` machine plane
+  (read-mostly, matches Python-era exposure), this is a NEW write path that
+  wasn't live before PR #91 (2026-07-13, `feat/wire-enrollments-audit-operator-api`).
+  Shipped deliberately (explicit operator decision, same day: "no login for now,
+  just disable it, or autologin as the admin") to unblock wiring real
+  enrollments/audit without waiting on GitHub OAuth app creation — see
+  `crates/uaa-control/src/operator/handlers.rs`'s module doc for the full
+  rationale. Resolution in progress 2026-07-13: bootstrap a short-lived
+  admin token through the SAME auth/session stack real SSO will eventually use
+  (pattern borrowed from `audiobook-organizer`), with a config switch to
+  disable the bootstrap token once a real GitHub OAuth app exists (spec
+  Decision 19, CT-03). Until that lands, treat `:15001` as fully public —
+  do not expose it outside a trusted network.
+
+- [ ] **CI: "New CI System / Test rust stable-1" jobs are broken (raised 2026-07-13)**
+  — `rustup toolchain install stable-1` fails with `invalid toolchain name:
+  'stable-1'` on both `ubuntu-latest` and `macos-latest`. This is a bug in the
+  shared/vendored CI matrix generator (`.github/workflows/scripts/ci_workflow.py`
+  + `reusable-ci.yml`'s `generate-matrix` job) — it emits the literal string
+  `"stable-1"` as a `matrix.version` value that later gets passed straight to
+  `rustup toolchain install`, which has no such toolchain. Confirmed identical
+  failure across PRs #89, #90, #91 (2026-07-13) — NOT introduced by any of
+  those diffs; the toolchain-drift-detection intent (see
+  [[feedback_prefer_latest_versions]] / PR #87's incident) is that `stable-1`
+  should resolve to "one stable release behind current," not a literal rustup
+  channel name. No branch protection currently requires this check, so it
+  hasn't blocked merges, but it means the "test against the previous stable
+  Rust" drift-detection lane has been silently broken since at least
+  2026-07-13 and should be fixed in the shared CI script.
 
 ## Record every MAC that contacts the machine plane, not just approved ones (raised 2026-07-11)
 
@@ -134,13 +169,12 @@ Every wipe-adjacent change (partition helper, LUKS keyfile, both phase-rerun tas
 Opus-tier and independently re-verified by the coordinator before merge. NO hardware was
 touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any hardware install.
 
-- [ ] **SECURITY follow-up (surfaced by remote-power/TASK-01):** `SshClient::execute_with_output`
-  (`src/network/ssh.rs`) does `debug!("Executing command with output: {}", command)`, logging the
-  FULL command string. `uaa power` passes `IPMI_PASSWORD='<pw>' ipmitool …` through the
-  `CommandExecutor` seam, so running with `-v`/debug would leak the BMC password to local logs
-  (the power module itself only ever logs a redacted twin). Add a redaction seam to
-  `SshClient`/`CommandExecutor` (e.g. an optional "loggable command" override) before `uaa power`
-  is used with verbose logging.
+- [x] **FIXED PR #90 (2026-07-13):** `SshClient::execute`/`execute_with_output`/
+  `execute_with_error_collection` all now redact `IPMI_PASSWORD='...'`/`-p '...'` before
+  logging OR storing in `ProcessError` (the latter was the worse leak: Rust's default
+  `Termination` impl Debug-prints any `Err` from `main`, so the plaintext BMC password was
+  printed to the terminal on ANY failed `uaa power` command, not just under verbose
+  logging). Original item: — surfaced by remote-power/TASK-01.
 
 ## Critical Bugs (blocking correct operation)
 
