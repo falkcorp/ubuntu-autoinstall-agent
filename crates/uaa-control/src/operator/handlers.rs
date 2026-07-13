@@ -1,9 +1,9 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-12
+// last-edited: 2026-07-13
 
-//! Operator API request handlers (`:8443`, mounted under `/api/*` ahead of
+//! Operator API request handlers (`:15001`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
 //!
 //! This is a first vertical slice, not the full CT-07 scope: `GET
@@ -291,6 +291,7 @@ pub fn router() -> Router {
 
 fn build_router(state: AppState) -> Router {
     Router::new()
+        .route("/healthz", get(handle_healthz))
         .route("/api/machines", get(handle_list_machines))
         .route("/api/machines/:mac", get(handle_get_machine))
         .route("/api/machines/:mac/approve", post(handle_approve_machine))
@@ -315,6 +316,17 @@ fn build_router(state: AppState) -> Router {
         .route("/api/audit", get(handle_list_audit))
         .route("/api/audit/verify", get(handle_verify_audit))
         .with_state(state)
+}
+
+/// `GET /healthz` — matched here (ahead of `web_ui`'s SPA catch-all
+/// fallback) so it keeps returning the same JSON shape every other plane's
+/// `listeners::health_router` does, instead of silently falling through to
+/// `index.html` once the SPA fallback swallows every unmatched path.
+async fn handle_healthz(State(_state): State<AppState>) -> Response {
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({ "service": "uaa-control", "listener": "operator" }),
+    )
 }
 
 // ── /api/machines (real) ──────────────────────────────────────────────
@@ -636,6 +648,17 @@ mod tests {
             let body = body_json(resp).await;
             assert_eq!(body.as_array().unwrap().len(), 0, "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_healthz_matched_before_spa_fallback_would_swallow_it() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
+        let resp = handle_healthz(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["service"], "uaa-control");
+        assert_eq!(body["listener"], "operator");
     }
 
     #[tokio::test]

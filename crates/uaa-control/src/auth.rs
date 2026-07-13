@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/auth.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: af3dc9c0-def6-46ff-9892-90e54716fe21
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 //! RBAC + operator authentication: GitHub OAuth web flow + org/team role mapping
 //! (spec Decision 8, component C3 "Operator plane").
@@ -32,7 +32,7 @@
 //! default here would silently grant mutation rights while GitHub is down, which is a
 //! worse failure mode than a temporary lockout. No code in this file, or anywhere in
 //! `uaa-control`, implements an alternate way to mint a session. If GitHub itself is
-//! unreachable long enough that operators are fully locked out of the `:8443` plane,
+//! unreachable long enough that operators are fully locked out of the `:15001` plane,
 //! the sanctioned recovery procedure is a human-operated, out-of-band, LOGGED
 //! database mutation:
 //!
@@ -435,7 +435,7 @@ fn percent_encode(input: &str) -> String {
 
 /// Shared operator-auth state: config, the [`GithubApi`] backend, the HMAC key, the
 /// in-flight OAuth `state` map, and the 5-minute role cache. Mount as an
-/// `axum::Extension<Arc<AuthState>>` (or router state) on the `:8443` operator
+/// `axum::Extension<Arc<AuthState>>` (or router state) on the `:15001` operator
 /// router; see [`require_role`] for the middleware contract.
 pub struct AuthState {
     config: AuthConfig,

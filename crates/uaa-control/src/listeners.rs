@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/listeners.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 4275dc4f-c0cb-479b-9f5c-5a444ed312f7
-// last-edited: 2026-07-12
+// last-edited: 2026-07-13
 
 //! Listener wiring + systemd socket activation (spec Decision 24).
 //!
@@ -10,11 +10,13 @@
 //!     socket activation so a self-update restart never drops the listening socket;
 //!   * `:7443` — gRPC mTLS (services + enrolled agents);
 //!   * `:7444` — enrollment JSON (install-CA-pinned);
-//!   * `:8443` — operator JSON API (first CT-07 slice, see `operator::handlers`'s
+//!   * `:15001` — operator JSON API (first CT-07 slice, see `operator::handlers`'s
 //!     module doc for what's real vs. stubbed) + SPA hosting (`operator::web_ui`).
+//!     Deliberately NOT `:8443` — that's a common alt-HTTPS port other services
+//!     reuse; a high, less-contested port avoids collisions on shared hosts.
 //!
 //! `:7443`/`:7444` remain bind-and-health scaffolds: each serves only `GET /healthz`;
-//! routes and TLS termination arrive with follower tasks (PK-03). `:8443` now serves
+//! routes and TLS termination arrive with follower tasks (PK-03). `:15001` now serves
 //! its real router. Ports bind plain for now (TLS is a runtime concern; tests bind :0).
 
 use std::os::unix::io::RawFd;
@@ -40,7 +42,7 @@ impl Default for ServeConfig {
             machine_plane_port: 25000,
             grpc_port: 7443,
             enroll_port: 7444,
-            operator_port: 8443,
+            operator_port: 15001,
         }
     }
 }
@@ -83,18 +85,16 @@ pub fn parse_listen_fds(
 pub fn health_router(listener: &'static str) -> Router {
     Router::new().route(
         "/healthz",
-        get(move || async move {
-            Json(json!({ "service": "uaa-control", "listener": listener }))
-        }),
+        get(move || async move { Json(json!({ "service": "uaa-control", "listener": listener })) }),
     )
 }
 
 /// Bind and serve all four planes.
 ///
 /// `:25000` uses the socket-activated fd when present (Decision 24), else a plain bind
-/// on `config.machine_plane_port` (dev fallback). `:7443/:7444/:8443` are health
-/// scaffolds (TLS wired later by PK-03/CT-07). Runtime-only; unit tests exercise
-/// [`parse_listen_fds`] and the routers, never this bind loop.
+/// on `config.machine_plane_port` (dev fallback). `:7443`/`:7444` are health scaffolds
+/// (TLS wired later by PK-03); `:15001` serves the real operator router. Runtime-only;
+/// unit tests exercise [`parse_listen_fds`] and the routers, never this bind loop.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let machine_listener = match sd_listen_fd() {
         Some(fd) => {
@@ -125,7 +125,8 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     });
     let grpc = tokio::spawn(async move { axum::serve(grpc, health_router("grpc")).await });
     let enroll = tokio::spawn(async move { axum::serve(enroll, health_router("enroll")).await });
-    let operator = tokio::spawn(async move { axum::serve(operator, crate::operator::router()).await });
+    let operator =
+        tokio::spawn(async move { axum::serve(operator, crate::operator::router()).await });
 
     // Any listener exiting is fatal; surface the first error.
     let (m, g, e, o) = tokio::try_join!(machine, grpc, enroll, operator)?;
