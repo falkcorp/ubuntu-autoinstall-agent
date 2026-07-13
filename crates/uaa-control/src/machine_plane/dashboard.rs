@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/dashboard.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: e4da51dc-1d66-4fd2-8de7-e09458eb455e
-// last-edited: 2026-07-12
+// last-edited: 2026-07-13
 
 //! Machine-plane status dashboard (`:25000` parity, spec Decision 12).
 //!
@@ -19,13 +19,11 @@
 //! instead: [`crate::db::MachineRow`]s from the same on-disk snapshot
 //! `machine_plane::{seeds,lifecycle}` read/write, and events from the WAL
 //! (`wal.jsonl`) — the only store `lifecycle::Registry::append_event` actually
-//! writes. `machine_plane::inventory`'s `/api/events` reads a DIFFERENT legacy
-//! path (`/var/log/cockroach-autoinstall/events.jsonl`) that nothing in this
-//! codebase populates anymore; this module deliberately does NOT reuse that
-//! dead path — see the module-level note in `inventory.rs`'s sibling docs and
-//! the dashboard's own [`FileRegistry::list_events`] doc for detail. That
-//! divergence (this dashboard shows live events; `/api/events` shows none) is
-//! a pre-existing gap this task surfaces, not one it silently patches over.
+//! writes. `machine_plane::inventory`'s `/api/events` reads the SAME WAL (see
+//! its own `FileRegistry::list_events`) rather than Python's `EVENTS_LOG`,
+//! which nothing in this codebase populates anymore — that used to leave
+//! `/api/events` permanently empty while this dashboard showed live events;
+//! both now read the same source.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

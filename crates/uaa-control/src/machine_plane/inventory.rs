@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/inventory.rs
-// version: 1.1.1
+// version: 1.2.0
 // guid: 76633c84-b337-47da-ab77-11cbf0f4b3b5
-// last-edited: 2026-07-12
+// last-edited: 2026-07-13
 
 //! Machine-plane operator/inventory endpoints (`:25000` parity, spec Decision 12).
 //!
@@ -25,14 +25,19 @@
 //!     `machine_plane::lifecycle` (IP-02) reads and writes, so a machine
 //!     registered via `/api/register` is immediately visible to `/api/approve`,
 //!     `/api/deregister`, `/api/certs`, and `/api/flip` here.
-//!   * YubiKeys/tang/events are legacy standalone JSON stores, exactly mirroring
-//!     Python's own `YUBIKEY_REGISTRY_FILE`/`TANG_REGISTRY_FILE`/`EVENTS_LOG`
-//!     (`scripts/autoinstall-agent.py` `:37-39`) — NOT the CT-01 `SnapshotDoc`
+//!   * YubiKeys/tang are legacy standalone JSON stores, exactly mirroring
+//!     Python's own `YUBIKEY_REGISTRY_FILE`/`TANG_REGISTRY_FILE`
+//!     (`scripts/autoinstall-agent.py` `:37-38`) — NOT the CT-01 `SnapshotDoc`
 //!     fields of the same name. `YubikeyRow` (`db::mod`) cannot carry
 //!     `approved_at`/`revoked_at` without a migration change (out of scope: a
 //!     single-file task cannot touch `db/mod.rs`), so this module keeps its own
 //!     [`YubikeyEntry`] shape instead. TODO(coordinator): once CT-02's schema
 //!     grows `approved_at`/`revoked_at` columns, unify onto `RegistryStore`.
+//!   * `/api/events` reads the WAL (`wal.jsonl`, via the shared [`StatePaths`]),
+//!     NOT Python's `EVENTS_LOG` file — nothing in this codebase writes that
+//!     legacy path anymore, which left this endpoint permanently empty. This
+//!     matches `dashboard::FileRegistry::list_events`, which reads the same
+//!     WAL; the two used to show different (one live, one always-empty) data.
 //!
 //! `cockroach cert create-node` is shelled out ONLY through the
 //! [`uaa_core::network::CommandExecutor`] seam — never a raw std-library process
@@ -58,7 +63,7 @@ use serde_json::{json, Value};
 use uaa_core::network::{CommandExecutor, LocalClient};
 
 use crate::db::{
-    store::{read_snapshot, write_snapshot, StatePaths},
+    store::{read_snapshot, write_snapshot, StatePaths, WalEntry},
     MachineRow, MachineStatus, TangServerRow,
 };
 
@@ -70,8 +75,6 @@ const IPXE_BOOT_DIR: &str = "/var/www/html/ipxe/boot";
 const YUBIKEY_REGISTRY_FILE: &str = "/var/log/cockroach-autoinstall/yubikey-registry.json";
 /// Legacy tang-server registry file (mirrors Python's `TANG_REGISTRY_FILE`, `:39`).
 const TANG_REGISTRY_FILE: &str = "/var/log/cockroach-autoinstall/tang-registry.json";
-/// Legacy events log (mirrors Python's `EVENTS_LOG`, `:35`).
-const EVENTS_LOG: &str = "/var/log/cockroach-autoinstall/events.jsonl";
 /// CockroachDB node-cert CA (parity-frozen legacy — NOT the install CA of spec
 /// Decision 6; Python `:41`). Serves node-cert issuance for the DB cluster only.
 const COCKROACH_CA_CRT: &str = "/var/lib/cockroach-autoinstall/.cockroach-ca/ca.crt";
@@ -134,9 +137,13 @@ pub trait Registry: Send + Sync {
     /// Remove the row for `mac` and return it (for the hostname in the
     /// deregister message), or `None` if `mac` was not registered.
     async fn delete_machine(&self, mac: &str) -> Option<MachineRow>;
-    /// Last `limit` events, oldest-first. ANY read/parse error yields an EMPTY
-    /// vec (Python `:406-412` wraps the whole read in a bare `except`, never a
-    /// 500 — Decision 12 collections-vs-single-resources convention).
+    /// Last `limit` events, oldest-first, read from the WAL (`wal.jsonl`) —
+    /// the same file `machine_plane::lifecycle::Registry::append_event`
+    /// writes to and `dashboard::FileRegistry::list_events` reads (NOT
+    /// Python's `EVENTS_LOG`, which nothing writes anymore). A missing WAL
+    /// yields an empty vec (never a 500 — Decision 12 collections-vs-single-
+    /// resources convention); a corrupt individual line is skipped rather
+    /// than zeroing the whole window.
     async fn list_events(&self, limit: usize) -> Vec<Value>;
     /// All registered YubiKeys, keyed by fingerprint.
     async fn list_yubikeys(&self) -> Vec<YubikeyEntry>;
@@ -166,21 +173,14 @@ pub struct FileRegistry {
     machine_paths: StatePaths,
     yubikey_file: PathBuf,
     tang_file: PathBuf,
-    events_file: PathBuf,
 }
 
 impl FileRegistry {
-    pub fn new(
-        machine_paths: StatePaths,
-        yubikey_file: PathBuf,
-        tang_file: PathBuf,
-        events_file: PathBuf,
-    ) -> Self {
+    pub fn new(machine_paths: StatePaths, yubikey_file: PathBuf, tang_file: PathBuf) -> Self {
         Self {
             machine_paths,
             yubikey_file,
             tang_file,
-            events_file,
         }
     }
 
@@ -278,23 +278,22 @@ impl Registry for FileRegistry {
     }
 
     async fn list_events(&self, limit: usize) -> Vec<Value> {
-        let content = match std::fs::read_to_string(&self.events_file) {
+        let content = match std::fs::read_to_string(&self.machine_paths.wal) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        let start = lines.len().saturating_sub(limit);
-        let mut out = Vec::with_capacity(lines.len() - start);
-        for line in &lines[start..] {
-            match serde_json::from_str::<Value>(line) {
-                Ok(v) => out.push(v),
-                // Python's `[json.loads(l) for l in lines]` raises on the first
-                // bad line and the outer `except` swallows it into `[]` — a
-                // single corrupt line zeroes the whole window, not just itself.
-                Err(_) => return Vec::new(),
+        let mut events: Vec<Value> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<WalEntry>(line) {
+                Ok(entry) if entry.kind == "event" => events.push(entry.payload),
+                _ => continue,
             }
         }
-        out
+        let start = events.len().saturating_sub(limit);
+        events.split_off(start)
     }
 
     async fn list_yubikeys(&self) -> Vec<YubikeyEntry> {
@@ -529,7 +528,6 @@ fn default_state() -> AppState {
             StatePaths::default(),
             PathBuf::from(YUBIKEY_REGISTRY_FILE),
             PathBuf::from(TANG_REGISTRY_FILE),
-            PathBuf::from(EVENTS_LOG),
         )),
         ipxe_dir: Arc::new(PathBuf::from(IPXE_BOOT_DIR)),
         ca_crt: Arc::new(PathBuf::from(COCKROACH_CA_CRT)),
@@ -1486,28 +1484,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_events_read_error_empty_200() {
-        // Real FileRegistry pointed at a nonexistent events file — the actual
-        // error path Python's bare `except` swallows (`:406-412`).
+    async fn test_events_missing_wal_empty_200() {
+        // Real FileRegistry pointed at a StatePaths whose wal.jsonl doesn't
+        // exist yet — the common case before anything has been ingested.
         let dir = tempdir().unwrap();
         let fr = FileRegistry::new(
             StatePaths::under(dir.path()),
             dir.path().join("yubikeys.json"),
             dir.path().join("tang.json"),
-            dir.path().join("does-not-exist.jsonl"),
         );
         let events = fr.list_events(50).await;
         assert!(events.is_empty());
-
-        // Also exercise the corrupt-line path.
-        std::fs::write(dir.path().join("events2.jsonl"), "not json\n").unwrap();
-        let fr2 = FileRegistry::new(
-            StatePaths::under(dir.path()),
-            dir.path().join("yubikeys.json"),
-            dir.path().join("tang.json"),
-            dir.path().join("events2.jsonl"),
-        );
-        assert!(fr2.list_events(50).await.is_empty());
 
         // Handler-level check via the mock (empty events vec -> 200 []).
         let registry = Arc::new(MockRegistry::default());
@@ -1517,6 +1504,33 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v, json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_events_reads_wal_skips_corrupt_and_non_event_lines() {
+        // /api/events must read the SAME wal.jsonl the dashboard reads (not
+        // the dead legacy events.jsonl nothing writes to anymore), keep only
+        // kind=="event" entries, and skip a corrupt line rather than zeroing
+        // the whole window.
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let lines = [
+            r#"{"event_id":"11111111-1111-1111-1111-111111111111","kind":"event","payload":{"msg":"first"},"at":"1"}"#,
+            "not json",
+            r#"{"event_id":"22222222-2222-2222-2222-222222222222","kind":"install_history","payload":{"msg":"ignored"},"at":"2"}"#,
+            r#"{"event_id":"33333333-3333-3333-3333-333333333333","kind":"event","payload":{"msg":"second"},"at":"3"}"#,
+        ];
+        std::fs::write(&paths.wal, lines.join("\n") + "\n").unwrap();
+        let fr = FileRegistry::new(
+            paths,
+            dir.path().join("yubikeys.json"),
+            dir.path().join("tang.json"),
+        );
+
+        let events = fr.list_events(50).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["msg"], "first");
+        assert_eq!(events[1]["msg"], "second");
     }
 
     // ── yubikeys ──────────────────────────────────────────────────────
