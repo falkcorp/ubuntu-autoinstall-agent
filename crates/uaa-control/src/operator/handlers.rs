@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
 // last-edited: 2026-07-13
 
@@ -9,15 +9,34 @@
 //! This is a first vertical slice, not the full CT-07 scope: `GET
 //! /api/machines` (+ single-machine GET, + approve) is real, backed by the
 //! same CT-01 snapshot `machine_plane::{seeds,lifecycle}` read/write.
-//! Enrollments/discovery/audit and reinstall have no backing implementation
-//! yet (CT-05/06 sagas, PK-01 enrollment state, CT-04 audit chain are none
-//! of them wired to HTTP here) — they're stubbed to return well-formed empty
-//! results / a clear "not implemented" error instead of crashing the SPA
-//! page that calls them. No auth middleware is wired yet either: this plane
-//! is exactly as unauthenticated right now as the legacy `:25000` plane
-//! already is (which also serves the full registry, including `tpm_ek`, with
-//! zero auth) — not a new exposure, but also not the end state (spec
-//! Decision 19 gates this on CT-03's OAuth/RBAC landing on this router).
+//! Enrollments (`GET /api/enrollments`, approve, reject) and audit (`GET
+//! /api/audit`, `GET /api/audit/verify`) are ALSO now real — wired against
+//! PK-01's `crate::enroll` state machine and CT-01's `crate::audit` chain,
+//! the same logic + tests that already existed, just not previously exposed
+//! over HTTP. Discovery (`GET /api/discovered`, dismiss) is still stubbed:
+//! unlike enrollments/audit, no backend exists ANYWHERE in the crate yet for
+//! `discovered_macs` — this is unbuilt feature work, not a wiring gap.
+//!
+//! Enrollments/audit currently run against IN-MEMORY stores
+//! ([`crate::enroll::MemEnrollmentStore`], [`crate::audit::MemAuditStore`]),
+//! not a database — state (pending enrollments, the audit chain) does NOT
+//! survive a `uaa-control` restart. This is a known, deliberate limitation,
+//! not an oversight: no `PgEnrollmentStore` exists in this crate yet, and
+//! wiring `PgAuditStore` (which DOES already exist) would need DB connection
+//! plumbing this crate's `main.rs`/`listeners::serve` doesn't have today.
+//! Flagged here rather than silently shipped as if it were durable.
+//!
+//! No auth middleware is wired yet either: this plane is exactly as
+//! unauthenticated right now as the legacy `:25000` plane already is (which
+//! also serves the full registry, including `tpm_ek`, with zero auth) — not
+//! a new exposure for reads, but `POST /api/enrollments/:fp/approve` NOW
+//! performs REAL install-CA certificate issuance with zero caller
+//! authentication (any caller who can reach `:15001` can mint a
+//! server-identity cert for any pending enrollment). Deliberately left this
+//! way per explicit operator decision (2026-07-13: ship auth-gated-later
+//! rather than block enrollment/audit wiring on CT-03 landing first) — not
+//! the end state (spec Decision 19 gates this on CT-03's OAuth/RBAC landing
+//! on this router).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -31,10 +50,14 @@ use axum::{
     Json, Router,
 };
 
+use crate::audit::{self, AuditStore, MemAuditStore};
+use crate::ca::InstallCa;
 use crate::db::{
     store::{read_snapshot, write_snapshot, StatePaths},
-    BootTarget, MachineRow as DbMachineRow, MachineStatus,
+    AuditEventRow as DbAuditEventRow, BootTarget, EnrollmentRow as DbEnrollmentRow,
+    MachineRow as DbMachineRow, MachineStatus,
 };
+use crate::enroll::{self, EnrollmentStore, MemEnrollmentStore};
 use crate::machine_plane::lifecycle::normalize_mac;
 
 use super::api_types::{ApiErrorBody, AuditVerifyResult, MachineRow};
@@ -42,6 +65,15 @@ use super::api_types::{ApiErrorBody, AuditVerifyResult, MachineRow};
 /// Webroot base for placed cloud-init configs (mirrors `machine_plane::seeds`'
 /// `CLOUD_INIT_BASE`; duplicated per-file — see that module's REUSE note).
 const CLOUD_INIT_BASE: &str = "/var/www/html/cloud-init";
+/// Install CA persistence dir (mirrors `crate::ca::InstallCa::load_or_create`'s
+/// own doc comment for its production default).
+const CA_DIR: &str = "/var/lib/uaa/ca";
+/// Attribution for enrollment/audit mutations made through this API. There is
+/// no operator identity yet — CT-03 auth (spec Decision 19) is what would let
+/// this carry a real principal. Using a fixed, clearly-flagged string (rather
+/// than inventing a fake identity) keeps the audit trail honest about what it
+/// does and doesn't know.
+const UNAUTHENTICATED_OPERATOR: &str = "operator (no auth wired yet)";
 
 // ── Registry seam (read + narrow write; mockable) ────────────────────────
 
@@ -222,6 +254,41 @@ async fn backfill_placed_configs(
     }
 }
 
+/// `claimed_hostname` isn't stored on the row — it's re-derived from the
+/// CSR's own DNS SAN (see [`enroll::hostname_from_csr`]'s doc). A malformed
+/// stored CSR (should never happen — `submit_csr` rejects one that doesn't
+/// parse) falls back to an empty string rather than failing the whole list.
+fn to_enrollment_view(row: &DbEnrollmentRow) -> super::api_types::EnrollmentRow {
+    let claimed_hostname = enroll::hostname_from_csr(&row.csr_pem).unwrap_or_default();
+    super::api_types::EnrollmentRow {
+        spki_fingerprint: row.spki_fingerprint.clone(),
+        claimed_mac: row.mac.clone().unwrap_or_default(),
+        claimed_hostname,
+        state: row.state.clone().into(),
+        first_seen: row.requested_at.clone().unwrap_or_default(),
+    }
+}
+
+fn to_audit_view(row: &DbAuditEventRow) -> super::api_types::AuditEventRow {
+    super::api_types::AuditEventRow {
+        seq: row.seq,
+        actor: row.actor.clone(),
+        action: row.action.clone(),
+        outcome: row.outcome.clone(),
+        timestamp: row.at.clone().unwrap_or_default(),
+        detail: row.detail.as_ref().map(|v| v.to_string()),
+    }
+}
+
+fn internal_error(what: &str) -> Response {
+    json_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiErrorBody {
+            message: format!("{what} failed"),
+        },
+    )
+}
+
 fn to_view(row: &DbMachineRow) -> MachineRow {
     MachineRow {
         mac: row.mac.clone(),
@@ -274,12 +341,26 @@ fn not_found(message: &str) -> Response {
 struct AppState {
     webroot: Arc<PathBuf>,
     registry: Arc<dyn Registry>,
+    enrollment_store: Arc<dyn EnrollmentStore>,
+    audit_store: Arc<dyn AuditStore>,
+    /// The install CA is loaded lazily, per-approval (see
+    /// `handle_approve_enrollment`) rather than once here — this keeps
+    /// router/state construction side-effect-free (every other field here
+    /// is; matches the rest of this crate's `default_state()` functions),
+    /// and means a CA-directory problem (permissions, corrupt key) fails
+    /// only the specific approval request, not the whole operator plane
+    /// (which also serves `/api/machines`, `/healthz`, etc. — those have no
+    /// reason to go down over an enrollment-signing concern).
+    ca_dir: Arc<PathBuf>,
 }
 
 fn default_state() -> AppState {
     AppState {
         webroot: Arc::new(PathBuf::from(CLOUD_INIT_BASE)),
         registry: Arc::new(FileRegistry::new(StatePaths::default())),
+        enrollment_store: Arc::new(MemEnrollmentStore::new()),
+        audit_store: Arc::new(MemAuditStore::new()),
+        ca_dir: Arc::new(PathBuf::from(CA_DIR)),
     }
 }
 
@@ -383,28 +464,93 @@ async fn handle_reinstall_machine(
     not_implemented("reinstall")
 }
 
-// ── Stubs: enrollments / discovery / audit (no backing implementation yet) ─
+// ── /api/enrollments (real, against crate::enroll's state machine) ───────
 
-async fn handle_list_enrollments(State(_state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        Vec::<super::api_types::EnrollmentRow>::new(),
-    )
+async fn handle_list_enrollments(State(state): State<AppState>) -> Response {
+    match state.enrollment_store.list_all().await {
+        Ok(mut rows) => {
+            rows.sort_by(|a, b| a.spki_fingerprint.cmp(&b.spki_fingerprint));
+            let views: Vec<_> = rows.iter().map(to_enrollment_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to list enrollments");
+            internal_error("listing enrollments")
+        }
+    }
 }
 
 async fn handle_approve_enrollment(
-    State(_state): State<AppState>,
-    AxumPath(_fp): AxumPath<String>,
+    State(state): State<AppState>,
+    AxumPath(fp): AxumPath<String>,
 ) -> Response {
-    not_implemented("enrollment approval")
+    match state.enrollment_store.get(&fp).await {
+        Ok(None) => return not_found("enrollment not registered"),
+        Ok(Some(_)) => {}
+        Err(err) => {
+            tracing::error!(%err, %fp, "enrollment lookup failed");
+            return internal_error("enrollment lookup");
+        }
+    }
+    let ca = match InstallCa::load_or_create(&state.ca_dir) {
+        Ok(ca) => ca,
+        Err(err) => {
+            tracing::error!(%err, ca_dir = %state.ca_dir.display(), "failed to load install CA");
+            return internal_error("loading install CA");
+        }
+    };
+    match enroll::approve(
+        state.enrollment_store.as_ref(),
+        &ca,
+        state.audit_store.as_ref(),
+        &fp,
+        UNAUTHENTICATED_OPERATOR,
+    )
+    .await
+    {
+        Ok(row) => {
+            tracing::info!(fp = %row.spki_fingerprint, "OPERATOR ENROLLMENT APPROVED");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(%err, %fp, "enrollment approval failed");
+            internal_error("enrollment approval")
+        }
+    }
 }
 
 async fn handle_reject_enrollment(
-    State(_state): State<AppState>,
-    AxumPath(_fp): AxumPath<String>,
+    State(state): State<AppState>,
+    AxumPath(fp): AxumPath<String>,
 ) -> Response {
-    not_implemented("enrollment rejection")
+    match state.enrollment_store.get(&fp).await {
+        Ok(None) => return not_found("enrollment not registered"),
+        Ok(Some(_)) => {}
+        Err(err) => {
+            tracing::error!(%err, %fp, "enrollment lookup failed");
+            return internal_error("enrollment lookup");
+        }
+    }
+    match enroll::reject(
+        state.enrollment_store.as_ref(),
+        state.audit_store.as_ref(),
+        &fp,
+        UNAUTHENTICATED_OPERATOR,
+    )
+    .await
+    {
+        Ok(row) => {
+            tracing::info!(fp = %row.spki_fingerprint, "OPERATOR ENROLLMENT REJECTED");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            tracing::error!(%err, %fp, "enrollment rejection failed");
+            internal_error("enrollment rejection")
+        }
+    }
 }
+
+// ── Stub: discovery (no backend exists anywhere in the crate yet) ────────
 
 async fn handle_list_discovered(State(_state): State<AppState>) -> Response {
     json_response(
@@ -420,22 +566,49 @@ async fn handle_dismiss_discovered(
     not_implemented("discovery dismissal")
 }
 
-async fn handle_list_audit(State(_state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        Vec::<super::api_types::AuditEventRow>::new(),
-    )
+// ── /api/audit (real, against crate::audit's hash-chained store) ─────────
+
+async fn handle_list_audit(State(state): State<AppState>) -> Response {
+    match state.audit_store.list_events(0).await {
+        Ok(events) => {
+            let views: Vec<_> = events.iter().map(to_audit_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to list audit events");
+            internal_error("listing audit events")
+        }
+    }
 }
 
-async fn handle_verify_audit(State(_state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        AuditVerifyResult {
-            ok: true,
-            checked: 0,
-            message: None,
-        },
-    )
+async fn handle_verify_audit(State(state): State<AppState>) -> Response {
+    match state.audit_store.list_events(0).await {
+        Ok(events) => {
+            let checked = events.len() as i64;
+            match audit::verify_chain(&events) {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    AuditVerifyResult {
+                        ok: true,
+                        checked,
+                        message: None,
+                    },
+                ),
+                Err(defect) => json_response(
+                    StatusCode::OK,
+                    AuditVerifyResult {
+                        ok: false,
+                        checked,
+                        message: Some(defect.to_string()),
+                    },
+                ),
+            }
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to verify audit chain");
+            internal_error("verifying audit chain")
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -494,10 +667,41 @@ mod tests {
         }
     }
 
+    fn test_ca() -> InstallCa {
+        let dir = tempdir().unwrap();
+        InstallCa::load_or_create(&dir.path().join("ca")).unwrap()
+    }
+
     fn test_state(webroot: PathBuf, registry: Arc<dyn Registry>) -> AppState {
+        // Subdir of the SAME tempdir the caller already keeps alive for the
+        // test's duration — `handle_approve_enrollment` loads the CA lazily
+        // per-request now, so this path must still exist when that runs.
+        let ca_dir = webroot.join("ca");
         AppState {
             webroot: Arc::new(webroot),
             registry,
+            enrollment_store: Arc::new(MemEnrollmentStore::new()),
+            audit_store: Arc::new(MemAuditStore::new()),
+            ca_dir: Arc::new(ca_dir),
+        }
+    }
+
+    /// Same as [`test_state`] but shares a caller-supplied enrollment/audit
+    /// store pair — needed by tests that assert on state the handler wrote
+    /// (e.g. an approve/reject transition, or a resulting audit event).
+    fn test_state_with_stores(
+        webroot: PathBuf,
+        registry: Arc<dyn Registry>,
+        enrollment_store: Arc<dyn EnrollmentStore>,
+        audit_store: Arc<dyn AuditStore>,
+    ) -> AppState {
+        let ca_dir = webroot.join("ca");
+        AppState {
+            webroot: Arc::new(webroot),
+            registry,
+            enrollment_store,
+            audit_store,
+            ca_dir: Arc::new(ca_dir),
         }
     }
 
@@ -510,6 +714,8 @@ mod tests {
 
     #[test]
     fn test_router_builds_standalone() {
+        // Constructing the router touches no filesystem (`ca_dir` is only
+        // read at approve-request time, not here) — only requests do.
         let _ = router();
     }
 
@@ -635,7 +841,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stub_list_endpoints_return_empty_arrays() {
+    async fn test_empty_store_list_endpoints_return_empty_arrays() {
+        // discovered has no backend at all (always empty); enrollments/audit
+        // are real now but a fresh MemStore is legitimately empty too.
         let dir = tempdir().unwrap();
         let state = || test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
 
@@ -648,6 +856,181 @@ mod tests {
             let body = body_json(resp).await;
             assert_eq!(body.as_array().unwrap().len(), 0, "{label}");
         }
+    }
+
+    // ── /api/enrollments (real) ────────────────────────────────────────
+
+    fn fresh_enrollment_store_and_ca() -> (Arc<dyn EnrollmentStore>, InstallCa) {
+        (Arc::new(MemEnrollmentStore::new()), test_ca())
+    }
+
+    async fn submit_via_state(
+        enrollment_store: &Arc<dyn EnrollmentStore>,
+        ca: &InstallCa,
+        audit_store: &Arc<dyn AuditStore>,
+        mac: &str,
+        hostname: &str,
+    ) -> String {
+        let identity = uaa_core::pki::AgentIdentity {
+            hostname: hostname.to_string(),
+            mac: mac.to_string(),
+        };
+        let (_key, csr_pem) = uaa_core::pki::generate_keypair_and_csr(&identity).unwrap();
+        let row = enroll::submit_csr(
+            enrollment_store.as_ref(),
+            ca,
+            audit_store.as_ref(),
+            &csr_pem,
+            mac,
+            hostname,
+        )
+        .await
+        .unwrap();
+        row.spki_fingerprint
+    }
+
+    #[tokio::test]
+    async fn test_list_enrollments_maps_pending_row_to_wire_shape() {
+        let dir = tempdir().unwrap();
+        let (enrollment_store, ca) = fresh_enrollment_store_and_ca();
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+        let fp = submit_via_state(
+            &enrollment_store,
+            &ca,
+            &audit_store,
+            "aa:bb:cc:dd:ee:01",
+            "pending-host",
+        )
+        .await;
+        let state = test_state_with_stores(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            enrollment_store,
+            audit_store,
+        );
+
+        let resp = handle_list_enrollments(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["spki_fingerprint"], fp);
+        assert_eq!(arr[0]["claimed_mac"], "aa:bb:cc:dd:ee:01");
+        assert_eq!(arr[0]["claimed_hostname"], "pending-host");
+        assert_eq!(arr[0]["state"], "pending");
+    }
+
+    #[tokio::test]
+    async fn test_approve_enrollment_issues_cert_and_records_audit_event() {
+        let dir = tempdir().unwrap();
+        let (enrollment_store, ca) = fresh_enrollment_store_and_ca();
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+        let fp = submit_via_state(
+            &enrollment_store,
+            &ca,
+            &audit_store,
+            "aa:bb:cc:dd:ee:02",
+            "approve-host",
+        )
+        .await;
+        let state = test_state_with_stores(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            enrollment_store.clone(),
+            audit_store.clone(),
+        );
+
+        let resp = handle_approve_enrollment(State(state), AxumPath(fp.clone())).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let row = enrollment_store.get(&fp).await.unwrap().unwrap();
+        assert_eq!(row.state, crate::db::EnrollmentState::Issued);
+        assert!(row.cert_pem.is_some(), "approve must set cert_pem");
+
+        let events = audit_store.list_events(0).await.unwrap();
+        assert!(
+            events.iter().any(|e| e.action == "enrollment.approve"),
+            "approve must be audited"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_approve_unknown_enrollment_404() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
+        let resp = handle_approve_enrollment(State(state), AxumPath("no-such-fp".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_reject_enrollment_sets_rejected_state() {
+        let dir = tempdir().unwrap();
+        let (enrollment_store, ca) = fresh_enrollment_store_and_ca();
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+        let fp = submit_via_state(
+            &enrollment_store,
+            &ca,
+            &audit_store,
+            "aa:bb:cc:dd:ee:03",
+            "reject-host",
+        )
+        .await;
+        let state = test_state_with_stores(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            enrollment_store.clone(),
+            audit_store,
+        );
+
+        let resp = handle_reject_enrollment(State(state), AxumPath(fp.clone())).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let row = enrollment_store.get(&fp).await.unwrap().unwrap();
+        assert_eq!(row.state, crate::db::EnrollmentState::Rejected);
+    }
+
+    #[tokio::test]
+    async fn test_reject_unknown_enrollment_404() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
+        let resp = handle_reject_enrollment(State(state), AxumPath("no-such-fp".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── /api/audit (real) ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_and_verify_audit_after_a_real_mutation() {
+        let dir = tempdir().unwrap();
+        let (enrollment_store, ca) = fresh_enrollment_store_and_ca();
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+        let fp = submit_via_state(
+            &enrollment_store,
+            &ca,
+            &audit_store,
+            "aa:bb:cc:dd:ee:04",
+            "audit-host",
+        )
+        .await;
+        let state = test_state_with_stores(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            enrollment_store,
+            audit_store,
+        );
+        let resp = handle_approve_enrollment(State(state.clone()), AxumPath(fp)).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let list_resp = handle_list_audit(State(state.clone())).await;
+        let list_body = body_json(list_resp).await;
+        let events = list_body.as_array().unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(events[0]["seq"], 1);
+
+        let verify_resp = handle_verify_audit(State(state)).await;
+        let verify_body = body_json(verify_resp).await;
+        assert_eq!(verify_body["ok"], true);
+        assert_eq!(verify_body["checked"], events.len() as i64);
+        assert!(verify_body["message"].is_null());
     }
 
     #[tokio::test]
