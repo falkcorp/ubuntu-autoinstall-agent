@@ -105,10 +105,17 @@ pub const OAUTH_STATE_COOKIE_NAME: &str = "uaa_oauth_state";
 const HMAC_KEY_FILE: &str = "auth_hmac.key";
 
 /// The one non-GitHub identity [`AuthState::effective_role`] treats as permanent
-/// [`Role::Admin`] — see the module doc's "Bootstrap admin token" section. Not a
-/// real GitHub login; nothing else in this file ever mints a session under this
-/// name except [`AuthState::mint_bootstrap_session`].
-pub const BOOTSTRAP_ADMIN_LOGIN: &str = "bootstrap-admin";
+/// [`Role::Admin`] — see the module doc's "Bootstrap admin token" section.
+/// Deliberately contains an underscore: GitHub usernames may only contain
+/// alphanumeric characters or single hyphens (never underscores, and never
+/// consecutive/leading/trailing hyphens), so this value can PROVABLY never be
+/// returned by [`GithubApi::user_login`] for a real account — a GitHub user
+/// registering or renaming their account to collide with this sentinel would
+/// otherwise let them claim a permanent, non-degrading Admin session via the
+/// ordinary OAuth login path, regardless of their actual org/team membership.
+/// Nothing else in this file ever mints a session under this identity except
+/// [`AuthState::mint_bootstrap_session`].
+pub const BOOTSTRAP_ADMIN_LOGIN: &str = "__bootstrap_admin__";
 
 // ── Role + config ───────────────────────────────────────────────────────────────
 
@@ -767,6 +774,13 @@ pub async fn complete_oauth_callback(
         Ok(login) => login,
         Err(_) => return CallbackOutcome::GithubError,
     };
+    // Defense in depth: `BOOTSTRAP_ADMIN_LOGIN` is chosen to be unrepresentable
+    // as a real GitHub username (see its doc comment), but a real login flow
+    // must never mint a session under that identity regardless — refuse
+    // outright rather than relying solely on that invariant holding.
+    if login == BOOTSTRAP_ADMIN_LOGIN {
+        return CallbackOutcome::Denied;
+    }
     let membership = match state.github.org_role(&token, &login).await {
         Ok(membership) => membership,
         Err(_) => return CallbackOutcome::GithubError,
@@ -1263,6 +1277,26 @@ mod tests {
     #[tokio::test]
     async fn test_role_mapping_non_member_403() {
         let (state, _mock, _dir) = test_state(MockGithubApi::healthy("dave", vec![], false));
+        match login_via_mock(&state).await {
+            CallbackOutcome::Denied => {}
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oauth_login_cannot_claim_bootstrap_admin_identity() {
+        // Regression test for a privilege-escalation path: even if a
+        // GithubApi impl somehow returned BOOTSTRAP_ADMIN_LOGIN as a `login`
+        // (impossible for the real API since GitHub usernames can't contain
+        // underscores, but this must hold regardless of that external
+        // invariant), the OAuth callback must refuse to mint a session for
+        // it — never granting the permanent, non-degrading Admin role the
+        // bootstrap-token path gets.
+        let (state, _mock, _dir) = test_state(MockGithubApi::healthy(
+            BOOTSTRAP_ADMIN_LOGIN,
+            vec!["uaa-admins".to_string()],
+            true,
+        ));
         match login_via_mock(&state).await {
             CallbackOutcome::Denied => {}
             other => panic!("expected Denied, got {other:?}"),
