@@ -1,7 +1,7 @@
 // file: web/src/api/types.ts
-// version: 1.0.0
+// version: 1.1.0
 // guid: b7bd1fea-0d99-4db5-a81c-6d6b2a8e9100
-// last-edited: 2026-07-10
+// last-edited: 2026-07-13
 
 // Typed DTOs mirroring CT-07's operator API responses. Names are kept
 // identical to CT-07's api_types.rs (MachineRow, EnrollmentRow,
@@ -57,6 +57,12 @@ export interface AuditVerifyResult {
 /** Shape of an error body returned by the operator API on non-2xx responses. */
 export interface ApiErrorBody {
   message: string;
+}
+
+/** Result of GET /api/auth/status. */
+export interface AuthStatus {
+  authenticated: boolean;
+  bootstrap_token_enabled: boolean;
 }
 
 /** Thrown by apiFetch for any non-2xx, non-401, non-403 response. */

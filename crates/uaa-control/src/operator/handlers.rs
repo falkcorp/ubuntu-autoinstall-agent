@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
 // last-edited: 2026-07-13
 
@@ -26,24 +26,27 @@
 //! plumbing this crate's `main.rs`/`listeners::serve` doesn't have today.
 //! Flagged here rather than silently shipped as if it were durable.
 //!
-//! No auth middleware is wired yet either: this plane is exactly as
-//! unauthenticated right now as the legacy `:25000` plane already is (which
-//! also serves the full registry, including `tpm_ek`, with zero auth) — not
-//! a new exposure for reads, but `POST /api/enrollments/:fp/approve` NOW
-//! performs REAL install-CA certificate issuance with zero caller
-//! authentication (any caller who can reach `:15001` can mint a
-//! server-identity cert for any pending enrollment). Deliberately left this
-//! way per explicit operator decision (2026-07-13: ship auth-gated-later
-//! rather than block enrollment/audit wiring on CT-03 landing first) — not
-//! the end state (spec Decision 19 gates this on CT-03's OAuth/RBAC landing
-//! on this router).
+//! # Auth (2026-07-13)
+//!
+//! Every route below is now gated by `crate::auth`'s (CT-03) RBAC middleware:
+//! reads require [`crate::auth::Role::Viewer`], mutations
+//! [`crate::auth::Role::Operator`], and the one self-service admin action
+//! (`POST /api/auth/bootstrap/disable`) requires [`crate::auth::Role::Admin`].
+//! [`router`] builds its own `Arc<AuthState>` + `Arc<BootstrapTokenState>` from
+//! the environment and layers them as `Extension`s over the whole sub-router —
+//! see `crate::auth`'s module doc (in particular its "Bootstrap admin token"
+//! section) for the full login story, including the temporary,
+//! disable-able exception it documents to spec Decision 8 while no GitHub
+//! OAuth app exists yet. `enroll::approve`/`reject`'s audit actor is now the
+//! real logged-in principal (`Extension<auth::Session>`, inserted by
+//! `auth::require_role`'s middleware) instead of a placeholder string.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Extension, Path as AxumPath, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -51,6 +54,9 @@ use axum::{
 };
 
 use crate::audit::{self, AuditStore, MemAuditStore};
+use crate::auth::{
+    self, AuthConfig, AuthState, BootstrapTokenState, GithubApi, RealGithubApi, Role,
+};
 use crate::ca::InstallCa;
 use crate::db::{
     store::{read_snapshot, write_snapshot, StatePaths},
@@ -59,6 +65,7 @@ use crate::db::{
 };
 use crate::enroll::{self, EnrollmentStore, MemEnrollmentStore};
 use crate::machine_plane::lifecycle::normalize_mac;
+use ring::rand::SecureRandom;
 
 use super::api_types::{ApiErrorBody, AuditVerifyResult, MachineRow};
 
@@ -68,12 +75,10 @@ const CLOUD_INIT_BASE: &str = "/var/www/html/cloud-init";
 /// Install CA persistence dir (mirrors `crate::ca::InstallCa::load_or_create`'s
 /// own doc comment for its production default).
 const CA_DIR: &str = "/var/lib/uaa/ca";
-/// Attribution for enrollment/audit mutations made through this API. There is
-/// no operator identity yet — CT-03 auth (spec Decision 19) is what would let
-/// this carry a real principal. Using a fixed, clearly-flagged string (rather
-/// than inventing a fake identity) keeps the audit trail honest about what it
-/// does and doesn't know.
-const UNAUTHENTICATED_OPERATOR: &str = "operator (no auth wired yet)";
+/// Where a freshly generated bootstrap token is also written (0600) so a human
+/// with SSH/server access can read it without grepping the service log —
+/// mirrors [`crate::auth::AuthConfig::state_dir`]'s HMAC-key file convention.
+const BOOTSTRAP_TOKEN_FILE: &str = "operator-bootstrap-token";
 
 // ── Registry seam (read + narrow write; mockable) ────────────────────────
 
@@ -364,39 +369,156 @@ fn default_state() -> AppState {
     }
 }
 
+/// Builds the CT-03 auth backend from the environment (`UAA_GITHUB_*`,
+/// `UAA_STATE_DIR`). Safe to call even with no GitHub OAuth app configured yet
+/// (`client_id`/`client_secret` empty) — `RealGithubApi` is only ever invoked
+/// from a real `/auth/callback` round trip, which can't complete without those
+/// set.
+///
+/// If the HMAC signing key can't be loaded/created (e.g. `state_dir` isn't
+/// writable), falls back to a fresh random in-memory-only key rather than
+/// failing router construction — matching this module's existing convention
+/// of keeping router/state construction side-effect-free-on-failure (see
+/// [`AppState::ca_dir`]'s doc comment for the same reasoning applied to CA
+/// loading). The degraded mode is a working plane whose sessions don't
+/// survive a restart, not a plane that fails to start; it's also what makes
+/// [`router`] callable in this crate's own tests, which run with no
+/// `/var/lib/uaa` access.
+fn default_auth_state() -> Arc<AuthState> {
+    let config = AuthConfig::from_env();
+    let hmac_key = auth::load_or_create_hmac_key(&config.state_dir).unwrap_or_else(|err| {
+        tracing::error!(
+            %err,
+            state_dir = %config.state_dir.display(),
+            "failed to load or create the operator-auth HMAC key; falling back to an \
+             ephemeral in-memory key (existing sessions will not survive a restart)"
+        );
+        let mut key = [0u8; 32];
+        ring::rand::SystemRandom::new()
+            .fill(&mut key)
+            .expect("system RNG unavailable");
+        key
+    });
+    let github: Arc<dyn GithubApi> = Arc::new(RealGithubApi::new(
+        config.client_id.clone(),
+        config.client_secret.clone(),
+        config.org.clone(),
+    ));
+    AuthState::new(config, github, hmac_key)
+}
+
+/// Builds the bootstrap-token stopgap (see `crate::auth`'s module doc) and, if
+/// enabled, generates the process's one outstanding token — logging it and
+/// writing it to [`BOOTSTRAP_TOKEN_FILE`] (0600) so an operator with server
+/// access can retrieve it without grepping logs.
+fn default_bootstrap_state(auth_state: &AuthState) -> Arc<BootstrapTokenState> {
+    let state_dir = auth_state.config().state_dir.clone();
+    let bootstrap = Arc::new(BootstrapTokenState::from_env(&state_dir));
+    if let Some(token) = bootstrap.generate() {
+        tracing::warn!(
+            %token,
+            "operator plane bootstrap admin token generated (single-use, 15-minute TTL) \
+             — POST {{\"token\": \"...\"}} to /api/auth/bootstrap to log in as admin until \
+             a real GitHub OAuth app is configured (UAA_GITHUB_CLIENT_ID/_SECRET)"
+        );
+        if let Err(err) = write_bootstrap_token_file(&state_dir, &token) {
+            tracing::error!(%err, "failed to write bootstrap token file");
+        }
+    }
+    bootstrap
+}
+
+fn write_bootstrap_token_file(state_dir: &Path, token: &str) -> std::io::Result<()> {
+    let path = state_dir.join(BOOTSTRAP_TOKEN_FILE);
+    std::fs::write(&path, format!("{token}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// The operator API sub-router, mounted under `/api/*`. Merged ahead of
 /// [`super::web_ui::router`]'s fallback so API paths are matched first.
 pub fn router() -> Router {
-    build_router(default_state())
+    let auth_state = default_auth_state();
+    let bootstrap_state = default_bootstrap_state(&auth_state);
+    build_router(default_state(), auth_state, bootstrap_state)
 }
 
-fn build_router(state: AppState) -> Router {
-    Router::new()
+/// Splits routes into four groups by the minimum [`Role`] they require (public,
+/// Viewer, Operator, Admin — see this module's `# Auth` doc section), finalizes
+/// each to `Router<()>` independently (some need [`AppState`], some
+/// `Arc<AuthState>`, some neither), then merges and layers the auth `Extension`s
+/// globally so `auth::require_role`'s middleware can find them on every route.
+fn build_router(
+    state: AppState,
+    auth_state: Arc<AuthState>,
+    bootstrap_state: Arc<BootstrapTokenState>,
+) -> Router {
+    let public = Router::new()
         .route("/healthz", get(handle_healthz))
-        .route("/api/machines", get(handle_list_machines))
-        .route("/api/machines/:mac", get(handle_get_machine))
-        .route("/api/machines/:mac/approve", post(handle_approve_machine))
-        .route(
-            "/api/machines/:mac/reinstall",
-            post(handle_reinstall_machine),
-        )
-        .route("/api/enrollments", get(handle_list_enrollments))
-        .route(
-            "/api/enrollments/:fp/approve",
-            post(handle_approve_enrollment),
-        )
-        .route(
-            "/api/enrollments/:fp/reject",
-            post(handle_reject_enrollment),
-        )
-        .route("/api/discovered", get(handle_list_discovered))
-        .route(
-            "/api/discovered/:mac/dismiss",
-            post(handle_dismiss_discovered),
-        )
-        .route("/api/audit", get(handle_list_audit))
-        .route("/api/audit/verify", get(handle_verify_audit))
-        .with_state(state)
+        .route("/api/auth/status", get(auth::auth_status_handler))
+        .route("/api/auth/bootstrap", post(auth::bootstrap_login_handler))
+        .with_state(state.clone());
+
+    let oauth = Router::new()
+        .route("/auth/login", get(auth::login_handler))
+        .route("/auth/callback", get(auth::callback_handler))
+        .with_state(auth_state.clone());
+
+    let viewer_routes = auth::require_role(
+        Router::new()
+            .route("/api/machines", get(handle_list_machines))
+            .route("/api/machines/:mac", get(handle_get_machine))
+            .route("/api/enrollments", get(handle_list_enrollments))
+            .route("/api/discovered", get(handle_list_discovered))
+            .route("/api/audit", get(handle_list_audit))
+            .route("/api/audit/verify", get(handle_verify_audit))
+            .with_state(state.clone()),
+        Role::Viewer,
+    );
+
+    let operator_routes = auth::require_role(
+        Router::new()
+            .route("/api/machines/:mac/approve", post(handle_approve_machine))
+            .route(
+                "/api/machines/:mac/reinstall",
+                post(handle_reinstall_machine),
+            )
+            .route(
+                "/api/enrollments/:fp/approve",
+                post(handle_approve_enrollment),
+            )
+            .route(
+                "/api/enrollments/:fp/reject",
+                post(handle_reject_enrollment),
+            )
+            .route(
+                "/api/discovered/:mac/dismiss",
+                post(handle_dismiss_discovered),
+            )
+            .with_state(state),
+        Role::Operator,
+    );
+
+    // No AppState needed — stays `Router<()>` without an explicit `with_state`.
+    let admin_routes = auth::require_role(
+        Router::new().route(
+            "/api/auth/bootstrap/disable",
+            post(auth::disable_bootstrap_handler),
+        ),
+        Role::Admin,
+    );
+
+    public
+        .merge(oauth)
+        .merge(viewer_routes)
+        .merge(operator_routes)
+        .merge(admin_routes)
+        .layer(Extension(auth_state))
+        .layer(Extension(bootstrap_state))
 }
 
 /// `GET /healthz` — matched here (ahead of `web_ui`'s SPA catch-all
@@ -482,6 +604,7 @@ async fn handle_list_enrollments(State(state): State<AppState>) -> Response {
 
 async fn handle_approve_enrollment(
     State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
     AxumPath(fp): AxumPath<String>,
 ) -> Response {
     match state.enrollment_store.get(&fp).await {
@@ -504,7 +627,7 @@ async fn handle_approve_enrollment(
         &ca,
         state.audit_store.as_ref(),
         &fp,
-        UNAUTHENTICATED_OPERATOR,
+        &session.login,
     )
     .await
     {
@@ -521,6 +644,7 @@ async fn handle_approve_enrollment(
 
 async fn handle_reject_enrollment(
     State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
     AxumPath(fp): AxumPath<String>,
 ) -> Response {
     match state.enrollment_store.get(&fp).await {
@@ -535,7 +659,7 @@ async fn handle_reject_enrollment(
         state.enrollment_store.as_ref(),
         state.audit_store.as_ref(),
         &fp,
-        UNAUTHENTICATED_OPERATOR,
+        &session.login,
     )
     .await
     {
@@ -703,6 +827,16 @@ mod tests {
             audit_store,
             ca_dir: Arc::new(ca_dir),
         }
+    }
+
+    /// A stand-in authenticated principal for tests that call a protected
+    /// handler function directly (bypassing the router, so `auth::require_role`
+    /// never runs to insert a real one).
+    fn test_session() -> Extension<auth::Session> {
+        Extension(auth::Session {
+            login: "test-operator".to_string(),
+            role: Role::Operator,
+        })
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -940,7 +1074,8 @@ mod tests {
             audit_store.clone(),
         );
 
-        let resp = handle_approve_enrollment(State(state), AxumPath(fp.clone())).await;
+        let resp =
+            handle_approve_enrollment(State(state), test_session(), AxumPath(fp.clone())).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let row = enrollment_store.get(&fp).await.unwrap().unwrap();
@@ -958,7 +1093,12 @@ mod tests {
     async fn test_approve_unknown_enrollment_404() {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
-        let resp = handle_approve_enrollment(State(state), AxumPath("no-such-fp".to_string())).await;
+        let resp = handle_approve_enrollment(
+            State(state),
+            test_session(),
+            AxumPath("no-such-fp".to_string()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -982,7 +1122,8 @@ mod tests {
             audit_store,
         );
 
-        let resp = handle_reject_enrollment(State(state), AxumPath(fp.clone())).await;
+        let resp =
+            handle_reject_enrollment(State(state), test_session(), AxumPath(fp.clone())).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         let row = enrollment_store.get(&fp).await.unwrap().unwrap();
         assert_eq!(row.state, crate::db::EnrollmentState::Rejected);
@@ -992,7 +1133,12 @@ mod tests {
     async fn test_reject_unknown_enrollment_404() {
         let dir = tempdir().unwrap();
         let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
-        let resp = handle_reject_enrollment(State(state), AxumPath("no-such-fp".to_string())).await;
+        let resp = handle_reject_enrollment(
+            State(state),
+            test_session(),
+            AxumPath("no-such-fp".to_string()),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1017,7 +1163,8 @@ mod tests {
             enrollment_store,
             audit_store,
         );
-        let resp = handle_approve_enrollment(State(state.clone()), AxumPath(fp)).await;
+        let resp =
+            handle_approve_enrollment(State(state.clone()), test_session(), AxumPath(fp)).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
         let list_resp = handle_list_audit(State(state.clone())).await;
@@ -1054,5 +1201,225 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["checked"], 0);
         assert!(body["message"].is_null());
+    }
+
+    // ── Router-level auth wiring (real `build_router`, real middleware) ──────
+    //
+    // Everything above calls handler functions directly, bypassing
+    // `auth::require_role` entirely. These tests instead build the ACTUAL
+    // router `router()`'s production code path constructs, and drive it with
+    // `tower::ServiceExt::oneshot` — the only way to prove the middleware is
+    // actually wired onto the routes it's supposed to protect, not just that
+    // the handlers behave correctly when called directly.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Builds the same router `router()` does in production, but against a
+    /// tempdir (so it never touches `/var/lib/uaa`) and with the bootstrap
+    /// token forced on regardless of the ambient environment, returning the
+    /// one valid raw token alongside it. The tempdir is returned too so it
+    /// stays alive for the test's duration.
+    fn test_full_router() -> (Router, String, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let app_state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
+
+        let auth_config = AuthConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            org: "falkcorp".to_string(),
+            admin_team: "uaa-admins".to_string(),
+            operator_team: "uaa-operators".to_string(),
+            state_dir: dir.path().to_path_buf(),
+        };
+        let hmac_key = auth::load_or_create_hmac_key(&auth_config.state_dir).unwrap();
+        let github: Arc<dyn GithubApi> = Arc::new(RealGithubApi::new(
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
+        let auth_state = AuthState::new(auth_config, github, hmac_key);
+
+        let bootstrap_state = Arc::new(BootstrapTokenState::new(dir.path(), false));
+        let token = bootstrap_state.generate().expect("enabled by construction");
+
+        let router = build_router(app_state, auth_state, bootstrap_state);
+        (router, token, dir)
+    }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn session_cookie_from(resp: &Response) -> String {
+        resp.headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .find_map(|v| {
+                let s = v.to_str().ok()?;
+                s.starts_with("uaa_session=")
+                    .then(|| s.split(';').next().unwrap().to_string())
+            })
+            .expect("response must set a uaa_session cookie")
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_read_is_401_not_open() {
+        // Before this wiring, `/api/machines` had zero auth at all — proves
+        // that gap is closed.
+        let (router, _token, _dir) = test_full_router();
+        let resp = router.oneshot(get("/api/machines")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_approve_enrollment_is_401_not_open() {
+        // THE originally-flagged critical gap: real cert issuance with zero
+        // caller authentication. Proves it's closed.
+        let (router, _token, _dir) = test_full_router();
+        let resp = router
+            .oneshot(post("/api/enrollments/some-fp/approve"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_healthz_and_auth_status_need_no_session() {
+        let (router, _token, _dir) = test_full_router();
+        let healthz = router.clone().oneshot(get("/healthz")).await.unwrap();
+        assert_eq!(healthz.status(), StatusCode::OK);
+        let status = router.oneshot(get("/api/auth/status")).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = body_json(status).await;
+        assert_eq!(body["authenticated"], false);
+        assert_eq!(body["bootstrap_token_enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_login_then_protected_route_succeeds() {
+        let (router, token, _dir) = test_full_router();
+
+        let login_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"token": token}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::OK);
+        let cookie = session_cookie_from(&login_resp);
+
+        // A read (Viewer-gated)...
+        let read = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/machines")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+
+        // ...and a mutation (Operator-gated) both succeed under the same
+        // bootstrap-minted session, proving it carries Admin (>= both).
+        let mutate = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/enrollments/no-such-fp/approve")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 404 (unknown fingerprint), NOT 401/403 — proves the session passed
+        // the auth gate and reached the real handler.
+        assert_eq!(mutate.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_login_wrong_token_401_grants_no_session() {
+        let (router, _token, _dir) = test_full_router();
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"token": "uaabs_wrong"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+            "a rejected bootstrap login must never set a session cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_disable_then_login_endpoint_stops_accepting_tokens() {
+        let (router, token, _dir) = test_full_router();
+
+        // Log in once to get an admin session capable of calling the
+        // disable endpoint.
+        let login_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"token": token}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = session_cookie_from(&login_resp);
+
+        let disable_resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/bootstrap/disable")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disable_resp.status(), StatusCode::OK);
+
+        let status = router.oneshot(get("/api/auth/status")).await.unwrap();
+        let body = body_json(status).await;
+        assert_eq!(body["bootstrap_token_enabled"], false);
     }
 }

@@ -1,7 +1,7 @@
 /* file: web/src/index.css */
-/* version: 1.0.0 */
+/* version: 1.1.0 */
 /* guid: eda64990-a578-4026-b133-dee17e5db539 */
-/* last-edited: 2026-07-10 */
+/* last-edited: 2026-07-13 */
 
 :root {
   color-scheme: light dark;
@@ -106,4 +106,41 @@ td {
 
 .approvals-section {
   margin-bottom: 1.5rem;
+}
+
+.banner-error {
+  border: 1px solid #c0392b;
+}
+
+.login-page {
+  max-width: 28rem;
+  margin: 2rem auto;
+}
+
+.login-option {
+  border: 1px solid #8888;
+  border-radius: 0.5rem;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.login-option form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border-radius: 0.4rem;
+  text-decoration: none;
+  text-align: center;
+  cursor: pointer;
+}
+
+.button-primary {
+  border: 1px solid #2e7d32;
+  color: inherit;
 }
