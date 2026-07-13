@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/enroll.rs
-// version: 1.1.1
+// version: 1.2.0
 // guid: 1a81d662-89c9-4e64-8ce9-9aa51fd3a412
 // last-edited: 2026-07-13
 
@@ -91,6 +91,10 @@ pub trait EnrollmentStore: Send + Sync {
     async fn update(&self, row: EnrollmentRow) -> anyhow::Result<()>;
     /// Every row currently `issued` for `mac` — used by [`approve`]'s supersede rule.
     async fn list_issued_for_mac(&self, mac: &str) -> anyhow::Result<Vec<EnrollmentRow>>;
+    /// Every row regardless of state — the operator-plane listing view
+    /// (`GET /api/enrollments`) needs to see `pending` rows awaiting a
+    /// decision, not just `issued` ones.
+    async fn list_all(&self) -> anyhow::Result<Vec<EnrollmentRow>>;
 }
 
 /// In-memory [`EnrollmentStore`] — ALWAYS compiled (not `#[cfg(test)]`): this
@@ -137,6 +141,10 @@ impl EnrollmentStore for MemEnrollmentStore {
             .filter(|r| r.mac.as_deref() == Some(mac) && r.state == EnrollmentState::Issued)
             .cloned()
             .collect())
+    }
+
+    async fn list_all(&self) -> anyhow::Result<Vec<EnrollmentRow>> {
+        Ok(self.rows.lock().unwrap().values().cloned().collect())
     }
 }
 
@@ -374,8 +382,10 @@ pub async fn revoke(
 
 /// Extracts the DNS SAN (the agent-claimed hostname) from a stored CSR — the
 /// `enrollments` table has no separate hostname column, so the CSR itself is the
-/// source of truth at sign time (see [`approve`]).
-fn hostname_from_csr(csr_pem: &str) -> anyhow::Result<String> {
+/// source of truth at sign time (see [`approve`]). `pub(crate)` so the operator
+/// API's `GET /api/enrollments` listing can display a `claimed_hostname` without
+/// the table growing a redundant column.
+pub(crate) fn hostname_from_csr(csr_pem: &str) -> anyhow::Result<String> {
     let params = rcgen::CertificateSigningRequestParams::from_pem(csr_pem)
         .map_err(|e| anyhow::anyhow!("invalid CSR: {e}"))?
         .params;
@@ -642,6 +652,44 @@ mod tests {
 
         // Exactly one row for this fp — the second submit must not have appended.
         assert!(store.get(&first.spki_fingerprint).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_returns_every_state() {
+        let store = MemEnrollmentStore::new();
+        let ca = test_ca();
+        let audit = MemAuditStore::new();
+        let pending = identity("pending-host", "aa:bb:cc:dd:ee:01");
+        let approved = identity("approved-host", "aa:bb:cc:dd:ee:02");
+        submit_csr(
+            &store,
+            &ca,
+            &audit,
+            &csr_for(&pending),
+            &pending.mac,
+            &pending.hostname,
+        )
+        .await
+        .unwrap();
+        let issued = submit_csr(
+            &store,
+            &ca,
+            &audit,
+            &csr_for(&approved),
+            &approved.mac,
+            &approved.hostname,
+        )
+        .await
+        .unwrap();
+        approve(&store, &ca, &audit, &issued.spki_fingerprint, "tester")
+            .await
+            .unwrap();
+
+        let mut all = store.list_all().await.unwrap();
+        all.sort_by(|a, b| a.spki_fingerprint.cmp(&b.spki_fingerprint));
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|r| r.state == EnrollmentState::Pending));
+        assert!(all.iter().any(|r| r.state == EnrollmentState::Issued));
     }
 
     // ── fail-closed 404 ───────────────────────────────────────────────────
