@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/server-deploy.sh
-# version: 1.1.0
+# version: 1.2.0
 # guid: 9e2f4a71-0b6d-4c8e-9a3f-1d5c7e8b2f60
-# last-edited: 2026-07-11
+# last-edited: 2026-07-13
 #
 # Repeatable build+deploy for the uaa constellation control daemon on the server
 # (172.16.2.30). Lives in the repo so `git pull` always ships the latest version of
@@ -151,7 +151,7 @@ status() {
     systemctl status uaa-control.socket || true
     echo
     echo "--- health checks ---"
-    for port in 25000 7443 7444 8443; do
+    for port in 25000 7443 7444 15001; do
         curl -s -m 2 "http://127.0.0.1:${port}/healthz" && echo || echo "port ${port}: no response"
     done
 }
