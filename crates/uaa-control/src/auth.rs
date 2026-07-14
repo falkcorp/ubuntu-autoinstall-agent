@@ -53,15 +53,19 @@
 //! No GitHub OAuth app exists yet to authenticate against — `AuthConfig::client_id`
 //! is empty until one is created. Rather than leave the operator plane fully
 //! inaccessible until then, [`BootstrapTokenState`] mints a real, HMAC-signed
-//! session (via [`AuthState::mint_bootstrap_session`], the exact same
-//! [`mint_session`] every OAuth login uses) for a single fixed, non-GitHub identity
-//! ([`BOOTSTRAP_ADMIN_LOGIN`]) that [`AuthState::effective_role`] always resolves to
-//! [`Role::Admin`] without ever calling GitHub. This IS the "alternate way to mint a
-//! session" the section above says doesn't exist elsewhere in this file — it exists
-//! narrowly, only here, only for one hardcoded identity string a forged cookie can
-//! never claim without the server's own HMAC key. It is explicitly disable-able two
-//! ways (env var for operators, a self-service admin API for whoever is logged in)
-//! so it can retire the moment a real OAuth app is configured.
+//! session (via [`AuthState::mint_bootstrap_session`]) carrying a payload bit,
+//! `is_bootstrap: true`, that [`AuthState::effective_role`] resolves straight to
+//! [`Role::Admin`] without ever calling GitHub. This IS the "alternate way to
+//! mint a session" the section above says doesn't exist elsewhere in this file
+//! — it exists narrowly, only here, gated on a bit inside the SAME HMAC-signed
+//! payload every session cookie carries, so nothing outside code that holds the
+//! signing key can ever set it (in particular: NOT the session's `login`
+//! string — GitHub usernames are chosen by the account holder, including via
+//! org/Enterprise-Managed-User accounts that permit underscores, so no string
+//! comparison against `login` belongs anywhere in this decision). It is
+//! explicitly disable-able two ways (env var for operators, a self-service
+//! admin API for whoever is logged in) so it can retire the moment a real
+//! OAuth app is configured.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -104,18 +108,18 @@ pub const OAUTH_STATE_COOKIE_NAME: &str = "uaa_oauth_state";
 /// The HMAC key file's name under [`AuthConfig::state_dir`].
 const HMAC_KEY_FILE: &str = "auth_hmac.key";
 
-/// The one non-GitHub identity [`AuthState::effective_role`] treats as permanent
-/// [`Role::Admin`] — see the module doc's "Bootstrap admin token" section.
-/// Deliberately contains an underscore: GitHub usernames may only contain
-/// alphanumeric characters or single hyphens (never underscores, and never
-/// consecutive/leading/trailing hyphens), so this value can PROVABLY never be
-/// returned by [`GithubApi::user_login`] for a real account — a GitHub user
-/// registering or renaming their account to collide with this sentinel would
-/// otherwise let them claim a permanent, non-degrading Admin session via the
-/// ordinary OAuth login path, regardless of their actual org/team membership.
-/// Nothing else in this file ever mints a session under this identity except
-/// [`AuthState::mint_bootstrap_session`].
-pub const BOOTSTRAP_ADMIN_LOGIN: &str = "__bootstrap_admin__";
+/// The `login` shown for a bootstrap-token session — see the module doc's
+/// "Bootstrap admin token" section. This is a DISPLAY LABEL ONLY (shows up in
+/// the audit log / UI as the acting principal) and carries no security
+/// meaning: it is never compared against to decide anything.
+/// [`AuthState::effective_role`] grants the bootstrap stopgap's permanent
+/// [`Role::Admin`] based on [`Session::is_bootstrap`] — a bit inside the
+/// HMAC-signed cookie payload that only [`AuthState::mint_bootstrap_session`]
+/// ever sets — specifically so that no string chosen here needs to be, or
+/// stay, unrepresentable as a real GitHub login (GitHub username rules differ
+/// across personal/org/Enterprise-Managed-User accounts and are not this
+/// crate's to rely on).
+pub const BOOTSTRAP_ADMIN_LOGIN: &str = "bootstrap-admin";
 
 // ── Role + config ───────────────────────────────────────────────────────────────
 
@@ -349,6 +353,16 @@ fn map_role(config: &AuthConfig, membership: &OrgMembership) -> Option<Role> {
 pub struct Session {
     pub login: String,
     pub role: Role,
+    /// `true` only for a session minted by [`AuthState::mint_bootstrap_session`].
+    /// This — not any property of `login`'s string content — is what
+    /// [`AuthState::effective_role`] trusts to grant the bootstrap stopgap's
+    /// permanent Admin role. It comes from the HMAC-signed payload, so it can't
+    /// be set by anything other than server-side code that holds the signing
+    /// key; a real GitHub OAuth login can never produce `true` here, no matter
+    /// what a GitHub account (personal, org, or Enterprise Managed User) is
+    /// named — usernames are attacker-influenceable (a user can register or
+    /// rename an account), so no string comparison ever belongs in this role.
+    pub is_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,15 +370,30 @@ struct SessionPayload {
     login: String,
     role: Role,
     exp: u64,
+    #[serde(default)]
+    is_bootstrap: bool,
 }
 
 /// Signs `{login, role, exp}` into `uaa_session=<base64(payload)>.<base64(hmac)>`.
-/// `now` is unix seconds; the cookie expires `SESSION_TTL_SECS` later.
+/// `now` is unix seconds; the cookie expires `SESSION_TTL_SECS` later. Always
+/// mints a non-bootstrap session — see [`AuthState::mint_bootstrap_session`]
+/// for the one place `is_bootstrap: true` is ever set.
 pub fn mint_session(key: &[u8; 32], login: &str, role: Role, now: u64) -> String {
+    mint_session_with_flags(key, login, role, now, false)
+}
+
+fn mint_session_with_flags(
+    key: &[u8; 32],
+    login: &str,
+    role: Role,
+    now: u64,
+    is_bootstrap: bool,
+) -> String {
     let payload = SessionPayload {
         login: login.to_string(),
         role,
         exp: now.saturating_add(SESSION_TTL_SECS),
+        is_bootstrap,
     };
     let payload_bytes = serde_json::to_vec(&payload).expect("session payload always serializes");
     let payload_b64 = BASE64.encode(&payload_bytes);
@@ -389,6 +418,7 @@ pub fn verify_session(key: &[u8; 32], cookie: &str, now: u64) -> Option<Session>
     Some(Session {
         login: payload.login,
         role: payload.role,
+        is_bootstrap: payload.is_bootstrap,
     })
 }
 
@@ -508,14 +538,22 @@ impl AuthState {
             .insert(login.to_string(), token.to_string());
     }
 
-    /// Mints a session for [`BOOTSTRAP_ADMIN_LOGIN`] using this state's own HMAC
-    /// key — the SAME [`mint_session`] a real OAuth callback calls, so a bootstrap
-    /// cookie and an OAuth cookie are indistinguishable to [`check_access`]/
-    /// [`require_role`]. There is no token/membership to cache — the resulting
-    /// session is never subject to the 5-minute role-cache TTL; see
-    /// [`Self::effective_role`]'s special case for why it doesn't need to be.
+    /// Mints a session carrying the signed `is_bootstrap: true` flag — the same
+    /// cookie SHAPE and signing key a real OAuth callback uses, but a payload
+    /// bit only server-side code holding the HMAC key can ever set. There is no
+    /// token/membership to cache — the resulting session is never subject to
+    /// the 5-minute role-cache TTL; see [`Self::effective_role`]'s special case
+    /// for why it doesn't need to be. [`BOOTSTRAP_ADMIN_LOGIN`] is used only as
+    /// the human-readable `login` shown in audit/UI — it carries no security
+    /// meaning (see its doc comment).
     pub fn mint_bootstrap_session(&self, now_unix: u64) -> String {
-        mint_session(&self.hmac_key, BOOTSTRAP_ADMIN_LOGIN, Role::Admin, now_unix)
+        mint_session_with_flags(
+            &self.hmac_key,
+            BOOTSTRAP_ADMIN_LOGIN,
+            Role::Admin,
+            now_unix,
+            true,
+        )
     }
 
     /// The role to apply to the CURRENT request only: a fresh cache hit returns the
@@ -525,12 +563,15 @@ impl AuthState {
     /// request. The cache itself is left untouched on failure (never poisoned to
     /// Viewer), so the next request retries the refresh rather than being stuck.
     ///
-    /// [`BOOTSTRAP_ADMIN_LOGIN`] is special-cased ahead of the cache: it has no
-    /// GitHub token to refresh against, so without this it would silently degrade
-    /// to Viewer after [`ROLE_CACHE_TTL`] — a bootstrap-token login is admin for
-    /// its whole session, not just 5 minutes of it.
-    async fn effective_role(&self, login: &str) -> Role {
-        if login == BOOTSTRAP_ADMIN_LOGIN {
+    /// `is_bootstrap` (from the verified, HMAC-signed cookie payload — never
+    /// derived from `login`'s string content, which a real GitHub user could
+    /// always influence by registering or renaming an account) short-circuits
+    /// straight to [`Role::Admin`]: there's no GitHub token to refresh against,
+    /// so without this a bootstrap session would silently degrade to Viewer
+    /// after [`ROLE_CACHE_TTL`] — it's meant to be admin for its whole session,
+    /// not just 5 minutes of it.
+    async fn effective_role(&self, login: &str, is_bootstrap: bool) -> Role {
+        if is_bootstrap {
             return Role::Admin;
         }
         if let Some((role, cached_at)) = self.role_cache.lock().unwrap().get(login).copied() {
@@ -774,13 +815,13 @@ pub async fn complete_oauth_callback(
         Ok(login) => login,
         Err(_) => return CallbackOutcome::GithubError,
     };
-    // Defense in depth: `BOOTSTRAP_ADMIN_LOGIN` is chosen to be unrepresentable
-    // as a real GitHub username (see its doc comment), but a real login flow
-    // must never mint a session under that identity regardless — refuse
-    // outright rather than relying solely on that invariant holding.
-    if login == BOOTSTRAP_ADMIN_LOGIN {
-        return CallbackOutcome::Denied;
-    }
+    // No check against BOOTSTRAP_ADMIN_LOGIN here, deliberately: a real GitHub
+    // user could legitimately be named that (see its doc comment — GitHub
+    // usernames are attacker/user-influenceable, including via org/EMU
+    // accounts that permit underscores), and this code path always mints via
+    // `mint_session` -> `is_bootstrap: false` regardless of `login`'s value —
+    // that flag, not the string, is what `effective_role` trusts. A real user
+    // who happens to share this name just gets their real mapped role.
     let membership = match state.github.org_role(&token, &login).await {
         Ok(membership) => membership,
         Err(_) => return CallbackOutcome::GithubError,
@@ -828,11 +869,14 @@ pub async fn check_access(
     let Some(session) = verify_session(&state.hmac_key, cookie_value, now_unix) else {
         return AccessDecision::Unauthenticated;
     };
-    let role = state.effective_role(&session.login).await;
+    let role = state
+        .effective_role(&session.login, session.is_bootstrap)
+        .await;
     if role >= min {
         AccessDecision::Allow(Session {
             login: session.login,
             role,
+            is_bootstrap: session.is_bootstrap,
         })
     } else {
         AccessDecision::Forbidden
@@ -1284,23 +1328,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oauth_login_cannot_claim_bootstrap_admin_identity() {
-        // Regression test for a privilege-escalation path: even if a
-        // GithubApi impl somehow returned BOOTSTRAP_ADMIN_LOGIN as a `login`
-        // (impossible for the real API since GitHub usernames can't contain
-        // underscores, but this must hold regardless of that external
-        // invariant), the OAuth callback must refuse to mint a session for
-        // it — never granting the permanent, non-degrading Admin role the
-        // bootstrap-token path gets.
-        let (state, _mock, _dir) = test_state(MockGithubApi::healthy(
-            BOOTSTRAP_ADMIN_LOGIN,
-            vec!["uaa-admins".to_string()],
-            true,
-        ));
-        match login_via_mock(&state).await {
-            CallbackOutcome::Denied => {}
-            other => panic!("expected Denied, got {other:?}"),
-        }
+    async fn test_real_oauth_login_sharing_bootstrap_display_name_gets_no_special_treatment() {
+        // Regression test for the privilege-escalation path a prior version of
+        // this code had: a real GitHub user whose `login` happens to equal
+        // BOOTSTRAP_ADMIN_LOGIN (a real possibility — GitHub usernames are
+        // chosen by the account holder, and org/Enterprise-Managed-User
+        // accounts permit underscores) must NOT get the bootstrap stopgap's
+        // permanent, non-degrading Admin role. They should get exactly the
+        // role their actual (mocked) org/team membership maps to — here,
+        // Viewer, since they aren't on `uaa-admins`/`uaa-operators` — proving
+        // the decision is driven by the signed `is_bootstrap` flag, never by
+        // comparing `login` against the constant.
+        let (state, _mock, _dir) =
+            test_state(MockGithubApi::healthy(BOOTSTRAP_ADMIN_LOGIN, vec![], true));
+        let cookie = match login_via_mock(&state).await {
+            CallbackOutcome::Success { cookie, role, .. } => {
+                assert_eq!(
+                    role,
+                    Role::Viewer,
+                    "must get their REAL mapped role, not Admin"
+                );
+                cookie
+            }
+            other => panic!("expected Success(Viewer), got {other:?}"),
+        };
+
+        // And it must not silently become Admin later either, e.g. via
+        // effective_role somehow keying off the login string on a cache miss.
+        let decision = check_access(&state, Role::Operator, Some(&cookie), unix_now()).await;
+        assert!(
+            matches!(decision, AccessDecision::Forbidden),
+            "a Viewer sharing the bootstrap display name must still be denied Operator+, got {decision:?}"
+        );
     }
 
     #[tokio::test]

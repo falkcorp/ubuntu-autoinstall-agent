@@ -860,6 +860,7 @@ mod tests {
         Extension(auth::Session {
             login: "test-operator".to_string(),
             role: Role::Operator,
+            is_bootstrap: false,
         })
     }
 
