@@ -1,5 +1,5 @@
 # file: .github/workflows/reusable-ci.yml
-# version: 1.0.2
+# version: 1.1.0
 # guid: a1b2c3d4-e5f6-7a8b-9c0d-1e2f3a4b5c6d
 
 name: Reusable CI Workflow
@@ -111,6 +111,13 @@ jobs:
         with:
           toolchain: ${{ matrix.version }}
 
+      - name: Install cargo-tarpaulin
+        if: matrix.language == 'rust'
+        run: |
+          if ! command -v cargo-tarpaulin >/dev/null 2>&1; then
+            cargo install cargo-tarpaulin --locked
+          fi
+
       - name: Run Rust tests
         if: matrix.language == 'rust'
         run: |
@@ -123,11 +130,28 @@ jobs:
         with:
           node-version: ${{ matrix.version }}
 
+      - name: Detect Node project directory
+        if: matrix.language == 'node'
+        id: node-project
+        run: |
+          # This repo's Node/TS project lives under web/, not the repo root
+          # (a Rust workspace) — fall back to root only if it has its own
+          # package.json, so this step still works for a Node-primary repo.
+          if [ -f web/package.json ]; then
+            echo "dir=web" >> "$GITHUB_OUTPUT"
+          else
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run Node.js tests
         if: matrix.language == 'node'
+        working-directory: ${{ steps.node-project.outputs.dir }}
         run: |
           npm ci
-          npm test -- --coverage
+          # --if-present: this repo has no JS test suite yet (web/package.json
+          # defines no "test" script) — a missing script must not fail CI;
+          # it will start running the moment a real test script is added.
+          npm run --if-present test -- --coverage
 
       - name: Upload coverage
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # file: tests/workflow_scripts/test_ci_workflow.py
-# version: 1.0.0
+# version: 1.1.0
 # guid: c3d4e5f6-a7b8-9c0d-1e2f-3a4b5c6d7e8f
 
 """Unit tests for ci_workflow module."""
@@ -351,4 +351,60 @@ def test_generate_test_matrix_invalid_branch_version(
 
     captured = capsys.readouterr()
     assert "Branch target 1.23 not in configured versions" in captured.out
+    assert len(matrix["include"]) == 0
+
+
+def test_is_unresolved_track_marker() -> None:
+    """is_unresolved_track_marker matches only `stable-N`-shaped strings."""
+    assert ci_workflow.is_unresolved_track_marker("stable-1") is True
+    assert ci_workflow.is_unresolved_track_marker("stable-2") is True
+    assert ci_workflow.is_unresolved_track_marker("stable") is False
+    assert ci_workflow.is_unresolved_track_marker("1.23") is False
+    assert ci_workflow.is_unresolved_track_marker("stable-1.23") is False
+
+
+def test_generate_test_matrix_skips_unresolved_track_marker() -> None:
+    """A `stable-N` config entry never reaches the matrix as a literal
+    version on a branch that doesn't resolve it — regression test for
+    `rustup toolchain install stable-1` failing in CI because the "rust"
+    version list (`["stable", "stable-1"]`) was passed straight through
+    unfiltered on ordinary (non `stable-1-rust-*`) branches.
+    """
+    languages = ["rust"]
+    versions = {"rust": ["stable", "stable-1"]}
+    platforms = ["ubuntu-latest", "macos-latest"]
+
+    matrix = ci_workflow.generate_test_matrix(
+        languages,
+        versions,
+        platforms,
+        optimize=True,
+        branch_name="feat/some-feature",
+    )
+
+    entries = matrix["include"]
+    assert entries, "the resolvable 'stable' entry must still produce jobs"
+    assert all(entry["version"] != "stable-1" for entry in entries)
+    assert all(entry["version"] == "stable" for entry in entries)
+
+
+def test_generate_test_matrix_only_track_markers_configured(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If a language's ENTIRE version list is unresolved track markers,
+    generate_test_matrix skips it (with a warning) rather than emitting
+    invalid matrix entries."""
+    languages = ["rust"]
+    versions = {"rust": ["stable-1", "stable-2"]}
+    platforms = ["ubuntu-latest"]
+
+    matrix = ci_workflow.generate_test_matrix(
+        languages,
+        versions,
+        platforms,
+        branch_name="main",
+    )
+
+    captured = capsys.readouterr()
+    assert "no concrete version resolved" in captured.out
     assert len(matrix["include"]) == 0

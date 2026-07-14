@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # file: .github/workflows/scripts/ci_workflow.py
-# version: 1.0.0
+# version: 1.1.0
 # guid: f6a7b8c9-d0e1-2f3a-4b5c-6d7e8f9a0b1c
 
 """CI workflow helper functions for matrix generation and change detection.
@@ -133,6 +133,20 @@ def get_branch_version_target(branch_name: str, language: str) -> str | None:
     return None
 
 
+def is_unresolved_track_marker(version: str) -> bool:
+    """True for a `stable-N` placeholder (e.g. `stable-1`) configured as a
+    version entry — meaningful ONLY when resolved via a matching
+    `stable-N-<language>-<version>` branch name (see
+    `get_branch_version_target`). On any other branch there is no concrete
+    toolchain/version behind it, so it must never be passed through to a
+    real toolchain installer literally — e.g. `rustup toolchain install
+    stable-1` is not a valid channel name and always fails.
+    """
+    import re
+
+    return bool(re.match(r"^stable-\d+$", version))
+
+
 def generate_test_matrix(
     languages: list[str],
     versions: dict[str, list[str]] | None = None,
@@ -197,6 +211,17 @@ def generate_test_matrix(
                     }
                 )
             continue
+
+        resolved_versions = [
+            version for version in lang_versions if not is_unresolved_track_marker(version)
+        ]
+        if not resolved_versions:
+            print(
+                f"⚠️  {language}: no concrete version resolved on branch "
+                f"{branch_name} (only stable-N track markers configured), skipping"
+            )
+            continue
+        lang_versions = resolved_versions
 
         if optimize:
             latest_version = lang_versions[-1]
