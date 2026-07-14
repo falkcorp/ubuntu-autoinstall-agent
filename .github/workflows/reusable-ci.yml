@@ -102,7 +102,10 @@ jobs:
       - name: Run Python tests
         if: matrix.language == 'python'
         run: |
-          pip install pytest pytest-cov
+          # pyyaml/requests: this repo's actual Python (the .github/workflows
+          # /scripts/ CI helpers + their tests) imports both transitively;
+          # without them collection fails before any test runs.
+          pip install pytest pytest-cov pyyaml requests
           pytest --cov --cov-report=term-missing
 
       - name: Set up Rust
