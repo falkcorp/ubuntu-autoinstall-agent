@@ -283,39 +283,47 @@ async fn serve_uaa_config(state: &AppState, client_ip: &str) -> Response {
 // ── Axum handlers (State first, ConnectInfo last — no body extractor on a
 // GET route) ────────────────────────────────────────────────────────────
 
+// `.to_canonical()` is load-bearing: `uaa-control.socket`'s `ListenStream=25000` has
+// no `BindIPv6Only=`, so systemd hands us a dual-stack `[::]:25000` fd (Ubuntu default
+// bindv6only=0). Every real IPv4 client then arrives as an IPv4-mapped IPv6 address
+// (`::ffff:a.b.c.d`), which `ip neigh show` never matches against the kernel's ARP
+// table (stored under the bare IPv4 form) — every real machine was silently denied
+// until this was added. The dev-fallback `0.0.0.0` bind path (and every test, which
+// uses synthetic V4 `SocketAddr`s) never hits this, which is why it went unnoticed.
+
 async fn handle_user_data(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_seed_file(&state, &addr.ip().to_string(), "user-data").await
+    serve_seed_file(&state, &addr.ip().to_canonical().to_string(), "user-data").await
 }
 
 async fn handle_meta_data(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_seed_file(&state, &addr.ip().to_string(), "meta-data").await
+    serve_seed_file(&state, &addr.ip().to_canonical().to_string(), "meta-data").await
 }
 
 async fn handle_vendor_data(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_seed_file(&state, &addr.ip().to_string(), "vendor-data").await
+    serve_seed_file(&state, &addr.ip().to_canonical().to_string(), "vendor-data").await
 }
 
 async fn handle_network_config(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_seed_file(&state, &addr.ip().to_string(), "network-config").await
+    serve_seed_file(&state, &addr.ip().to_canonical().to_string(), "network-config").await
 }
 
 async fn handle_uaa_config(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_uaa_config(&state, &addr.ip().to_string()).await
+    serve_uaa_config(&state, &addr.ip().to_canonical().to_string()).await
 }
 
 fn build_router(state: AppState) -> Router {
@@ -431,6 +439,14 @@ mod tests {
         SocketAddr::from(([172, 16, 3, 92], 54321))
     }
 
+    /// What `uaa-control.socket`'s real dual-stack `[::]:25000` bind actually hands
+    /// us for this same client (see the `.to_canonical()` comment on the handlers
+    /// above) — an IPv4-mapped IPv6 address, never a plain V4 one.
+    fn mapped_client_addr() -> SocketAddr {
+        let mapped = std::net::Ipv4Addr::new(172, 16, 3, 92).to_ipv6_mapped();
+        SocketAddr::from((mapped, 54321))
+    }
+
     /// In-memory [`Registry`] mock — zero filesystem, zero CRDB. Only
     /// `get_machine`/`upsert_machine` are exercised by seeds.rs handlers; the
     /// other three trait methods are unreachable stubs here.
@@ -525,6 +541,22 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             assert!(body_bytes(resp).await.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_mapped_ipv6_client_resolves_via_canonical_ip() {
+        // Regression test for the dual-stack-socket bug: a client arriving as
+        // `::ffff:172.16.3.92` (what systemd's `[::]:25000` socket actually hands
+        // us) must still resolve via the bare-IPv4 `ip neigh show` command — the
+        // mock only has that bare form registered, so a regression back to
+        // `addr.ip().to_string()` (no `.to_canonical()`) makes this 404 instead.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(HEXMAC)).unwrap();
+        let mock = MockExecutor::new(&[(neigh_cmd().as_str(), REACHABLE)]);
+        let state = test_state_with(dir.path().to_path_buf(), mock);
+
+        let resp = handle_user_data(State(state), ConnectInfo(mapped_client_addr())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 # file: crates/uaa-control/systemd/uaa-control.service
-# version: 1.0.2
+# version: 1.0.3
 # guid: 5c164116-d4a3-4715-b230-aa9e1a1e88e3
 # last-edited: 2026-07-14
 #
@@ -17,6 +17,11 @@ After=uaa-control.socket network-online.target
 
 [Service]
 Type=exec
+# GitHub OAuth (UAA_GITHUB_CLIENT_ID/_SECRET/_ORG/_ADMIN_TEAM/_OPERATOR_TEAM) lives
+# here, root:root 600, never in this tracked unit file. The leading '-' means the
+# service still starts (falling back to the bootstrap-token login) if the file is
+# absent, e.g. on a fresh checkout before an operator has provisioned it.
+EnvironmentFile=-/etc/uaa/uaa-control.env
 ExecStart=/usr/local/bin/uaa-control serve
 Restart=on-failure
 # StateDirectory gives /var/lib/uaa for the registry snapshot + WAL (Decision 4).
