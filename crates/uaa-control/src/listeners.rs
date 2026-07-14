@@ -1,23 +1,31 @@
 // file: crates/uaa-control/src/listeners.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: 4275dc4f-c0cb-479b-9f5c-5a444ed312f7
-// last-edited: 2026-07-13
+// last-edited: 2026-07-14
 
 //! Listener wiring + systemd socket activation (spec Decision 24).
 //!
 //! uaa-control serves four planes:
 //!   * `:25000` — legacy machine plane (exact Python parity), taken over via systemd
-//!     socket activation so a self-update restart never drops the listening socket;
-//!   * `:7443` — gRPC mTLS (services + enrolled agents);
-//!   * `:7444` — enrollment JSON (install-CA-pinned);
-//!   * `:15001` — operator JSON API (first CT-07 slice, see `operator::handlers`'s
+//!     socket activation so a self-update restart never drops the listening socket.
+//!     Left alone by the 2026-07-14 renumbering below: real PXE-booting hardware and
+//!     cloud-init configs already call back to this exact port.
+//!   * `:15000` — operator JSON API (first CT-07 slice, see `operator::handlers`'s
 //!     module doc for what's real vs. stubbed) + SPA hosting (`operator::web_ui`).
-//!     Deliberately NOT `:8443` — that's a common alt-HTTPS port other services
-//!     reuse; a high, less-contested port avoids collisions on shared hosts.
+//!   * `:15001` — gRPC mTLS (services + enrolled agents);
+//!   * `:15002` — enrollment JSON (install-CA-pinned);
 //!
-//! `:7443`/`:7444` remain bind-and-health scaffolds: each serves only `GET /healthz`;
-//! routes and TLS termination arrive with follower tasks (PK-03). `:15001` now serves
-//! its real router. Ports bind plain for now (TLS is a runtime concern; tests bind :0).
+//!   (2026-07-14: renumbered from the prior `:15001`/`:7443`/`:7444` into one
+//!   contiguous, memorable block — one listener to remember plus "+1, +2" for the
+//!   rest, rather than three unrelated numbers. `:25000` was deliberately excluded:
+//!   it's the one plane real hardware/cloud-init already targets, and renumbering it
+//!   would require updating every client-side reference in lockstep or break
+//!   in-flight/future installs.)
+//!
+//! `:15001`/`:15002` remain bind-and-health scaffolds: each serves only `GET
+//! /healthz`; routes and TLS termination arrive with follower tasks (PK-03). `:15000`
+//! now serves its real router. Ports bind plain for now (TLS is a runtime concern;
+//! tests bind :0).
 
 use std::os::unix::io::RawFd;
 
@@ -40,9 +48,9 @@ impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             machine_plane_port: 25000,
-            grpc_port: 7443,
-            enroll_port: 7444,
-            operator_port: 15001,
+            grpc_port: 15001,
+            enroll_port: 15002,
+            operator_port: 15000,
         }
     }
 }
@@ -92,9 +100,10 @@ pub fn health_router(listener: &'static str) -> Router {
 /// Bind and serve all four planes.
 ///
 /// `:25000` uses the socket-activated fd when present (Decision 24), else a plain bind
-/// on `config.machine_plane_port` (dev fallback). `:7443`/`:7444` are health scaffolds
-/// (TLS wired later by PK-03); `:15001` serves the real operator router. Runtime-only;
-/// unit tests exercise [`parse_listen_fds`] and the routers, never this bind loop.
+/// on `config.machine_plane_port` (dev fallback). `:15001`/`:15002` are health
+/// scaffolds (TLS wired later by PK-03); `:15000` serves the real operator router.
+/// Runtime-only; unit tests exercise [`parse_listen_fds`] and the routers, never this
+/// bind loop.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let machine_listener = match sd_listen_fd() {
         Some(fd) => {

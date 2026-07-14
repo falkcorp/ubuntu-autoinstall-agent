@@ -1,7 +1,7 @@
 <!-- file: docs/specs/constellation-design.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 49fbec09-b12d-402c-9f51-5aee6ff92d70 -->
-<!-- last-edited: 2026-07-10 -->
+<!-- last-edited: 2026-07-14 -->
 
 # uaa Constellation — Design Spec
 
@@ -260,7 +260,7 @@ judge-CHALLENGED but locked by the owner's operation brief (objection recorded).
 | Binary | Runs on | Ports | Owns |
 |---|---|---|---|
 | `uaa` (CLI/agent) | fleet hosts, server, operator Mac | — (client only; mDNS browse-only) | install phases, luks keyslots, power CLI, iso/image/config tooling, vm-validate, self-update (timer-auto) |
-| `uaa-control` | the server (172.16.2.30) | :25000 HTTP via systemd socket activation (legacy machine plane, exact Python parity), :7443 gRPC mTLS (services + enrolled agents), :7444 HTTPS install-CA-pinned JSON (enrollment CSR submit/poll, first-boot checkin), :8443 HTTPS (operator JSON+OpenAPI + SPA) | registry (CRDB) + snapshot/WAL degraded mode, enrollment CA + CRL, RBAC, audit chain, approve-SAGA, one-click reinstall, boot-target reconciliation |
+| `uaa-control` | the server (172.16.2.30) | :25000 HTTP via systemd socket activation (legacy machine plane, exact Python parity), :15000 HTTPS (operator JSON+OpenAPI + SPA), :15001 gRPC mTLS (services + enrolled agents), :15002 HTTPS install-CA-pinned JSON (enrollment CSR submit/poll, first-boot checkin) | registry (CRDB) + snapshot/WAL degraded mode, enrollment CA + CRL, RBAC, audit chain, approve-SAGA, one-click reinstall, boot-target reconciliation |
 | `uaa-web` | the server | :8081 HTTP (boot artifacts, read-only), :7445 gRPC mTLS | `/var/www/html` writes: seeds, iPXE files, ISOs, casper trees, agent binaries, signed update manifests; ISO build jobs (detached) |
 | `uaa-pxe` | the server | :7446 gRPC mTLS | dnsmasq per-host boot config via dhcp-hostsdir/optsdir + test-then-reload + post-reload verification, dnsmasq/tftpd health, discovery inbox, optional DNS A/PTR |
 
@@ -369,7 +369,7 @@ service ControlService {
   rpc ReinstallMachine(ReinstallMachineRequest) returns (ReinstallMachineResponse);
   rpc UpsertDiscoveredMac(UpsertDiscoveredMacRequest) returns (Ack);  // uaa-pxe inbox
 }
-// proto/uaa/enroll/v1/enroll.proto  (also exposed as JSON on :7444)
+// proto/uaa/enroll/v1/enroll.proto  (also exposed as JSON on :15002)
 service EnrollService {
   rpc SubmitCsr(SubmitCsrRequest) returns (SubmitCsrResponse);       // idempotent by SPKI fp
   rpc GetCredential(GetCredentialRequest) returns (GetCredentialResponse); // poll
@@ -450,9 +450,9 @@ committed. Exposes tonic clients + servers per package. musl gate:
   tolerance for missing iPXE files (USB-only hosts); TPM-EK first-bind + mismatch-403;
   `ip neigh` MAC resolution (legacy trust, dies with this port). Read paths keep serving
   under CRDB degradation (snapshot).
-- **Enrollment plane (:7444, HTTPS server-auth)** — JSON mirror of `EnrollService`.
+- **Enrollment plane (:15002, HTTPS server-auth)** — JSON mirror of `EnrollService`.
   Fail-closed: unknown SPKI polls get 404, never auto-issue.
-- **Operator plane (:8443)** — axum + utoipa (`/api/openapi.json`), GitHub OAuth →
+- **Operator plane (:15000)** — axum + utoipa (`/api/openapi.json`), GitHub OAuth →
   signed session cookie, RBAC middleware (fail-closed to viewer on GitHub failure —
   mutations denied, reads allowed), SPA via rust-embed.
 - **Approve SAGA** (`ApproveMachine`), ORDERED not parallel (ops-judge defect repair):
@@ -505,7 +505,7 @@ agent boot ──▶ load /var/lib/uaa/{agent.key,agent.csr,claim.json}   (creat
    │  pin install-ca.crt (from seed/ISO)             (no CA file → abort + retry loop, fail-closed)
    ├─ SubmitCsr (idempotent upsert by SPKI fp)
    ├─ GetCredential poll (backoff 30s→5m cap) ──▶ pending: keep polling (survives reboot)
-   │                                          └▶ issued: persist agent.crt → mTLS gRPC :7443
+   │                                          └▶ issued: persist agent.crt → mTLS gRPC :15001
    └─ rejected/revoked: log loudly, hold at 1h poll (operator can re-approve)
 Approve (SPA): pending CSR list (SPKI fp + claimed MAC/hostname + discovery-inbox
 correlation) → approve/reject → control signs (rcgen, 90d, SAN = hostname + mac URI);

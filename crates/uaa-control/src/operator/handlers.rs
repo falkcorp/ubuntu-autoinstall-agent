@@ -1,9 +1,9 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.4.0
+// version: 1.4.1
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-13
+// last-edited: 2026-07-14
 
-//! Operator API request handlers (`:15001`, mounted under `/api/*` ahead of
+//! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
 //!
 //! This is a first vertical slice, not the full CT-07 scope: `GET

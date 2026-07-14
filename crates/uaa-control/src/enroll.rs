@@ -1,9 +1,9 @@
 // file: crates/uaa-control/src/enroll.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: 1a81d662-89c9-4e64-8ce9-9aa51fd3a412
-// last-edited: 2026-07-13
+// last-edited: 2026-07-14
 
-//! Enrollment plane (`uaa.enroll.v1` gRPC + `:7444` JSON mirror) — CSR submit +
+//! Enrollment plane (`uaa.enroll.v1` gRPC + `:15002` JSON mirror) — CSR submit +
 //! GetCredential poll, idempotent by SPKI fingerprint (spec C6, NORMATIVE).
 //!
 //! Filled by pki PK-01 (this task), on top of PK-01's own [`crate::ca::InstallCa`].
@@ -422,7 +422,7 @@ fn now_rfc3339() -> String {
 /// machine core above. Exposed as `pub` so the coordinator constructs it (with the
 /// real [`MemEnrollmentStore`]-or-`Pg` store, [`InstallCa`], and audit store) and
 /// wires it wherever the real gRPC transport lands (spec: TLS termination for
-/// `:7443` arrives with PK-03/CT-07 — see `crate::listeners` module doc).
+/// `:15001` arrives with PK-03/CT-07 — see `crate::listeners` module doc).
 pub struct EnrollGrpcService {
     store: Arc<dyn EnrollmentStore>,
     ca: Arc<InstallCa>,
@@ -488,7 +488,7 @@ impl uaa_proto::enroll::v1::enroll_service_server::EnrollService for EnrollGrpcS
 }
 
 /// Build the tonic server wrapper for [`EnrollGrpcService`] — the coordinator's one
-/// call site to add it to a `tonic::transport::Server` once the real `:7443` gRPC
+/// call site to add it to a `tonic::transport::Server` once the real `:15001` gRPC
 /// transport lands (PK-03/CT-07).
 pub fn enroll_grpc_service(
     store: Arc<dyn EnrollmentStore>,
@@ -500,7 +500,7 @@ pub fn enroll_grpc_service(
     ))
 }
 
-// ── `:7444` JSON mirror (POST /enroll/csr, GET /enroll/credential/<fp>) ──────────
+// ── `:15002` JSON mirror (POST /enroll/csr, GET /enroll/credential/<fp>) ──────────
 
 /// Request body for `POST /enroll/csr` — field-for-field the wire shape
 /// `uaa_core::pki::SubmitCsrRequest` (the agent client, PK-02) serializes.
@@ -533,9 +533,9 @@ struct AppState {
     audit: Arc<dyn AuditStore>,
 }
 
-/// The `:7444` enrollment JSON router — `POST /enroll/csr`, `GET
+/// The `:15002` enrollment JSON router — `POST /enroll/csr`, `GET
 /// /enroll/credential/:fp`. Built by the coordinator with the real store/CA/audit
-/// instances and merged into the `:7444` listener wiring point in
+/// instances and merged into the `:15002` listener wiring point in
 /// `crate::listeners` (see that module's doc — never edited by this task).
 pub fn enroll_json_router(
     store: Arc<dyn EnrollmentStore>,

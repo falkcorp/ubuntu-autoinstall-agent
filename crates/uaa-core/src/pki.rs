@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/pki.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: fd51b533-b595-41dc-97e2-1e5c54476890
-// last-edited: 2026-07-10
+// last-edited: 2026-07-14
 
 //! PKI (CA/cert issuance) — agent-side half of spec C6 / Decision 7.
 //!
@@ -28,7 +28,7 @@
 //! 4. A persisted, unexpired, non-past-2/3-lifetime `agent.crt` short-circuits the
 //!    whole flow with zero network calls.
 //!
-//! The HTTP transport (`:7444` JSON mirror of `uaa.enroll.v1.EnrollService`) sits
+//! The HTTP transport (`:15002` JSON mirror of `uaa.enroll.v1.EnrollService`) sits
 //! behind [`EnrollTransport`] so tests run against a scripted mock — no sockets —
 //! and the sleep between polls sits behind [`Sleeper`] so tests never really sleep.
 
@@ -367,7 +367,7 @@ pub struct GetCredentialResponse {
     pub ca_pem: String,
 }
 
-/// The `:7444` JSON enrollment plane, behind a trait so tests never open a
+/// The `:15002` JSON enrollment plane, behind a trait so tests never open a
 /// socket. `get_credential` returns `Ok(None)` for a 404 (unknown SPKI fp) —
 /// never an `Err` — so the state machine can distinguish "server lost state,
 /// re-submit" from a real transport failure.

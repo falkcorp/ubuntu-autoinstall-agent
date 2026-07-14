@@ -1,14 +1,14 @@
 // file: crates/uaa-control/src/lib.rs
-// version: 1.0.1
+// version: 1.1.0
 // guid: 377e6bf2-0687-480d-a7f4-7bd21c525206
-// last-edited: 2026-07-13
+// last-edited: 2026-07-14
 
 //! uaa-control — the constellation's central daemon (spec component C3).
 //!
 //! Owns the registry system-of-record (CockroachDB, Decision 4/5), the four listeners
-//! (`:25000` legacy machine plane via systemd socket activation, plus `:7443` gRPC
-//! mTLS, `:7444` enrollment JSON, `:15001` operator), the embedded schema migrations,
-//! and the snapshot+WAL degraded-mode layer.
+//! (`:25000` legacy machine plane via systemd socket activation, plus `:15000`
+//! operator, `:15001` gRPC mTLS, `:15002` enrollment JSON), the embedded schema
+//! migrations, and the snapshot+WAL degraded-mode layer.
 //!
 //! This crate is scaffolded by CT-01. Most feature surface lands via follower tasks
 //! that each own a DISJOINT set of stub modules (the de-collision pattern — one filling

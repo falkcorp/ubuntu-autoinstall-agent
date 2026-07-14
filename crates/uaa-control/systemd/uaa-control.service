@@ -1,10 +1,10 @@
 # file: crates/uaa-control/systemd/uaa-control.service
-# version: 1.0.1
+# version: 1.0.2
 # guid: 5c164116-d4a3-4715-b230-aa9e1a1e88e3
-# last-edited: 2026-07-13
+# last-edited: 2026-07-14
 #
 # Service unit for the uaa-control daemon (spec C3). Paired with uaa-control.socket so
-# the :25000 machine plane is socket-activated (Decision 24). The :7443/:7444/:15001
+# the :25000 machine plane is socket-activated (Decision 24). The :15000/:15001/:15002
 # planes are bound by the process itself.
 #
 # DEPLOY IS BUCKET-3 (human) WORK: docs/reference artifact only. An operator installs

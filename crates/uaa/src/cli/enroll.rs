@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/enroll.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: ff6b7df8-50d5-47a6-bfe5-3063d426ffe9
-// last-edited: 2026-07-10
+// last-edited: 2026-07-14
 
 //! `uaa enroll` — agent-side enrollment CLI (spec Decision 7 / C6).
 //!
@@ -18,7 +18,7 @@ use uaa_core::pki::{self, AgentIdentity};
 
 #[derive(Debug, clap::Args)]
 pub struct EnrollArgs {
-    /// Enrollment plane endpoint (uaa-control `:7444`), e.g. https://172.16.2.30:7444
+    /// Enrollment plane endpoint (uaa-control `:15002`), e.g. https://172.16.2.30:15002
     #[arg(long)]
     pub endpoint: String,
 
