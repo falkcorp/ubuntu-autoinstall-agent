@@ -1,7 +1,7 @@
 # file: crates/uaa-control/Cargo.toml
-# version: 1.3.0
+# version: 1.4.0
 # guid: 1e1a4386-a459-4a97-8baf-c942283b3107
-# last-edited: 2026-07-12
+# last-edited: 2026-07-14
 
 [package]
 name = "uaa-control"
@@ -28,9 +28,13 @@ axum = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tower-http = { workspace = true }
-# TLS (wired at runtime; scaffolds bind plain for now — Decision 5)
+# TLS: `:15000` operator plane TLS-terminates with a leaf cert minted by the
+# install CA (crate::ca::InstallCa::issue_server_cert), served via axum-server
+# (axum 0.7's own axum::serve only accepts a concrete tokio::net::TcpListener, no
+# TLS-listener seam — see listeners.rs). `:15001`/`:15002` are still plain scaffolds.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 # Registry system-of-record: tokio-postgres only, per spec Decision 5.
 tokio-postgres = { workspace = true }
 # Serialization + IDs + hashing

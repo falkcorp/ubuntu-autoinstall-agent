@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/ca.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 19da2b5c-91d8-4a97-ba3b-de299638e434
-// last-edited: 2026-07-10
+// last-edited: 2026-07-14
 
 //! Dedicated install CA (rcgen) — mint/sign agent certs, CRL (Decision 6).
 //!
@@ -12,6 +12,12 @@
 //! this task (collision row: CT-01 stub → PK-01 → PK-03) — it adds
 //! `issue_service`/CRL publish and REUSES [`InstallCa`] rather than writing a second
 //! CA type; the `pub` surface here is kept intentionally minimal and stable for that.
+//!
+//! 2026-07-14: added [`InstallCa::issue_server_cert`] — a server-leaf (not
+//! agent-leaf) mint used by `listeners.rs` to TLS-terminate the `:15000` operator
+//! plane so it can sit behind the Cloudflare Tunnel origin
+//! (`~/repos/temp/cloudflare-one/HANDOFF.md` §1/§4.3). Reuses [`InstallCa`] per the
+//! note above rather than adding a second CA type.
 //!
 //! # NEVER the CockroachDB CA (Decision 6, locked)
 //!
@@ -39,8 +45,8 @@ use std::path::Path;
 use chrono::{Datelike, Duration as ChronoDuration, Utc};
 use rcgen::{
     date_time_ymd, BasicConstraints, Certificate, CertificateParams,
-    CertificateSigningRequestParams, DistinguishedName, DnType, Ia5String, IsCa, KeyPair,
-    KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
+    CertificateSigningRequestParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Ia5String,
+    IsCa, KeyPair, KeyUsagePurpose, SanType, PKCS_ECDSA_P256_SHA256,
 };
 
 const CA_KEY_FILE: &str = "ca.key";
@@ -157,7 +163,12 @@ impl InstallCa {
     /// not verify is rejected here, before anything is signed.
     ///
     /// NEVER the CockroachDB CA — this always signs with THIS install CA's key.
-    pub fn sign_agent_csr(&self, csr_pem: &str, hostname: &str, mac: &str) -> anyhow::Result<String> {
+    pub fn sign_agent_csr(
+        &self,
+        csr_pem: &str,
+        hostname: &str,
+        mac: &str,
+    ) -> anyhow::Result<String> {
         let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|e| anyhow::anyhow!("invalid CSR: {e}"))?;
 
@@ -179,6 +190,48 @@ impl InstallCa {
     /// agents/operators. NEVER the CockroachDB CA.
     pub fn ca_cert_pem(&self) -> &str {
         &self.cert_pem
+    }
+
+    /// Mint a fresh TLS server-leaf cert (SAN = `names`, `id-kp-serverAuth`) signed
+    /// by this install CA. Returns `(cert_pem, key_pem)`.
+    ///
+    /// Unlike [`InstallCa::sign_agent_csr`], this generates its own keypair rather
+    /// than signing a caller-supplied CSR — there is no remote agent proving
+    /// possession here, just this same process about to terminate TLS with the
+    /// result. Nothing is persisted to disk: the caller (`listeners.rs`) holds both
+    /// PEMs in memory for the process lifetime, so a fresh leaf is minted on every
+    /// restart. The Decision 6 custody/backup requirements apply to the CA root
+    /// (`ca.key`) only, never to these short-lived leaves.
+    ///
+    /// `names` may mix DNS names and IP addresses (`rcgen::CertificateParams::new`
+    /// sniffs each string and files it under the right `SanType` automatically).
+    ///
+    /// NEVER the CockroachDB CA — this always signs with THIS install CA's key.
+    pub fn issue_server_cert(&self, names: &[String]) -> anyhow::Result<(String, String)> {
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| anyhow::anyhow!("server cert keypair generation failed: {e}"))?;
+
+        let mut params = CertificateParams::new(names.to_vec())
+            .map_err(|e| anyhow::anyhow!("invalid server cert SAN list {names:?}: {e}"))?;
+        let mut dn = DistinguishedName::new();
+        dn.push(
+            DnType::CommonName,
+            names.first().map(String::as_str).unwrap_or("uaa-control"),
+        );
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::NoCa;
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        set_validity_days(&mut params, AGENT_CERT_LIFETIME_DAYS);
+
+        let cert = params
+            .signed_by(&key_pair, &self.cert, &self.key_pair)
+            .map_err(|e| anyhow::anyhow!("signing server certificate failed: {e}"))?;
+
+        Ok((cert.pem(), key_pair.serialize_pem()))
     }
 }
 
@@ -243,13 +296,25 @@ mod tests {
         let first_pem = first.ca_cert_pem().to_string();
 
         assert_eq!(dir_mode_of(&ca_dir), 0o700, "CA dir must be 0700");
-        assert_eq!(mode_of(&ca_dir.join("ca.key")), 0o600, "ca.key must be 0600");
-        assert_eq!(mode_of(&ca_dir.join("ca.crt")), 0o644, "ca.crt must be 0644");
+        assert_eq!(
+            mode_of(&ca_dir.join("ca.key")),
+            0o600,
+            "ca.key must be 0600"
+        );
+        assert_eq!(
+            mode_of(&ca_dir.join("ca.crt")),
+            0o644,
+            "ca.crt must be 0644"
+        );
 
         // Second load must return the IDENTICAL cert text — never regenerated (a
         // regenerated CA would orphan every already-issued cert).
         let second = InstallCa::load_or_create(&ca_dir).unwrap();
-        assert_eq!(second.ca_cert_pem(), first_pem, "load must never regenerate the CA");
+        assert_eq!(
+            second.ca_cert_pem(),
+            first_pem,
+            "load must never regenerate the CA"
+        );
     }
 
     #[test]
@@ -307,6 +372,66 @@ mod tests {
     }
 
     #[test]
+    fn test_issue_server_cert_has_serverauth_eku_and_san() {
+        let dir = tempdir().unwrap();
+        let ca = InstallCa::load_or_create(&dir.path().join("ca")).unwrap();
+
+        let (cert_pem, key_pem) = ca
+            .issue_server_cert(&["uaa.jdfalk.com".to_string(), "172.16.2.30".to_string()])
+            .unwrap();
+
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+
+        let (_, pem) = parse_x509_pem(cert_pem.as_bytes()).unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&pem.contents).unwrap();
+
+        // Leaf, not a CA — must not be usable to mint further certs.
+        assert!(!cert
+            .basic_constraints()
+            .unwrap()
+            .map(|bc| bc.value.ca)
+            .unwrap_or(false));
+
+        let mut found_dns = false;
+        let mut found_ip = false;
+        let mut found_server_auth = false;
+        for ext in cert.extensions() {
+            match ext.parsed_extension() {
+                x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) => {
+                    for name in &san.general_names {
+                        match name {
+                            x509_parser::extensions::GeneralName::DNSName(dns)
+                                if *dns == "uaa.jdfalk.com" =>
+                            {
+                                found_dns = true
+                            }
+                            x509_parser::extensions::GeneralName::IPAddress(ip)
+                                if *ip == [172, 16, 2, 30] =>
+                            {
+                                found_ip = true
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                x509_parser::extensions::ParsedExtension::ExtendedKeyUsage(eku) => {
+                    found_server_auth = eku.server_auth;
+                }
+                _ => {}
+            }
+        }
+        assert!(found_dns, "expected DNS SAN uaa.jdfalk.com");
+        assert!(found_ip, "expected IP SAN 172.16.2.30");
+        assert!(found_server_auth, "expected id-kp-serverAuth EKU");
+
+        // Must chain to the same CA that signed agent certs, not a stray root.
+        let (_, ca_pem_parsed) = parse_x509_pem(ca.ca_cert_pem().as_bytes()).unwrap();
+        let (_, ca_cert) = x509_parser::parse_x509_certificate(&ca_pem_parsed.contents).unwrap();
+        assert!(cert.verify_signature(Some(ca_cert.public_key())).is_ok());
+    }
+
+    #[test]
     fn test_sign_agent_csr_rejects_garbage() {
         let dir = tempdir().unwrap();
         let ca = InstallCa::load_or_create(&dir.path().join("ca")).unwrap();
@@ -332,7 +457,11 @@ mod tests {
 
         // Second "process": load (never regenerate) the SAME CA from disk.
         let loaded = InstallCa::load_or_create(&ca_dir).unwrap();
-        assert_eq!(loaded.ca_cert_pem(), persisted_ca_pem, "load must not regenerate");
+        assert_eq!(
+            loaded.ca_cert_pem(),
+            persisted_ca_pem,
+            "load must not regenerate"
+        );
 
         let (csr_pem, identity) = test_csr();
         let cert_pem = loaded
@@ -347,7 +476,9 @@ mod tests {
         let (_, child_pem) = parse_x509_pem(cert_pem.as_bytes()).unwrap();
         let (_, child_cert) = x509_parser::parse_x509_certificate(&child_pem.contents).unwrap();
         assert!(
-            child_cert.verify_signature(Some(ca_cert.public_key())).is_ok(),
+            child_cert
+                .verify_signature(Some(ca_cert.public_key()))
+                .is_ok(),
             "cert signed by a RELOADED CA must verify against the persisted ca.crt"
         );
 
@@ -365,6 +496,9 @@ mod tests {
                 }
             }
         }
-        assert!(found_dns, "reloaded-CA-signed cert must still carry the hostname SAN");
+        assert!(
+            found_dns,
+            "reloaded-CA-signed cert must still carry the hostname SAN"
+        );
     }
 }
