@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/main.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 608d78f5-ac4c-43a5-b29f-e9008a300858
-// last-edited: 2026-07-11
+// last-edited: 2026-07-14
 
 //! Thin entrypoint for the `uaa-control` daemon. All logic lives in `uaa_control`
 //! (the library) so `cargo test --lib --offline` exercises it. `serve` is the default
@@ -30,6 +30,13 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // rustls 0.23 has both `ring` and `aws-lc-rs` in the dependency tree (pulled in
+    // transitively by different crates), so it refuses to auto-pick a process-level
+    // CryptoProvider — every TLS bind (axum-server's bind_rustls for :15000) panics
+    // at first handshake attempt without this.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("install rustls CryptoProvider (must run before any TLS listener binds)");
     tracing_subscriber_init();
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
