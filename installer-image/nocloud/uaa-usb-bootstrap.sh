@@ -1,8 +1,8 @@
 #!/bin/bash
 # file: installer-image/nocloud/uaa-usb-bootstrap.sh
-# version: 1.1.0
+# version: 1.2.0
 # guid: 9e4c7a20-1b5f-4d38-8a6e-2c0d9f471b63
-# last-edited: 2026-07-09
+# last-edited: 2026-07-14
 #
 # USB auto-bootstrap: turns the SSH-ready remastered Ubuntu Server USB into a
 # zero-touch installer, mirroring the netboot flow. Runs from the LIVE session
@@ -14,8 +14,19 @@
 #      same as the netboot cloud-init seed) -> /run/uaa-config.yaml
 #   3. runs `uaa install --config /run/uaa-config.yaml --report-url ...`
 #   4. on success, best-effort efibootmgr: BootOrder = network #1, ubuntu #2
-#   5. reports status and powers off (loop-safe). A config-fetch or install
-#      FAILURE never reboot-loops: poweroff, or shell if uaa.on_done=shell.
+#   5. uploads final logs (dmesg + journalctl + every /var/log/*.log, via
+#      reporting.sh's upload_logs — see upload_final_logs below), reports
+#      status, and powers off (loop-safe). A config-fetch or install FAILURE
+#      never reboot-loops: poweroff, or shell if uaa.on_done=shell.
+#
+# 2026-07-14: added upload_final_logs() on every terminal path (agent-fetch
+# failure, config-fetch failure, install success, install failure).
+# reporting.sh's upload_logs() already existed and already worked server-side
+# — this script just never called it, so every failure required SSHing into
+# the live session to read /var/log/cloud-init-output.log by hand. Once this
+# is verified working, `--on-done shell` should go back to the poweroff
+# default: the logs are on the server either way now, no need to hold the
+# session open for physical/SSH access.
 #
 # Tunables (env, or uaa.* kernel cmdline tokens where noted):
 #   UAA_AGENT_URL           agent binary URL   (default http://172.16.2.30/uaa/uaa-amd64)
@@ -53,6 +64,19 @@ report_status() {
     curl -fsSL --max-time 10 "${REPORT_BASE}/reporting.sh" -o /run/reporting.sh 2>/dev/null \
         && bash -c "source /run/reporting.sh && send_status_update '${state}' 0 '${msg}'" 2>/dev/null \
         || true
+}
+
+upload_final_logs() {
+    # Best-effort: push dmesg + journalctl + every /var/log/*.log (including
+    # cloud-init-output.log, where the actual `uaa install` error lands) to
+    # the server as webhook file attachments, so a failure is debuggable from
+    # the server without SSHing into the live session. Called on every
+    # terminal path — success or failure — not just failure, since "what
+    # actually happened" is worth having on disk either way.
+    log "uploading final logs (dmesg, journalctl, /var/log/*.log)"
+    curl -fsSL --max-time 10 "${REPORT_BASE}/reporting.sh" -o /run/reporting.sh 2>/dev/null \
+        && bash -c "source /run/reporting.sh && upload_logs" 2>/dev/null \
+        || log "could not fetch reporting.sh / upload final logs (best-effort, continuing)"
 }
 
 finish() {
@@ -106,6 +130,7 @@ log "fetching agent binary: ${AGENT_URL}"
 if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 120 "${AGENT_URL}" -o "${AGENT}"; then
     log "FAILED to fetch agent from ${AGENT_URL}"
     report_status failed "uaa-usb-bootstrap: could not fetch agent ${AGENT_URL}"
+    upload_final_logs
     finish_failure "${ON_DONE}"
     exit 1
 fi
@@ -125,6 +150,7 @@ log "fetching per-host config: ${CONFIG_URL}"
 if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "${CONFIG_URL}" -o "${CONF}"; then
     log "FAILED to fetch config from ${CONFIG_URL}"
     report_status failed "uaa-usb-bootstrap: could not fetch ${CONFIG_URL}"
+    upload_final_logs
     # A config-fetch failure must NOT loop-reinstall — halt for inspection.
     finish_failure "${ON_DONE}"
     exit 1
@@ -140,13 +166,15 @@ if "${AGENT}" install --config "${CONF}" --report-url "${REPORT_URL}"; then
     log "install completed OK for ${HOST}"
     # ── 4. best-effort boot order (network #1, ubuntu #2) ───────────────────
     set_boot_order
-    # ── 5. report + poweroff (loop-safe) ────────────────────────────────────
+    # ── 5. upload logs + report + poweroff (loop-safe) ──────────────────────
+    upload_final_logs
     report_status success "uaa-usb-bootstrap: ${HOST} installed"
     finish "${ON_DONE}"
 else
     rc=$?
     log "installer exited ${rc} for ${HOST}"
     report_status failed "uaa-usb-bootstrap: ${HOST} install failed (rc=${rc})"
+    upload_final_logs
     # Do NOT reboot-loop on a broken install; power off (or stay up with
     # uaa.on_done=shell) so an operator can inspect over SSH.
     finish_failure "${ON_DONE}"

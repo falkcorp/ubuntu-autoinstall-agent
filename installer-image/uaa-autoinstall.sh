@@ -1,8 +1,8 @@
 #!/bin/bash
 # file: installer-image/uaa-autoinstall.sh
-# version: 1.2.0
+# version: 1.3.0
 # guid: 4b8e1d02-6f3a-4c77-9e21-5a0c8b6d1f34
-# last-edited: 2026-07-09
+# last-edited: 2026-07-14
 #
 # Boot-time entrypoint for the custom ZFS-on-LUKS installer image (Option 2).
 # iPXE boots the overlaid 26.04 live-server with a kernel cmdline like:
@@ -12,8 +12,13 @@
 #
 # This script (run by uaa-autoinstall.service, gated on ConditionKernelCommandLine=
 # uaa.autoinstall) reads uaa.config= from /proc/cmdline, fetches the per-host YAML,
-# runs the agent's full ZFS-on-LUKS install, reports status, then powers off
-# (loop-safe) or reboots per uaa.on_done.
+# runs the agent's full ZFS-on-LUKS install, uploads final logs, reports status,
+# then powers off (loop-safe) or reboots per uaa.on_done.
+#
+# 2026-07-14: added upload_final_logs() on every terminal path, mirroring the
+# same fix in installer-image/nocloud/uaa-usb-bootstrap.sh — see that file's
+# header for why (reporting.sh's upload_logs() already existed server-side,
+# this script just never called it).
 
 set -uo pipefail
 
@@ -40,6 +45,17 @@ report_status() {
     curl -fsSL --max-time 10 "${REPORT_BASE}/reporting.sh" -o /run/reporting.sh 2>/dev/null \
         && bash -c "source /run/reporting.sh && send_status_update '${state}' 0 '${msg}'" 2>/dev/null \
         || true
+}
+
+upload_final_logs() {
+    # Best-effort: push dmesg + journalctl + every /var/log/*.log (including
+    # cloud-init-output.log) to the server as webhook file attachments, so a
+    # failure is debuggable from the server without console/SSH access to the
+    # (about to power off) box. Called on every terminal path.
+    log "uploading final logs (dmesg, journalctl, /var/log/*.log)"
+    curl -fsSL --max-time 10 "${REPORT_BASE}/reporting.sh" -o /run/reporting.sh 2>/dev/null \
+        && bash -c "source /run/reporting.sh && upload_logs" 2>/dev/null \
+        || log "could not fetch reporting.sh / upload final logs (best-effort, continuing)"
 }
 
 finish() {
@@ -82,6 +98,7 @@ log "fetching per-host config: ${CONFIG_URL}"
 if ! curl -fsSL --retry 5 --retry-delay 3 --max-time 60 "${CONFIG_URL}" -o "${CONF}"; then
     log "FAILED to fetch config from ${CONFIG_URL}"
     report_status failed "uaa-autoinstall: could not fetch ${CONFIG_URL}"
+    upload_final_logs
     # A config-fetch failure should NOT loop-reinstall — halt for inspection.
     finish_failure "${ON_DONE:-poweroff}"
     exit 1
@@ -93,12 +110,14 @@ report_status running "uaa-autoinstall: installing ${HOST}"
 
 if "${AGENT}" install --config "${CONF}"; then
     log "install completed OK for ${HOST}"
+    upload_final_logs
     report_status success "uaa-autoinstall: ${HOST} installed"
     finish "${ON_DONE}"
 else
     rc=$?
     log "installer exited ${rc} for ${HOST}"
     report_status failed "uaa-autoinstall: ${HOST} install failed (rc=${rc})"
+    upload_final_logs
     # Do NOT reboot-loop on a broken install; power off (or drop to shell) so an
     # operator can inspect. Override with uaa.on_done=shell for interactive debug.
     finish_failure "${ON_DONE:-poweroff}"
