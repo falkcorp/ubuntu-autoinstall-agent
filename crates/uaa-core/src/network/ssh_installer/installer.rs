@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.10.1
+// version: 2.11.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-16
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -470,7 +470,8 @@ impl SshInstaller {
 
     /// In-target (curtin-compatible) mode: the binary is already running INSIDE
     /// the installed/target chroot. Runs ONLY post-install configuration
-    /// (Phase 5: GRUB, LUKS crypttab, dracut, Tang) by bind-mounting / to
+    /// (Phase 5: GRUB, LUKS crypttab, dracut, Tang, install-CA trust anchor) by
+    /// bind-mounting / to
     /// /mnt/targetos so the existing chroot-based Phase-5 code is reused
     /// unchanged. NEVER runs preflight_checks (it wipes residual state),
     /// Phases 1-4 (packages/disk prep/ZFS/debootstrap), or Phase 6
@@ -915,6 +916,7 @@ impl SshInstaller {
         sc.configure_zfs_in_chroot(config).await?;
         sc.configure_grub_in_chroot(config).await?;
         sc.setup_luks_key_in_chroot(config).await?;
+        sc.install_ca_cert_in_chroot(config).await?;
         info!("Phase 5 completed");
         Ok(())
     }
@@ -1015,6 +1017,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            install_ca_cert: "test-ca-pem".into(),
         }
     }
 
@@ -1232,6 +1235,55 @@ mod tests {
         assert!(
             contains_cmd(&cmds, "grub"),
             "Phase 5 should still issue a grub command"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase5_installs_ca_cert_trust_anchor() {
+        // Same --phases 5 setup as test_selective_run_skips_unselected_phases.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zfs list -H -o name -r rpool/ROOT | grep -m1 '^rpool/ROOT/ubuntu_'",
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let cfg = sample_config();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            contains_cmd(&cmds, "/mnt/targetos/etc/uaa/install-ca.crt"),
+            "Phase 5 should write the install CA cert into the target"
+        );
+        assert!(
+            contains_cmd(&cmds, &cfg.install_ca_cert),
+            "written cert content should match config.install_ca_cert"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_phase5_writes_placeholder_verbatim_when_ca_unplaced() {
+        // A config placed before the install CA was reachable still carries
+        // the literal placeholder; phase 5 must write it as-is (fail-closed —
+        // uaa enroll treats an unparseable CA as the missing-CA case) rather
+        // than erroring out or silently skipping the file.
+        let mock = RecordingExecutor::with_responses(&[(
+            "zfs list -H -o name -r rpool/ROOT | grep -m1 '^rpool/ROOT/ubuntu_'",
+            "rpool/ROOT/ubuntu_abc123",
+        )]);
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::parse("5").unwrap();
+        let mut cfg = sample_config();
+        cfg.install_ca_cert = crate::config_place::PLACEHOLDER.to_string();
+
+        let result = installer.perform_installation(&cfg, &selection).await;
+        assert!(result.is_ok(), "phase 5 must not fail on an unplaced CA: {result:?}");
+
+        let cmds = mock.recorded();
+        assert!(
+            contains_cmd(&cmds, "REPLACE_AT_PLACE_TIME"),
+            "placeholder should be written verbatim, not silently dropped"
         );
     }
 

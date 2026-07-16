@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/config.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: a0de168b-3b68-4f34-8fe2-c4e513d40d70
-// last-edited: 2026-07-10
+// last-edited: 2026-07-16
 
 //! `uaa config` — server-local placement of per-host InstallationConfig files.
 //!
@@ -10,7 +10,9 @@
 //! injecting place-time secrets from `--inject-from`. Injection is server-local
 //! only — there is NO HTTP secret-write API, by design.
 
-use uaa_core::config_place::{place_configs, PlaceOptions, DEFAULT_DEST_BASE, DEFAULT_SRC_DIR};
+use uaa_core::config_place::{
+    place_configs, PlaceOptions, DEFAULT_DEST_BASE, DEFAULT_INSTALL_CA_CERT_PATH, DEFAULT_SRC_DIR,
+};
 
 #[derive(Debug, clap::Args)]
 pub struct ConfigArgs {
@@ -52,6 +54,7 @@ pub async fn config_command(args: ConfigArgs) -> uaa_core::Result<()> {
                 dest_base: dest.into(),
                 inject_from: inject_from.map(Into::into),
                 hosts,
+                install_ca_cert_path: DEFAULT_INSTALL_CA_CERT_PATH.into(),
             };
             let report = place_configs(&opts)?;
 

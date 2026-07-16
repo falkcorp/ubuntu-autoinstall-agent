@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.5.4
+// version: 2.6.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-13
+// last-edited: 2026-07-16
 
 //! Configuration structures for SSH/local installation
 
@@ -93,6 +93,17 @@ pub struct InstallationConfig {
     /// drives `verify` to check that at least one fido2 keyslot exists.
     #[serde(default = "default_true")]
     pub expect_fido2: bool,
+    /// Install CA public cert (PEM), written to `/etc/uaa/install-ca.crt` on
+    /// the target in Phase 5 so `uaa enroll`'s default `--ca` path finds it
+    /// (spec Decision 7). NOT a per-host secret — the same cert for every
+    /// host — so `uaa config place` fills this slot unconditionally from the
+    /// server's `/var/lib/uaa/ca/ca.crt`, regardless of `--inject-from`. A
+    /// config placed before the CA existed keeps the literal
+    /// `REPLACE_AT_PLACE_TIME` placeholder here; Phase 5 writes it to the
+    /// target as-is (fail-closed — `uaa enroll` treats an unparseable CA as
+    /// the missing-CA case, never falling back to system roots).
+    #[serde(default = "default_install_ca_cert")]
+    pub install_ca_cert: String,
 }
 
 fn default_tang_threshold() -> u8 {
@@ -105,6 +116,10 @@ fn default_true() -> bool {
 
 fn default_tpm2_pcr_ids() -> String {
     "7".to_string()
+}
+
+pub fn default_install_ca_cert() -> String {
+    crate::config_place::PLACEHOLDER.to_string()
 }
 
 pub fn default_network_renderer() -> String {
@@ -164,6 +179,7 @@ impl InstallationConfig {
             tpm2_pin: None,
             tpm2_pcr_ids: default_tpm2_pcr_ids(),
             expect_fido2: true,
+            install_ca_cert: default_install_ca_cert(),
         }
     }
 }

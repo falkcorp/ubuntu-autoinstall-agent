@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.11.1
+// version: 2.12.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-16
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -680,6 +680,40 @@ impl<'a> SystemConfigurator<'a> {
         Ok(())
     }
 
+    /// Write the install CA's public cert into the target at
+    /// `/etc/uaa/install-ca.crt`, the default `--ca` path `uaa enroll` pins
+    /// (spec Decision 7). Runs in both the full install and in-target-only
+    /// paths (phase 5 is shared by both — see `perform_in_target_configuration`).
+    ///
+    /// Best-effort but loud: a config placed before the CA was reachable
+    /// still carries the literal `REPLACE_AT_PLACE_TIME` placeholder here, so
+    /// this writes it as-is and warns — matching `uaa enroll`'s own
+    /// fail-closed treatment of an unparseable CA (abort + retry), never
+    /// silently granting trust.
+    pub async fn install_ca_cert_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
+        info!("Installing CA trust anchor in chroot");
+        if config.install_ca_cert.contains(crate::config_place::PLACEHOLDER) {
+            warn!(
+                "install_ca_cert still contains {} — uaa enroll on this host will fail closed \
+                 until the config is re-placed with the install CA reachable",
+                crate::config_place::PLACEHOLDER
+            );
+        }
+        self.runner
+            .execute("mkdir -p /mnt/targetos/etc/uaa && chmod 0755 /mnt/targetos/etc/uaa")
+            .await?;
+        self.runner
+            .execute(&format!(
+                "cat > /mnt/targetos/etc/uaa/install-ca.crt <<'UAA_INSTALL_CA_EOF'\n{}\nUAA_INSTALL_CA_EOF",
+                config.install_ca_cert
+            ))
+            .await?;
+        self.runner
+            .execute("chmod 0644 /mnt/targetos/etc/uaa/install-ca.crt")
+            .await?;
+        Ok(())
+    }
+
     /// Enroll Tang servers via Clevis SSS (t-of-n) on the LUKS partition.
     ///
     /// The clevis binary runs on the *host* (live environment) because the LUKS
@@ -1160,6 +1194,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            install_ca_cert: "test-ca-pem".into(),
         }
     }
 

@@ -1,7 +1,7 @@
 # file: examples/configs/install/len-serv-001.yaml
-# version: 1.0.0
+# version: 1.1.0
 # guid: a1b2c3d4-0001-4a1b-8c2d-1e2f3a4b5c61
-# last-edited: 2026-07-09
+# last-edited: 2026-07-16
 #
 # Per-host ZFS-on-LUKS install config for len-serv-001.
 # Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs);
@@ -22,6 +22,12 @@ timezone: America/New_York
 # --- secrets: injected per-host at place-time ---
 luks_key: REPLACE_AT_PLACE_TIME
 root_password: REPLACE_AT_PLACE_TIME
+
+# NOT a per-host secret — the same install CA cert for every host, filled in
+# automatically by `uaa config place` from /var/lib/uaa/ca/ca.crt on the
+# server (Decision 7). Written to /etc/uaa/install-ca.crt on the target so
+# `uaa enroll` finds it. Left unsubstituted here it fails closed.
+install_ca_cert: REPLACE_AT_PLACE_TIME
 
 network_interface: enp1s0f0
 network_address: 172.16.3.92/23

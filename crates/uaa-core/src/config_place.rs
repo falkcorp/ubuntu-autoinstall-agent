@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/config_place.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 0f2da210-310d-48f5-8c58-1b95bd3c6d45
-// last-edited: 2026-07-10
+// last-edited: 2026-07-16
 
 //! Config placement — server-local port of `scripts/deploy-usb-configs.sh` (v1.1.0).
 //!
@@ -60,6 +60,12 @@ pub const DEFAULT_SRC_DIR: &str = "examples/configs/install";
 
 /// Default cloud-init web root on the server.
 pub const DEFAULT_DEST_BASE: &str = "/var/www/html/cloud-init";
+
+/// Default path to the install CA's public cert on the server. Mirrors
+/// `uaa_control::ca::InstallCa`'s production layout (`/var/lib/uaa/ca/ca.crt`,
+/// 0644 inside a 0700 dir) — this crate has no dependency on uaa-control, so
+/// the path is duplicated here as a plain constant rather than imported.
+pub const DEFAULT_INSTALL_CA_CERT_PATH: &str = "/var/lib/uaa/ca/ca.crt";
 
 /// Host → MAC registry (the known fleet MACs). Unknown host → `None`.
 pub fn mac_for_host(host: &str) -> Option<&'static str> {
@@ -256,6 +262,24 @@ pub fn inject_secrets(secrets: &SecretsFile, host: &str, config_text: &str) -> S
     out.join("\n")
 }
 
+/// Fill the `install_ca_cert: REPLACE_AT_PLACE_TIME` slot from the install
+/// CA's public cert at `ca_cert_path`. Unlike [`inject_secrets`], this runs
+/// UNCONDITIONALLY — the same cert for every host, not a per-host secret
+/// (Decision 7) — so it applies regardless of whether `--inject-from` was
+/// given. A missing/unreadable CA file leaves the line untouched; the
+/// PLACEHOLDER hard gate in [`place_configs`] then refuses that host, matching
+/// `uaa enroll`'s own fail-closed treatment of a missing CA.
+fn inject_install_ca_cert(config_text: &str, ca_cert_path: &Path) -> String {
+    let Ok(pem) = fs::read_to_string(ca_cert_path) else {
+        return config_text.to_string();
+    };
+    let escaped = pem.replace('\\', "\\\\").replace('\n', "\\n");
+    config_text.replace(
+        &format!("install_ca_cert: {PLACEHOLDER}"),
+        &format!("install_ca_cert: \"{escaped}\""),
+    )
+}
+
 /// True for a remote-looking destination — scp `host:path` syntax, `ssh://…`, or
 /// anything containing `://`. Placement is server-local only.
 fn dest_is_remote(dest: &str) -> bool {
@@ -282,6 +306,10 @@ pub struct PlaceOptions {
     pub inject_from: Option<PathBuf>,
     /// Hosts to place; empty = all [`KNOWN_HOSTS`].
     pub hosts: Vec<String>,
+    /// Path to the install CA's public cert, injected into every host
+    /// unconditionally (not a secret — see [`inject_install_ca_cert`]).
+    /// Defaults to [`DEFAULT_INSTALL_CA_CERT_PATH`]; overridable for tests.
+    pub install_ca_cert_path: PathBuf,
 }
 
 /// Outcome of a placement run. Overall `Ok` even with refusals; the CLI maps a
@@ -365,6 +393,10 @@ pub fn place_configs(opts: &PlaceOptions) -> Result<PlaceReport> {
             None => (config_text, None),
         };
 
+        // Install CA cert: unconditional, not gated behind --inject-from — it
+        // is the same public cert for every host, not a per-host secret.
+        let final_text = inject_install_ca_cert(&final_text, &opts.install_ca_cert_path);
+
         // HARD GATE on the staged copy: never place a config whose secrets were
         // not injected. The reason carries the token + src path, never a value.
         if final_text.contains(PLACEHOLDER) {
@@ -427,7 +459,8 @@ mod tests {
              network_search: jf.local\n\
              network_nameservers:\n  - 172.16.2.1\n\
              enroll_tpm2: true\n\
-             tpm2_pin: REPLACE_AT_PLACE_TIME\n"
+             tpm2_pin: REPLACE_AT_PLACE_TIME\n\
+             install_ca_cert: REPLACE_AT_PLACE_TIME\n"
         )
     }
 
@@ -531,6 +564,7 @@ mod tests {
             dest_base: dest.path().to_path_buf(),
             inject_from: None,
             hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
         };
         let report = place_configs(&opts).unwrap();
 
@@ -562,6 +596,7 @@ mod tests {
                 "len-serv-002".to_string(),
                 "len-serv-001".to_string(),
             ],
+            install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
         };
         let report = place_configs(&opts).unwrap();
 
@@ -583,6 +618,7 @@ mod tests {
                 dest_base: PathBuf::from(remote),
                 inject_from: None,
                 hosts: vec!["len-serv-001".to_string()],
+                install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
             };
             let err = place_configs(&opts).unwrap_err();
             assert!(
@@ -614,6 +650,7 @@ mod tests {
             dest_base: dest.path().to_path_buf(),
             inject_from: Some(secrets_path.clone()),
             hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
         };
         let report = place_configs(&opts).unwrap();
 
@@ -646,12 +683,16 @@ mod tests {
             placeholder_config("len-serv-001"),
         )
         .unwrap();
+        let ca_path = secrets_dir.path().join("ca.crt");
+        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
+            .unwrap();
 
         let opts = PlaceOptions {
             src_dir: src.path().to_path_buf(),
             dest_base: dest.path().to_path_buf(),
             inject_from: Some(secrets_path),
             hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: ca_path,
         };
         let report = place_configs(&opts).unwrap();
 
@@ -665,8 +706,39 @@ mod tests {
         assert_eq!(mode & 0o777, 0o644, "wrong mode: {:o}", mode);
         let content = fs::read_to_string(&placed).unwrap();
         assert!(content.contains("test-passphrase"), "injected value missing");
+        assert!(content.contains("-----BEGIN CERTIFICATE-----"), "CA cert missing");
         assert!(!content.contains(PLACEHOLDER), "placeholder leftover");
         // Parses as InstallationConfig.
-        serde_yaml::from_str::<InstallationConfig>(&content).expect("must parse");
+        let parsed: InstallationConfig =
+            serde_yaml::from_str(&content).expect("must parse");
+        assert_eq!(
+            parsed.install_ca_cert,
+            "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
+        );
+    }
+
+    #[test]
+    fn test_inject_install_ca_cert_fills_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n")
+            .unwrap();
+
+        let config = "hostname: x\ninstall_ca_cert: REPLACE_AT_PLACE_TIME\nother: y\n";
+        let out = inject_install_ca_cert(config, &ca_path);
+
+        assert!(!out.contains(PLACEHOLDER), "got: {out}");
+        assert!(
+            out.contains("install_ca_cert: \"-----BEGIN CERTIFICATE-----\\nABC\\n-----END CERTIFICATE-----\\n\""),
+            "got: {out}"
+        );
+        assert!(out.contains("other: y"), "unrelated line disturbed: {out}");
+    }
+
+    #[test]
+    fn test_inject_install_ca_cert_missing_file_is_noop() {
+        let config = "hostname: x\ninstall_ca_cert: REPLACE_AT_PLACE_TIME\n";
+        let out = inject_install_ca_cert(config, Path::new("/nonexistent/ca.crt"));
+        assert_eq!(out, config, "missing CA file must leave the placeholder untouched");
     }
 }

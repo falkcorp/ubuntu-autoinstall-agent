@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.10.2
+// version: 2.11.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-10
+// last-edited: 2026-07-14
 
 //! Command implementations for the CLI
 
@@ -632,10 +632,32 @@ fn is_live_environment() -> bool {
     // Check for common live environment indicators. Ubuntu Server live ISOs
     // use casper (boot=casper on the cmdline, /run/casper at runtime), NOT
     // Debian live-boot's /run/live / boot=live — check both families.
+    //
+    // 2026-07-14 (U1/unimatrixone): none of the checks below held on a real
+    // Ubuntu 26.04 Server live boot — /run/casper doesn't exist on this
+    // release, and the cmdline only carries `BOOT_IMAGE=/casper/vmlinuz`
+    // (a path, not a standalone `casper`/`boot=casper` token), so `uaa
+    // install` refused to run with "should only be run from a live USB/CD
+    // environment" on a machine that unambiguously *was* live-booted from
+    // the USB. Added two version-stable signals that actually held on the
+    // real box: casper/live-boot both always mount an overlayfs root over
+    // squashfs lower layers, and `/cdrom` is the live medium itself.
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let root_is_overlay = std::fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .any(|line| {
+            let mut fields = line.split_whitespace();
+            let _source = fields.next();
+            let mountpoint = fields.next();
+            let fstype = fields.next();
+            mountpoint == Some("/") && fstype == Some("overlay")
+        });
     std::path::Path::exists(std::path::Path::new("/run/live"))
         || std::path::Path::exists(std::path::Path::new("/lib/live"))
         || std::path::Path::exists(std::path::Path::new("/run/casper"))
+        || std::path::Path::exists(std::path::Path::new("/cdrom"))
+        || root_is_overlay
         || std::env::var("DEBIAN_FRONTEND").unwrap_or_default() == "noninteractive"
         || cmdline.contains("boot=live")
         || cmdline.contains("boot=casper")
@@ -764,6 +786,10 @@ fn create_local_installation_config(
         tpm2_pin: None,
         tpm2_pcr_ids: "7".to_string(),
         expect_fido2: true,
+        // No place-time delivery on this interactive path (it runs live, off the
+        // netboot server) — leave the fail-closed placeholder; `uaa enroll` will
+        // refuse to trust it until the CA is delivered by hand.
+        install_ca_cert: uaa_core::network::ssh_installer::config::default_install_ca_cert(),
     })
 }
 

@@ -1,7 +1,7 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 1.1.0
+# version: 1.2.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
-# last-edited: 2026-07-09
+# last-edited: 2026-07-16
 #
 # Per-host ZFS-on-LUKS install config for unimatrixone (Supermicro X10DSC+).
 # Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs);
@@ -36,6 +36,12 @@ timezone: America/New_York
 # --- secrets: injected per-host at place-time ---
 luks_key: REPLACE_AT_PLACE_TIME
 root_password: REPLACE_AT_PLACE_TIME
+
+# NOT a per-host secret — the same install CA cert for every host, filled in
+# automatically by `uaa config place` from /var/lib/uaa/ca/ca.crt on the
+# server (Decision 7). Written to /etc/uaa/install-ca.crt on the target so
+# `uaa enroll` finds it. Left unsubstituted here it fails closed.
+install_ca_cert: REPLACE_AT_PLACE_TIME
 
 # NIC confirmed on the live target 2026-07-09: the 82599 port with 172.16.2.35 +
 # MAC ac:1f:6b:40:fc:e2 is `ens5f0` (systemd predictable name, PCI-path based, so
