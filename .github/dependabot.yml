@@ -1,5 +1,5 @@
 # file: .github/dependabot.yml
-# version: 1.1.0
+# version: 1.2.0
 # guid: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 # last-edited: 2026-07-16
 #
@@ -33,15 +33,25 @@ updates:
       - dependency-name: "*"
         update-types:
           - version-update:semver-major
-      # reqwest is pre-1.0, so a 0.12->0.13 bump is classified as
-      # "semver-minor" by the rule above and slips through — but 0.13
-      # renamed the rustls-tls feature (breaks our build) and changed the
-      # default TLS root-cert verifier, which touches the fail-closed,
-      # pinned-CA-only client in crates/uaa-core/src/pki.rs
-      # (ReqwestEnrollTransport). Needs a deliberate, tested migration, not
-      # an unattended bump (see PR #93).
-      - dependency-name: "reqwest"
-        versions: [">=0.13.0"]
+      # Almost every Cargo dependency here is pre-1.0 (reqwest, rcgen,
+      # axum, tonic, sha2, mdns-sd, ed25519-dalek, ...), where Dependabot
+      # classifies a 0.x -> 0.(x+1) bump as "semver-minor" — the rule above
+      # (major-only) never catches it, yet these bumps break the build as
+      # often as a real major would. Proven twice: reqwest 0.12->0.13 (PR
+      # #93, renamed the rustls-tls feature + changed the default TLS
+      # root-cert verifier, touching the fail-closed pinned-CA client in
+      # pki.rs) and a 16-crate grouped bump (PR #94: rcgen's Ia5String went
+      # private, sha2 0.11's LowerHex bound broke, mdns-sd 0.20 reworked its
+      # API, tonic-build 0.14 removed `configure()`). Ignoring semver-minor
+      # too means routine dependency bumps here are patch-only; upgrading a
+      # 0.x crate to a new "minor" is a deliberate, tested, one-at-a-time
+      # decision, not something to wave through weekly. (Security-advisory
+      # PRs are a separate Dependabot mechanism and are NOT filtered by
+      # this — see the vite fix that still needed doing by hand because it
+      # crossed the same kind of pre-1.0 boundary.)
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
 
   # Github Actions
   - package-ecosystem: github-actions
