@@ -36,18 +36,18 @@ ssh2 = { version = "0.9", default-features = false, features = ["vendored-openss
 
 # Cryptography
 ring = "0.17"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # File Operations
 tempfile = "3.8"
 walkdir = "2.4"
-dirs = "5.0"
+dirs = "6.0"
 
 # System Operations
-nix = "0.27"
+nix = "0.31"
 
 # Progress Indicators
-indicatif = "0.17"
+indicatif = "0.18"
 
 # UUID Generation
 uuid = { version = "1.6", features = ["v4"] }
@@ -67,23 +67,23 @@ libc = "0.2"
 tokio-test = "0.4"
 
 # constellation deps (CP-02) — later crates reference these with workspace = true
-axum = "0.7"
+axum = "0.8"
 base64 = "0.22"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-mdns-sd = "0.13"
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+mdns-sd = "0.20"
 notify = "6.1"
-prost = "0.13"
-prost-types = "0.13"
-protox = "0.7"
-rand = "0.8"
-rcgen = "0.13"
+prost = "0.14"
+prost-types = "0.14"
+protox = "0.9"
+rand = "0.10"
+rcgen = "0.14"
 rust-embed = "8.5"
 rustls = "0.23"
 semver = { version = "1.0", features = ["serde"] }
 tokio-postgres = "0.7"
 tokio-rustls = "0.26"
-tonic = "0.12"
-tonic-build = "0.12"
-tower-http = { version = "0.6", features = ["fs"] }
+tonic = "0.14"
+tonic-build = "0.14"
+tower-http = { version = "0.7", features = ["fs"] }
 utoipa = "5.2"
-x509-parser = "0.16"
+x509-parser = "0.18"
