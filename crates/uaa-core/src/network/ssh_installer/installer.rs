@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.11.0
+// version: 2.11.1
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-16
 
@@ -1309,6 +1309,52 @@ mod tests {
         assert!(
             wipefs <= sgdisk && sgdisk < zpool && zpool < debootstrap && debootstrap < grub,
             "expected wipefs<=sgdisk<zpool<debootstrap<grub, got {wipefs} {sgdisk} {zpool} {debootstrap} {grub}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_run_assembles_md_before_wiping() {
+        // unimatrixone-shaped config: disk_device is an IMSM/mdraid volume that
+        // does not auto-assemble on the live ISO. A fresh (non-selective) run
+        // must assemble it before the first command that touches the device
+        // node (wipefs), or wipefs hard-fails because /dev/md/Volume0_0
+        // doesn't exist yet.
+        let mock = RecordingExecutor::new();
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::full();
+        let mut cfg = sample_config();
+        cfg.disk_device = "/dev/md/Volume0_0".into();
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        let assemble =
+            position_cmd(&cmds, "mdadm --assemble --scan").expect("mdadm --assemble --scan expected");
+        let wipefs = position_cmd(&cmds, "wipefs -a").expect("wipefs -a expected");
+        assert!(
+            assemble < wipefs,
+            "expected mdadm assembly before wipefs, got assemble={assemble} wipefs={wipefs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_run_skips_md_assemble_for_plain_disk() {
+        // Non-md disk_device (the common case): assemble_md_if_needed must be a
+        // true no-op, not just harmless. Phase 1 still apt-installs the mdadm
+        // package unconditionally (it's harmless on non-md hosts), so assert on
+        // the specific assemble invocation, not the bare substring "mdadm".
+        let mock = RecordingExecutor::new();
+        let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
+        let selection = PhaseSelection::full();
+        let cfg = sample_config();
+        assert!(!cfg.disk_device.starts_with("/dev/md"));
+
+        let _ = installer.perform_installation(&cfg, &selection).await;
+
+        let cmds = mock.recorded();
+        assert!(
+            !contains_cmd(&cmds, "mdadm --assemble --scan"),
+            "plain-disk run must not attempt md assembly"
         );
     }
 

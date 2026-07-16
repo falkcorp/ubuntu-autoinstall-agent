@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/disk_ops.rs
-// version: 2.4.1
+// version: 2.5.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-16
 
 //! Disk operations for SSH installation
 
@@ -37,6 +37,15 @@ impl<'a> DiskManager<'a> {
         _auth: &WipeAuthorization,
     ) -> Result<()> {
         info!("Starting disk preparation for {}", config.disk_device);
+
+        // For an md/IMSM disk_device (e.g. unimatrixone's /dev/md/Volume0_0),
+        // the live ISO does not auto-assemble the array on boot — the device
+        // node simply doesn't exist yet, and the very next command (wipefs -a)
+        // hard-fails. assemble_md_if_needed is idempotent (mdadm --assemble
+        // --scan || true) and a no-op for non-md disks, so it's safe to call
+        // unconditionally as the first step of every fresh install, not just
+        // the selective-rerun path it was originally written for.
+        self.assemble_md_if_needed(config).await?;
 
         // Clean up any existing mounts first
         self.cleanup_existing_mounts(config).await?;
