@@ -1,146 +1,507 @@
 /* file: web/src/index.css */
-/* version: 1.1.0 */
+/* version: 2.0.0 */
 /* guid: eda64990-a578-4026-b133-dee17e5db539 */
-/* last-edited: 2026-07-13 */
+/* last-edited: 2026-07-14 */
 
 :root {
   color-scheme: light dark;
-  font-family: system-ui, -apple-system, sans-serif;
+  font-family:
+    system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  --sidebar-width-collapsed: 4rem;
+  --sidebar-width-expanded: 15.5rem;
+  --banner-height: 3.75rem;
+  --radius-sm: 0.4rem;
+  --radius-md: 0.65rem;
+  --radius-lg: 1rem;
+  --space-1: 0.35rem;
+  --space-2: 0.6rem;
+  --space-3: 1rem;
+  --space-4: 1.5rem;
+  --space-5: 2.25rem;
+  --transition-fast: 150ms ease;
+  --transition-med: 220ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Light theme */
+  --bg: #f3f4f7;
+  --bg-elevated: #ffffff;
+  --bg-sidebar: #14182b;
+  --bg-sidebar-hover: #1f2440;
+  --text: #1a1c23;
+  --text-muted: #6b7080;
+  --text-on-sidebar: #c9cce0;
+  --text-on-sidebar-active: #ffffff;
+  --border: #e3e5ec;
+  --border-strong: #c9cce0;
+  --accent: #5b6cff;
+  --accent-strong: #4451e0;
+  --accent-soft: #eef0ff;
+  --success: #1f9d55;
+  --success-soft: #e6f7ec;
+  --danger: #d43f3f;
+  --danger-soft: #fdecec;
+  --shadow-sm: 0 1px 2px rgba(16, 18, 30, 0.06), 0 1px 1px rgba(16, 18, 30, 0.04);
+  --shadow-md: 0 8px 24px rgba(16, 18, 30, 0.1), 0 2px 6px rgba(16, 18, 30, 0.06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1117;
+    --bg-elevated: #171a24;
+    --bg-sidebar: #0b0d16;
+    --bg-sidebar-hover: #1a1e30;
+    --text: #e7e8ee;
+    --text-muted: #9195a8;
+    --text-on-sidebar: #a7abc4;
+    --text-on-sidebar-active: #ffffff;
+    --border: #262a3a;
+    --border-strong: #363b52;
+    --accent: #7c8bff;
+    --accent-strong: #97a2ff;
+    --accent-soft: #1c2050;
+    --success: #3ecf7e;
+    --success-soft: #123324;
+    --danger: #f0716f;
+    --danger-soft: #3a1616;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.45);
+  }
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--text);
 }
+
+h1,
+h2,
+h3 {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/* ── App shell ─────────────────────────────────────────────────────────── */
 
 .app-shell {
   display: flex;
-  flex-direction: column;
   min-height: 100vh;
 }
 
-.app-header {
+.app-shell-bare {
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+}
+
+.app-content {
+  flex: 1;
+  min-width: 0;
+  margin-left: var(--sidebar-width-collapsed);
+  display: flex;
+  flex-direction: column;
+  transition: margin-left var(--transition-med);
+}
+
+/* Only a PIN changes this — an unpinned hover pop-out overlays the sidebar
+   on top of content (z-index + box-shadow below) instead of reflowing it. */
+.app-content-pinned {
+  margin-left: var(--sidebar-width-expanded);
+}
+
+/* ── Sidebar (collapsible / pop-out / pinnable) ───────────────────────── */
+
+.sidebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  z-index: 20;
+  width: var(--sidebar-width-collapsed);
+  background: var(--bg-sidebar);
+  color: var(--text-on-sidebar);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width var(--transition-med), box-shadow var(--transition-med);
+}
+
+.sidebar-expanded {
+  width: var(--sidebar-width-expanded);
+  box-shadow: var(--shadow-md);
+}
+
+.sidebar-top {
   display: flex;
   align-items: center;
-  gap: 1.5rem;
-  padding: 0.75rem 1.25rem;
-  border-bottom: 1px solid #8888;
+  justify-content: space-between;
+  height: var(--banner-height);
+  padding: 0 var(--space-2) 0 1.1rem;
+  flex-shrink: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.app-header nav {
+.sidebar-brand {
   display: flex;
-  gap: 1rem;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
 }
 
-.nav-link {
-  text-decoration: none;
+.sidebar-brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
 }
 
-.nav-link-active {
+.sidebar-brand-text {
   font-weight: 700;
-  text-decoration: underline;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+
+.sidebar-pin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.9rem;
+  height: 1.9rem;
+  flex-shrink: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-on-sidebar);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sidebar-pin:hover {
+  background: var(--bg-sidebar-hover);
+  color: #fff;
+}
+
+.sidebar-pin[aria-pressed="true"] {
+  color: var(--accent-strong);
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) 0.6rem;
+}
+
+.sidebar-nav .nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0.55rem 0.65rem;
+  border-radius: var(--radius-sm);
+  color: var(--text-on-sidebar);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.sidebar-nav .nav-link:hover {
+  background: var(--bg-sidebar-hover);
+  color: #fff;
+}
+
+.sidebar-nav .nav-link-active {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+@media (prefers-color-scheme: dark) {
+  .sidebar-nav .nav-link-active {
+    background: rgba(124, 139, 255, 0.16);
+  }
+}
+
+.nav-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.nav-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Top banner ────────────────────────────────────────────────────────── */
+
+.app-banner {
+  height: var(--banner-height);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-4);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.app-banner-title {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.app-banner-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 3px var(--success-soft);
+}
+
+/* ── Main content ──────────────────────────────────────────────────────── */
 
 .app-main {
-  padding: 1.25rem;
+  padding: var(--space-4);
+  flex: 1;
 }
+
+.page-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-4);
+}
+
+.page-card section > h2:first-child,
+.page-card > section > h2:first-child {
+  margin-top: 0;
+}
+
+/* ── Tables ────────────────────────────────────────────────────────────── */
 
 table {
   border-collapse: collapse;
   width: 100%;
-  margin-top: 0.5rem;
+  margin-top: var(--space-3);
+  font-size: 0.92rem;
 }
 
 th,
 td {
   text-align: left;
-  padding: 0.4rem 0.6rem;
-  border-bottom: 1px solid #8884;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
 }
+
+th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+tbody tr {
+  transition: background var(--transition-fast);
+}
+
+tbody tr:hover {
+  background: var(--bg);
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+
+button,
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font: inherit;
+  font-weight: 550;
+  font-size: 0.88rem;
+  cursor: pointer;
+  text-decoration: none;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    transform var(--transition-fast);
+}
+
+button:hover:not(:disabled),
+.button:hover {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+table button + button {
+  margin-left: 0.4rem;
+}
+
+.button-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.button-primary:hover {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #fff;
+}
+
+/* ── Badges ────────────────────────────────────────────────────────────── */
 
 .badge {
-  padding: 0.1rem 0.5rem;
-  border-radius: 0.75rem;
-  font-size: 0.85em;
-  border: 1px solid #8888;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
 }
 
-.badge-drift {
-  border-color: #c0392b;
-  color: #c0392b;
+.badge-drift,
+.badge-nomatch {
+  border-color: transparent;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
-.badge-consistent {
-  border-color: #2e7d32;
-  color: #2e7d32;
+.badge-consistent,
+.badge-match {
+  border-color: transparent;
+  background: var(--success-soft);
+  color: var(--success);
 }
+
+/* ── Banners / cards / states ──────────────────────────────────────────── */
 
 .error-card {
-  border: 1px solid #c0392b;
-  border-radius: 0.4rem;
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  border-radius: var(--radius-md);
   padding: 0.75rem 1rem;
-  margin: 0.5rem 0;
+  margin: 0.75rem 0;
+  color: var(--danger);
 }
 
 .banner {
-  border-radius: 0.4rem;
-  padding: 0.6rem 1rem;
-  margin: 0.5rem 0;
+  border-radius: var(--radius-md);
+  padding: 0.7rem 1rem;
+  margin: 0.75rem 0;
+  border: 1px solid var(--border);
 }
 
-.banner-forbidden {
-  border: 1px solid #c0392b;
+.banner-forbidden,
+.banner-verify-fail,
+.banner-error {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .banner-verify-ok {
-  border: 1px solid #2e7d32;
-}
-
-.banner-verify-fail {
-  border: 1px solid #c0392b;
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .empty-state {
-  opacity: 0.75;
+  color: var(--text-muted);
   font-style: italic;
+  padding: var(--space-3) 0;
+}
+
+.state-loading {
+  color: var(--text-muted);
+  padding: var(--space-3) 0;
 }
 
 .approvals-section {
-  margin-bottom: 1.5rem;
+  margin-bottom: var(--space-4);
 }
 
-.banner-error {
-  border: 1px solid #c0392b;
-}
+/* ── Login page (bare shell, no sidebar) ──────────────────────────────── */
 
 .login-page {
-  max-width: 28rem;
-  margin: 2rem auto;
+  max-width: 26rem;
+  width: 100%;
+  margin: 2rem;
+  padding: var(--space-4);
 }
 
 .login-option {
-  border: 1px solid #8888;
-  border-radius: 0.5rem;
-  padding: 1rem 1.25rem;
-  margin-bottom: 1.25rem;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.login-option h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
 }
 
 .login-option form {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  margin-top: 0.5rem;
+  gap: 0.6rem;
+  margin-top: var(--space-3);
 }
 
-.button {
-  display: inline-block;
-  padding: 0.5rem 1rem;
-  border-radius: 0.4rem;
-  text-decoration: none;
-  text-align: center;
-  cursor: pointer;
+.login-option input {
+  padding: 0.5rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
 }
 
-.button-primary {
-  border: 1px solid #2e7d32;
-  color: inherit;
+.login-option label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
 }
