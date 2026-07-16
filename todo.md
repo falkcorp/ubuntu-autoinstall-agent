@@ -1,7 +1,7 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.6.0
+# version: 2.7.0
 # guid: todo0001-0000-0000-0000-000000000001
-# last-edited: 2026-07-13
+# last-edited: 2026-07-16
 
 ## RESOLVED: operator plane (:15001) had zero authentication (raised 2026-07-13, fixed 2026-07-13)
 
@@ -23,21 +23,21 @@
   router-level tests proving unauthenticated reads/mutations now 401. Not
   yet merged — see PR (branch `feat/operator-plane-auth`).
 
-- [ ] **CI: "New CI System / Test rust stable-1" jobs are broken (raised 2026-07-13)**
-  — `rustup toolchain install stable-1` fails with `invalid toolchain name:
-  'stable-1'` on both `ubuntu-latest` and `macos-latest`. This is a bug in the
-  shared/vendored CI matrix generator (`.github/workflows/scripts/ci_workflow.py`
-  + `reusable-ci.yml`'s `generate-matrix` job) — it emits the literal string
-  `"stable-1"` as a `matrix.version` value that later gets passed straight to
-  `rustup toolchain install`, which has no such toolchain. Confirmed identical
-  failure across PRs #89, #90, #91 (2026-07-13) — NOT introduced by any of
-  those diffs; the toolchain-drift-detection intent (see
-  [[feedback_prefer_latest_versions]] / PR #87's incident) is that `stable-1`
-  should resolve to "one stable release behind current," not a literal rustup
-  channel name. No branch protection currently requires this check, so it
-  hasn't blocked merges, but it means the "test against the previous stable
-  Rust" drift-detection lane has been silently broken since at least
-  2026-07-13 and should be fixed in the shared CI script.
+- [x] **CI: "New CI System / Test rust stable-1" jobs are broken (raised 2026-07-13, fixed 2026-07-13)**
+  — `rustup toolchain install stable-1` failed with `invalid toolchain name:
+  'stable-1'` because the shared/vendored CI matrix generator
+  (`.github/workflows/scripts/ci_workflow.py`) passed the literal
+  `"stable-1"` track marker straight through as a `matrix.version` value on
+  ordinary branches. Already fixed in `ddd6e61` (`fix(ci): fix stable-1
+  toolchain, missing tarpaulin, and Node.js path bugs`, same day): added
+  `is_unresolved_track_marker()`, which filters any bare `stable-N` entry
+  out of the resolved version list unless a matching `stable-N-<language>-
+  <version>` branch name resolves it to a concrete version — covered by
+  `test_is_unresolved_track_marker` and
+  `test_generate_test_matrix_skips_unresolved_track_marker` in
+  `tests/workflow_scripts/test_ci_workflow.py`. Confirmed still passing on
+  `main` (2026-07-16). This bullet was left unchecked after the fix landed;
+  correcting it now.
 
 ## Record every MAC that contacts the machine plane, not just approved ones (raised 2026-07-11)
 
@@ -236,13 +236,18 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   (deny_unknown_fields + round-trip tests) → planned: docs/agent-tasks/installer-robustness/TASK-06-config-schema-hardening.md.
 - [x] **SSH key injection** — already implemented: `configure_system_in_chroot` injects
   `config.ssh_authorized_keys` into the target (system_setup.rs:409-425; verified 2026-07-09).
-- [ ] **`curtin in-target` compatibility** *(→ planned: docs/agent-tasks/installer-robustness/TASK-07-curtin-in-target.md)* — when invoked as `curtin in-target -- ubuntu-autoinstall-agent
-  install`, the binary is already inside the chroot; skip mount setup and debootstrap; only do
-  post-install configuration (GRUB, LUKS crypttab, dracut, Tang).
+- [x] **`curtin in-target` compatibility. DONE (`6ffeae0`, extended since)** —
+  `TARGET_MARKER_PATH`/`is_inside_installed_target` detect the in-target case;
+  `SshInstaller::perform_in_target_configuration` runs ONLY Phase 5 (GRUB, LUKS
+  crypttab, dracut, Tang, and now the install-CA trust anchor), never
+  mount-setup/debootstrap. *(→ planned: docs/agent-tasks/installer-robustness/TASK-07-curtin-in-target.md)*
 
 ## Phase-selective re-run (designed 2026-07-09)
 
-- [ ] **Run only specific install phases (idempotent partial re-run).**
+- [x] **Run only specific install phases (idempotent partial re-run). DONE (`7d909e8` + `69263ed`)**
+  — `PhaseSelection` (`--phases`/`--from-phase`, compile-time `WipeAuthorization` guard) plus
+  non-destructive mount-existing-target prep (`needs_luks_reopen`/`needs_pool_import`,
+  / → /boot → ESP order).
   *(→ planned: docs/agent-tasks/phase-rerun/TASK-01 + TASK-02; spec docs/specs/phase-selective-rerun-design.md)* Install is 7 phases
   (0 vars, 1 pkgs, 2 disk-prep/WIPE, 3 zfs, 4 base, 5 sys-config incl. grub, 6 final).
   Add `--phases <spec>` / `--from-phase <n>` so e.g. a failed grub can be redone with
@@ -264,7 +269,11 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   user to fix the BIOS. Do NOT auto-change BIOS via SUM (keep firmware writes manual). This
   prevents completing a 7/7 install that then can't boot (exactly what happened on U1 —
   fixed by manually setting the controller to legacy). Need to identify the exact BIOS token.
-- [ ] **efibootmgr boot order in chroot (post-grub).**
+- [x] **efibootmgr boot order in chroot (post-grub). DONE (`0cc3b3c`)** —
+  `SystemConfigurator::set_uefi_boot_order` (system_setup.rs), tested by
+  `test_boot_order_cmd_attempts_order_when_entries_exist` /
+  `test_boot_order_cmd_is_chrooted_and_nonfatal` /
+  `test_boot_order_cmd_matches_usb_script_regexes`.
   *(→ planned: docs/agent-tasks/boot-prod/TASK-01-efibootmgr-chroot.md)* Set UEFI BootOrder so
   **network #1, ubuntu #2** — firmware tries PXE first, falls through to the installed
   disk. grub-install currently makes `ubuntu` #1. Also flip the server's PXE target for
@@ -294,7 +303,10 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
      `sudo dd if=<out.iso> of=/dev/sdX bs=4M status=progress conv=fsync`.
   5. Test the full flow on one host: boot USB → agent+config fetched by MAC →
      `uaa install` 7/7 → webhook report → poweroff; verify BootOrder + next boot from disk.
-- [ ] **Populate the RESET partition (p2, 4GiB ext4 — subiquity reset/recovery partition).**
+- [x] **Populate the RESET partition (p2, 4GiB ext4 — subiquity reset/recovery partition). DONE (`3ef30b6`)**
+  — `ResetPartitionStager` (reset_partition.rs), staged in `phase_5_system_configuration`;
+  gated on typing `nuke it` (`test_reset_helper_gate_literal`), plus
+  `test_grub_dropin_contents`/`test_iso_copy_cmd_exact_bytes`/`test_tarball_copy_uses_uaacache_convention`.
   *(→ planned: docs/agent-tasks/boot-prod/TASK-02-reset-partition-populate.md; spec docs/specs/reset-partition-design.md)*
   Currently created + formatted but empty. Idea (user 2026-07-09): put a copy of the
   bootable USB + the debootstrap tarball on it, and a GRUB "reset/recover" entry. The reset
@@ -330,13 +342,17 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   `boot=casper`, bare `casper` token). Original item: — checks `/run/live`, `/lib/live`, or `boot=live` in
   cmdline. On Ubuntu Server live ISO this is correct, but on iPXE-netbooted live environments it may
   miss. Consider also checking for `casper` in `/proc/cmdline` or presence of `ubuntu` in overlay mounts.
-- [ ] **`detect_primary_disk` is fragile** *(→ planned: docs/agent-tasks/installer-robustness/TASK-02-detect-primary-disk-json.md)* — parses `lsblk` text output with simple string matching.
-  Should use `lsblk --json` for reliable parsing.
-- [ ] **`detect_network_config` always returns DHCP** *(→ planned: docs/agent-tasks/installer-robustness/TASK-03-detect-network-config-parse.md)* — never actually reads network info; returns
-  hardcoded DHCP. Needs actual parsing of `ip addr` / `ip route` output.
-- [ ] **`setup_network_configuration` uses `networkd` renderer** *(→ planned: docs/agent-tasks/installer-robustness/TASK-04-netplan-renderer-dhcp.md)* — some servers may prefer `NetworkManager`.
-  Make renderer configurable.
-- [ ] **`hold_on_failure` keepalive calls `self.ssh.execute`** even in local mode — would fail locally.
+- [x] **`detect_primary_disk` is fragile. DONE (`d04567f`)** — now parses `lsblk --json -b -o
+  NAME,TYPE,SIZE` (`crates/uaa/src/cli/commands.rs::detect_primary_disk`).
+  *(→ planned: docs/agent-tasks/installer-robustness/TASK-02-detect-primary-disk-json.md)*
+- [x] **`detect_network_config` always returns DHCP. DONE (`44c0bca`)** — now parses real
+  `ip addr`/`ip route` JSON (`crates/uaa/src/cli/commands.rs::detect_network_config`).
+  *(→ planned: docs/agent-tasks/installer-robustness/TASK-03-detect-network-config-parse.md)*
+- [x] **`setup_network_configuration` uses `networkd` renderer. DONE (`519e721`)** —
+  `InstallationConfig.network_renderer` is a configurable field (networkd/NetworkManager,
+  validated at render time, `test_network_renderer_defaults_when_absent`).
+  *(→ planned: docs/agent-tasks/installer-robustness/TASK-04-netplan-renderer-dhcp.md)*
+- [x] **`hold_on_failure` keepalive calls `self.ssh.execute`** even in local mode — would fail locally.
   Fixed as part of CommandRunner trait refactor.
 - [x] **`SshInstaller` dual-mode is awkward** — refactored to `runner: Box<dyn CommandExecutor>`;
   no more separate `ssh`/`local` fields or mode enum.
@@ -344,10 +360,14 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   to `GRUB_CMDLINE_LINUX` when `initramfs_type == Dracut` and Tang servers are configured.
 - [x] **Tang servers hardcoded** — moved to `InstallationConfig.tang_servers`; fully configurable
   per-machine via YAML; `for_len_serv_003()` sets all three Tang server URLs.
-- [ ] **LUKS passphrase in process env** *(→ planned: docs/agent-tasks/installer-robustness/TASK-05-luks-keyfile.md — also fixes the worse leak: passphrase interpolated into cryptsetup command lines, disk_ops.rs:340/348)* — `setup_installation_variables` exports `LUKS_KEY` as a
-  shell env var, visible in `/proc/<pid>/environ`. Use a tempfile-based keyfile instead.
-- [ ] **No test for local install flow** *(→ planned: docs/agent-tasks/testing-gates/TASK-02-localclient-tests.md)* — all tests use `SshInstaller` with SSH. Add unit tests for
-  local mode using `LocalClient`.
+- [x] **LUKS passphrase in process env. DONE (`10fbb0f`)** — `disk_ops.rs` now writes a 0600
+  tempfile keyfile (`printf '%s' ... > keyfile`, never logged) and drives
+  `cryptsetup --key-file`, shredded after use; `test_luks_commands_never_embed_passphrase`
+  proves it.
+  *(→ planned: docs/agent-tasks/installer-robustness/TASK-05-luks-keyfile.md — also fixes the worse leak: passphrase interpolated into cryptsetup command lines, disk_ops.rs:340/348)*
+- [x] **No test for local install flow. DONE (`55ab93a`)** — `crates/uaa-core/src/network/local.rs`
+  has 10 dedicated `LocalClient` unit tests.
+  *(→ planned: docs/agent-tasks/testing-gates/TASK-02-localclient-tests.md)*
 - [x] **STALE — `PackageManager` never installs `zsys`** (verified 2026-07-09: no zsys in
   packages.rs; only `com.ubuntu.zsys:*` dataset PROPERTIES in zfs_ops.rs, which are correct
   per the OpenZFS HOWTO and harmless without the zsys package). Original item: — zsys is deprecated/removed in Ubuntu 24.04+. Remove it
@@ -365,12 +385,10 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   the target packages + dracut `mdraid` module, gated on the target disk being an md device. Validate
   on the QEMU/mdadm path before any u1 hardware attempt. (The `{}p1` suffix scheme is already correct
   for md126.)
-- [ ] **Partition-name suffix is hardcoded `{}p1..p4`** *(→ planned: docs/agent-tasks/installer-robustness/TASK-01-partition-suffix-helper.md — wave-1, blocks the QEMU virtio gate)* — correct for every current target (NVMe
-  `nvme0n1`, md `md126` — both end in a digit → take `p`) but wrong for bare `/dev/sda` / `/dev/vda`
-  (SATA/virtio → `sda1`, no `p`). Route the ~9 call sites (disk_ops, zfs_ops, system_setup, installer)
-  through one helper that appends `p<N>` only when the device name ends in a digit. Needed before the
-  QEMU gate if that VM uses a virtio `/dev/vda` disk. NOTE: `zfs_ops.rs` test asserts `/dev/sdap3` —
-  that bakes in the bug and must be corrected with the fix.
+- [x] **Partition-name suffix is hardcoded `{}p1..p4`. DONE (`7273286`)** — every call site now
+  routes through `partition_path()` (`ssh_installer/partitions.rs`), which only appends `p<N>`
+  when the device name ends in a digit (covers NVMe/md vs. bare sda/vda).
+  *(→ planned: docs/agent-tasks/installer-robustness/TASK-01-partition-suffix-helper.md — wave-1, blocks the QEMU virtio gate)*
 - [x] **reqwest `Cargo.toml` bound was `^0.13` but lock/intent is `0.12.28`** — dependabot commit
   5f48844 (2026-06-23) set `version = "0.13"` while its own message + `Cargo.lock` say 0.12.28;
   `^0.13` can't match 0.12.28 and `reqwest 0.13.x` dropped the `rustls-tls` feature, so the crate did
@@ -413,10 +431,11 @@ touched; the VM gate (`vm-validate.sh`) must pass on a Linux host before any har
   - If Intel AMT: use `wsmancli` or `amtterm` targeting port 16992.
   - If neither: fall back to Wake-on-LAN (`wol <mac>`) for power-on (not power-off).
 
-- [ ] **Wire remote power into the tool** *(→ planned: docs/agent-tasks/remote-power/TASK-01-power-subcommand-ipmi.md — dispatch + IPMI path now; DASH/AMT arms deferred)* — once credentials are known, add a
-  `ubuntu-autoinstall-agent power <hostname> on|off|reset` subcommand that dispatches
-  to the right mechanism (DASH/AMT/IPMI/WoL) based on machine class. This enables fully
-  automated: place → flip → power-cycle → wait-for-ssh → verify.
+- [x] **Wire remote power into the tool. DONE (`f99dffa`, extended since with AMT/WoL)** —
+  `uaa power <hostname> on|off|status` (`crates/uaa/src/cli/commands.rs::power_command`)
+  dispatches IPMI-via-server; Intel AMT (wsman) + Wake-on-LAN paths added later (ws8-power).
+  DASH (M715q) remains deferred — driver/creds not yet installed (see line ~395 below).
+  *(→ planned: docs/agent-tasks/remote-power/TASK-01-power-subcommand-ipmi.md — dispatch + IPMI path now; DASH/AMT arms deferred)*
 
 ## Infrastructure Context
 
