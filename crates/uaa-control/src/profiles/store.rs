@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/profiles/store.rs
-// version: 0.2.0
+// version: 0.3.0
 // guid: b0c81b2d-2a46-40e3-855b-408cf3708503
 // last-edited: 2026-07-17
 
@@ -45,12 +45,15 @@
 #[cfg(test)]
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::audit::{AuditStore, NewAuditEvent};
 use crate::db::store::{read_snapshot_strict, write_snapshot, SnapshotDoc, StatePaths, StoreError};
 use crate::db::{HostGroupRow, HostProfileRow, HostnameAllocationRow, ProfileVersionRow};
+use crate::import_export::normalize_mac;
+use crate::profiles::alloc::{next_index, render_hostname, taken_hostnames};
 
 /// Persistence for host groups / profiles / hostname allocations / profile
 /// versions. Mirrors `saga.rs`'s `SagaStore` — a narrow, per-concern trait, not
@@ -78,11 +81,26 @@ pub trait ProfileStore: Send + Sync {
     /// rebound-away rows (append-only history) — the fail-closed read
     /// DS-REG-03's allocator depends on.
     async fn list_allocations(&self, group_id: Uuid) -> Result<Vec<HostnameAllocationRow>>;
-    /// DS-REG-03. A loud stub in [`SnapshotProfileStore`] — never a silent `Ok`.
+    /// DS-REG-03. Allocate-once: a bound identity returns its existing row
+    /// unchanged (writing nothing); an unbound one gets `max(index)+1`; a
+    /// released one is reactivated at the SAME index. Reads fail CLOSED via
+    /// `read_snapshot_strict` — an unreadable snapshot is an `Err`, never an
+    /// allocate-from-1.
     async fn allocate_index(&self, group_id: Uuid, identity: &str) -> Result<HostnameAllocationRow>;
-    /// DS-REG-03. A loud stub in [`SnapshotProfileStore`] — never a silent `Ok`.
+    /// DS-REG-03 / spec D18 — the NIC-replacement runbook and the one deliberate
+    /// exception to append-only. Moves the existing index+hostname to
+    /// `new_identity` and tombstones the old row, audited via
+    /// [`AuditStore::append_in_txn`] with the caller-supplied `actor`.
+    ///
+    /// NOTE (deliberate deviation from the DS-REG-03 brief's 3-arg sketch): the
+    /// `audit` store and `actor` are threaded as parameters, mirroring the
+    /// crate's audited-mutation convention (`enroll::approve(..., audit, &session.login)`).
+    /// The actor is the per-request operator login; it cannot be a store field.
+    /// Operator-gating (`Role::Operator`) is the caller's job (DS-OPS-01).
     async fn rebind(
         &self,
+        audit: &dyn AuditStore,
+        actor: &str,
         group_id: Uuid,
         old_identity: &str,
         new_identity: &str,
@@ -93,6 +111,12 @@ pub trait ProfileStore: Send + Sync {
     /// version already written — this trait does not enforce that; it is a
     /// caller-side invariant (spec Decisions 10/11).
     async fn put_version(&self, row: ProfileVersionRow) -> Result<()>;
+}
+
+/// Current wall-clock time as an RFC3339 string, for `allocated_at` audit
+/// stamps. Ordering/debug only — never a key.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 // ── SnapshotProfileStore — real impl, backed by the StatePaths snapshot ────
@@ -113,6 +137,12 @@ impl SnapshotProfileStore {
         Self { paths }
     }
 
+    /// **Write-path only; allocation must use `read_snapshot_strict` directly.**
+    /// This helper fails OPEN on a missing file (returns an empty doc to
+    /// bootstrap a first write) — CORRECT for `put_*`, CATASTROPHIC for
+    /// `allocate_index`/`rebind`, where a missing snapshot read as empty would
+    /// conclude every index is free and re-allocate the whole fleet from 1.
+    ///
     /// Strict read for a mutation's read-modify-write cycle. Like
     /// [`read_snapshot_strict`], EXCEPT a genuinely missing file — the
     /// first-ever write on a fresh install, before any snapshot has been
@@ -201,17 +231,144 @@ impl ProfileStore for SnapshotProfileStore {
             .collect())
     }
 
-    async fn allocate_index(&self, _group_id: Uuid, _identity: &str) -> Result<HostnameAllocationRow> {
-        unimplemented!("DS-REG-03")
+    /// Allocate-once hostname index for `(group_id, normalize_mac(identity))`.
+    ///
+    /// Reads via [`read_snapshot_strict`] — **never** `read_for_mutation` (which
+    /// fails open) — so an unreadable snapshot is refused, never treated as an
+    /// empty registry that would re-allocate the fleet from 1. Follows
+    /// DS-REG-02's lock-free read-compute-write pattern (`guarded_mutation` is
+    /// not usable here: it gates on a `DbHealth` this store does not have and
+    /// holds no lock). There is therefore NO in-process serialization; under
+    /// spec D4 `uaa-control` is single-writer, exactly as every other mutation
+    /// in this store already assumes.
+    async fn allocate_index(&self, group_id: Uuid, identity: &str) -> Result<HostnameAllocationRow> {
+        let identity = normalize_mac(identity);
+        let mut doc = read_snapshot_strict(&self.paths)?;
+
+        // Allocate-once: at most one non-tombstoned row per (group, identity).
+        if let Some(pos) = doc.hostname_allocations.iter().position(|a| {
+            a.group_id == group_id && a.identity == identity && a.rebound_to.is_none()
+        }) {
+            if doc.hostname_allocations[pos].released_at.is_some() {
+                // Returning machine: reactivate at the SAME index.
+                doc.hostname_allocations[pos].released_at = None;
+                let row = doc.hostname_allocations[pos].clone();
+                write_snapshot(&self.paths, &doc)?;
+                return Ok(row);
+            }
+            // Already bound and active: idempotent no-op, write NOTHING.
+            return Ok(doc.hostname_allocations[pos].clone());
+        }
+
+        // Unbound: max(index)+1 over EVERY row in the group (never lowest-free).
+        let group_rows: Vec<HostnameAllocationRow> = doc
+            .hostname_allocations
+            .iter()
+            .filter(|a| a.group_id == group_id)
+            .cloned()
+            .collect();
+        let index = next_index(&group_rows);
+
+        let group = doc
+            .host_groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .ok_or_else(|| anyhow!("no host group with id {group_id}"))?;
+        let hostname = render_hostname(&group.hostname_pattern, &group.name, index)?;
+
+        // Global uniqueness (spec D2): the materialized name must not collide with
+        // ANY group's allocation or ANY hostname_override.
+        if taken_hostnames(&doc).contains(&hostname) {
+            return Err(anyhow!(
+                "hostname {hostname:?} is already allocated (global uniqueness, spec D2)"
+            ));
+        }
+
+        let row = HostnameAllocationRow {
+            group_id,
+            identity,
+            index,
+            hostname,
+            allocated_at: Some(now_rfc3339()),
+            released_at: None,
+            rebound_to: None,
+        };
+        doc.hostname_allocations.push(row.clone());
+        write_snapshot(&self.paths, &doc)?;
+        Ok(row)
     }
 
     async fn rebind(
         &self,
-        _group_id: Uuid,
-        _old_identity: &str,
-        _new_identity: &str,
+        audit: &dyn AuditStore,
+        actor: &str,
+        group_id: Uuid,
+        old_identity: &str,
+        new_identity: &str,
     ) -> Result<HostnameAllocationRow> {
-        unimplemented!("DS-REG-03")
+        let old_identity = normalize_mac(old_identity);
+        let new_identity = normalize_mac(new_identity);
+        let mut doc = read_snapshot_strict(&self.paths)?;
+
+        let old_pos = doc
+            .hostname_allocations
+            .iter()
+            .position(|a| {
+                a.group_id == group_id && a.identity == old_identity && a.rebound_to.is_none()
+            })
+            .ok_or_else(|| {
+                anyhow!("rebind: old identity {old_identity} is not bound in group {group_id}")
+            })?;
+
+        if doc.hostname_allocations.iter().any(|a| {
+            a.group_id == group_id && a.identity == new_identity && a.rebound_to.is_none()
+        }) {
+            return Err(anyhow!(
+                "rebind: new identity {new_identity} is already bound in group {group_id}"
+            ));
+        }
+
+        // Tombstone the old row; the index + hostname move to the new identity.
+        doc.hostname_allocations[old_pos].rebound_to = Some(new_identity.clone());
+        let index = doc.hostname_allocations[old_pos].index;
+        let hostname = doc.hostname_allocations[old_pos].hostname.clone();
+
+        let new_row = HostnameAllocationRow {
+            group_id,
+            identity: new_identity.clone(),
+            index,
+            hostname,
+            allocated_at: Some(now_rfc3339()),
+            released_at: None,
+            rebound_to: None,
+        };
+        doc.hostname_allocations.push(new_row.clone());
+
+        // Commit the snapshot write INSIDE the audit's critical section so the
+        // append-only exception and its audit row land atomically (spec D18 /
+        // Decision 21). Never the no-op-mutation `append` helper — this changes
+        // state, so the mutation IS the snapshot write.
+        let event = NewAuditEvent {
+            at: now_rfc3339(),
+            actor: actor.to_string(),
+            role: "operator".to_string(),
+            action: "registry.rebind".to_string(),
+            target: Some(format!("group:{group_id}")),
+            outcome: "success".to_string(),
+            detail: Some(serde_json::json!({
+                "old_identity": old_identity,
+                "new_identity": new_identity,
+                "index": index,
+            })),
+        };
+        let paths = self.paths.clone();
+        audit
+            .append_in_txn(
+                Box::new(move || write_snapshot(&paths, &doc).map_err(anyhow::Error::from)),
+                event,
+            )
+            .await?;
+        Ok(new_row)
     }
 
     async fn list_versions(&self, object_id: Uuid) -> Result<Vec<ProfileVersionRow>> {
@@ -388,25 +545,34 @@ impl ProfileStore for MemProfileStore {
 
     async fn rebind(
         &self,
+        audit: &dyn AuditStore,
+        actor: &str,
         group_id: Uuid,
         old_identity: &str,
         new_identity: &str,
     ) -> Result<HostnameAllocationRow> {
-        let mut state = self.state.lock().expect("MemProfileStore state poisoned");
-
+        // Phase 1: validate + compute the new row WITHOUT committing (guard
+        // dropped before the await below — no std Mutex held across `.await`).
         let (index, hostname) = {
+            let state = self.state.lock().expect("MemProfileStore state poisoned");
             let existing = state
                 .hostname_allocations
-                .iter_mut()
+                .iter()
                 .find(|a| {
                     a.group_id == group_id && a.identity == old_identity && a.rebound_to.is_none()
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "no active allocation for identity {old_identity} in group {group_id}"
+                        "rebind: old identity {old_identity} is not bound in group {group_id}"
                     )
                 })?;
-            existing.rebound_to = Some(new_identity.to_string());
+            if state.hostname_allocations.iter().any(|a| {
+                a.group_id == group_id && a.identity == new_identity && a.rebound_to.is_none()
+            }) {
+                return Err(anyhow::anyhow!(
+                    "rebind: new identity {new_identity} is already bound in group {group_id}"
+                ));
+            }
             (existing.index, existing.hostname.clone())
         };
 
@@ -419,7 +585,38 @@ impl ProfileStore for MemProfileStore {
             released_at: None,
             rebound_to: None,
         };
-        state.hostname_allocations.push(row.clone());
+
+        // Phase 2: commit the tombstone + new row INSIDE the audit append — the
+        // same atomic pattern the real store uses (never the no-op-mutation
+        // helper, which must never accompany a state change).
+        let event = NewAuditEvent {
+            at: now_rfc3339(),
+            actor: actor.to_string(),
+            role: "operator".to_string(),
+            action: "registry.rebind".to_string(),
+            target: Some(format!("group:{group_id}")),
+            outcome: "success".to_string(),
+            detail: None,
+        };
+        let row_for_closure = row.clone();
+        let new_identity = new_identity.to_string();
+        audit
+            .append_in_txn(
+                Box::new(move || {
+                    let mut state = self.state.lock().expect("MemProfileStore state poisoned");
+                    if let Some(old) = state.hostname_allocations.iter_mut().find(|a| {
+                        a.group_id == group_id
+                            && a.identity == old_identity
+                            && a.rebound_to.is_none()
+                    }) {
+                        old.rebound_to = Some(new_identity.clone());
+                    }
+                    state.hostname_allocations.push(row_for_closure);
+                    Ok(())
+                }),
+                event,
+            )
+            .await?;
         Ok(row)
     }
 
@@ -510,14 +707,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "DS-REG-03")]
-    async fn test_allocate_index_is_unimplemented_stub() {
-        let dir = tempdir().unwrap();
-        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
-        let _ = store.allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:ff").await;
-    }
-
-    #[tokio::test]
     async fn test_delete_group_leaves_allocations() {
         let store = MemProfileStore::new();
         let group_id = Uuid::new_v4();
@@ -553,11 +742,12 @@ mod tests {
     #[tokio::test]
     async fn test_mem_profile_store_rebind_tombstones_old_row() {
         let store = MemProfileStore::new();
+        let audit = MemAuditStore::new();
         let group_id = Uuid::new_v4();
         let first = store.allocate_index(group_id, "old-identity").await.unwrap();
 
         let rebound = store
-            .rebind(group_id, "old-identity", "new-identity")
+            .rebind(&audit, "operator-login", group_id, "old-identity", "new-identity")
             .await
             .unwrap();
 
@@ -568,5 +758,296 @@ mod tests {
         assert_eq!(all.len(), 2, "old row is tombstoned, not removed");
         let old_row = all.iter().find(|a| a.identity == "old-identity").unwrap();
         assert_eq!(old_row.rebound_to.as_deref(), Some("new-identity"));
+    }
+
+    // ── DS-REG-03: allocate-once + rebind on the REAL SnapshotProfileStore ──
+    //
+    // These exercise the fail-CLOSED production impl (`read_snapshot_strict`),
+    // not the in-memory twin, because the whole point of this task is the
+    // strict-read behavior a temp-dir snapshot can prove.
+    // (`AuditStore`, `read_snapshot_strict`, `write_snapshot` come via `super::*`.)
+
+    use crate::audit::MemAuditStore;
+
+    /// Seed a group into a fresh temp-dir store (via `put_group`, which
+    /// bootstraps the snapshot on a missing file) so allocation has a pattern to
+    /// render against.
+    async fn snapshot_store_with_group(
+        dir: &std::path::Path,
+        group_id: Uuid,
+        name: &str,
+    ) -> SnapshotProfileStore {
+        let store = SnapshotProfileStore::new(StatePaths::under(dir));
+        store.put_group(sample_group(group_id, name)).await.unwrap();
+        store
+    }
+
+    /// Simulate a decommission: set `released_at` on the row for `identity`.
+    fn soft_release(paths: &StatePaths, group_id: Uuid, identity: &str) {
+        let mut doc = read_snapshot_strict(paths).unwrap();
+        let row = doc
+            .hostname_allocations
+            .iter_mut()
+            .find(|a| a.group_id == group_id && a.identity == identity && a.rebound_to.is_none())
+            .expect("identity must be bound to release it");
+        row.released_at = Some("2026-01-01T00:00:00Z".into());
+        write_snapshot(paths, &doc).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_allocate_index_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        let first = store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
+        let rows_after_first = read_snapshot_strict(&paths).unwrap().hostname_allocations.len();
+
+        let second = store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
+        let rows_after_second = read_snapshot_strict(&paths).unwrap().hostname_allocations.len();
+
+        assert_eq!(first.index, second.index, "same identity -> same index");
+        assert_eq!(
+            rows_after_first, rows_after_second,
+            "a second allocate for a bound identity must write NOTHING (no new row)"
+        );
+        assert_eq!(rows_after_second, 1, "still exactly one allocation row");
+    }
+
+    #[tokio::test]
+    async fn test_group_delete_does_not_cascade_allocations() {
+        // THE core requirement of the whole package: delete + recreate a group
+        // (same immutable id) re-attaches every machine to the index it had.
+        let dir = tempdir().unwrap();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        let ids = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"];
+        let mut original = Vec::new();
+        for id in ids {
+            original.push(store.allocate_index(group_id, id).await.unwrap().index);
+        }
+        assert_eq!(original, vec![1, 2, 3]);
+
+        store.delete_group("len-serv").await.unwrap();
+        // Recreate with the SAME immutable id (allocations key on group_id).
+        store.put_group(sample_group(group_id, "len-serv")).await.unwrap();
+
+        for (id, expected) in ids.iter().zip(original.iter()) {
+            let row = store.allocate_index(group_id, id).await.unwrap();
+            assert_eq!(
+                row.index, *expected,
+                "identity {id} must re-attach to its ORIGINAL index, never a new one"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_allocate_refuses_on_missing_snapshot() {
+        // Bare tempdir: NO put_group (that would bootstrap the file). The
+        // snapshot genuinely does not exist.
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+
+        let result = store.allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01").await;
+        assert!(
+            result.is_err(),
+            "a missing snapshot must refuse to allocate, never allocate-from-1"
+        );
+        assert!(
+            !paths.snapshot.exists(),
+            "the refusal must not create/clobber the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allocate_refuses_on_corrupt_snapshot() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        std::fs::write(&paths.snapshot, b"not json").unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+
+        let result = store.allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01").await;
+        assert!(
+            result.is_err(),
+            "a corrupt snapshot must refuse to allocate, never allocate-from-1"
+        );
+        assert_eq!(
+            std::fs::read(&paths.snapshot).unwrap(),
+            b"not json",
+            "the refusal must not overwrite the corrupt file with an empty registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allocate_never_reuses_released_index() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
+        store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
+        soft_release(&paths, group_id, "aa:bb:cc:dd:ee:02");
+
+        let fresh = store.allocate_index(group_id, "aa:bb:cc:dd:ee:03").await.unwrap();
+        assert_eq!(
+            fresh.index, 3,
+            "a NEW identity must get 3, never reuse the released index 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allocate_returning_identity_reactivates_same_index() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
+        let second = store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
+        soft_release(&paths, group_id, "aa:bb:cc:dd:ee:02");
+
+        let returned = store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
+        assert_eq!(returned.index, second.index, "returning machine keeps index 2");
+
+        let doc = read_snapshot_strict(&paths).unwrap();
+        let row = doc
+            .hostname_allocations
+            .iter()
+            .find(|a| a.identity == "aa:bb:cc:dd:ee:02" && a.rebound_to.is_none())
+            .unwrap();
+        assert!(row.released_at.is_none(), "released_at must be cleared on return");
+    }
+
+    #[tokio::test]
+    async fn test_allocate_lower_mac_added_later_gets_next_index() {
+        // The operator's original bug: a machine added LATER with a numerically
+        // LOWER MAC must never reshuffle an existing binding.
+        let dir = tempdir().unwrap();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        let first = store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        assert_eq!(first.index, 1, "first bound MAC gets index 1");
+
+        let lower = store.allocate_index(group_id, "6c:4b:90:bc:39:b3").await.unwrap();
+        assert_eq!(
+            lower.index, 2,
+            "the lower MAC added later gets the NEXT index, never index 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hostname_uniqueness_is_global() {
+        let dir = tempdir().unwrap();
+        // Two groups whose patterns render the SAME hostname from different
+        // prefixes: `len` + "{name}-serv-{index:03}" and `len-serv` + default.
+        let g1 = Uuid::new_v4();
+        let g2 = Uuid::new_v4();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+        let mut group1 = sample_group(g1, "len");
+        group1.hostname_pattern = "{name}-serv-{index:03}".into();
+        store.put_group(group1).await.unwrap();
+        store.put_group(sample_group(g2, "len-serv")).await.unwrap();
+
+        let a = store.allocate_index(g1, "aa:bb:cc:dd:ee:01").await.unwrap();
+        assert_eq!(a.hostname, "len-serv-001");
+
+        let collision = store.allocate_index(g2, "aa:bb:cc:dd:ee:02").await;
+        assert!(
+            collision.is_err(),
+            "a second group rendering the same hostname must be refused (global uniqueness)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebind_moves_index_and_tombstones_old() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let audit = MemAuditStore::new();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        let original = store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        let new_row = store
+            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .await
+            .unwrap();
+
+        assert_eq!(new_row.index, original.index, "index moves to the new identity");
+        assert_eq!(new_row.hostname, original.hostname, "hostname moves too");
+        assert_eq!(new_row.identity, "6c:4b:90:bc:39:b3");
+
+        let doc = read_snapshot_strict(&paths).unwrap();
+        let old_row = doc
+            .hostname_allocations
+            .iter()
+            .find(|a| a.identity == "6c:4b:90:bc:f7:f4")
+            .unwrap();
+        assert_eq!(
+            old_row.rebound_to.as_deref(),
+            Some("6c:4b:90:bc:39:b3"),
+            "old row must be tombstoned with rebound_to"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebind_unknown_old_identity_errors() {
+        let dir = tempdir().unwrap();
+        let audit = MemAuditStore::new();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        let result = store
+            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .await;
+        assert!(
+            result.is_err(),
+            "rebind of an unbound old identity must Err, never silently allocate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebind_to_bound_identity_errors() {
+        let dir = tempdir().unwrap();
+        let audit = MemAuditStore::new();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        store.allocate_index(group_id, "6c:4b:90:bc:39:b3").await.unwrap();
+
+        let result = store
+            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .await;
+        assert!(
+            result.is_err(),
+            "rebind onto an already-bound identity must Err, never merge two machines"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebind_is_audited() {
+        let dir = tempdir().unwrap();
+        let audit = MemAuditStore::new();
+        let group_id = Uuid::new_v4();
+        let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
+
+        store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        store
+            .rebind(&audit, "operator-jdfalk", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .await
+            .unwrap();
+
+        let events = audit.list_events(0).await.unwrap();
+        assert_eq!(events.len(), 1, "rebind must append exactly one audit event");
+        assert_eq!(
+            events[0].actor, "operator-jdfalk",
+            "the audit actor must be the caller-supplied login"
+        );
+        assert_eq!(events[0].action, "registry.rebind");
     }
 }
