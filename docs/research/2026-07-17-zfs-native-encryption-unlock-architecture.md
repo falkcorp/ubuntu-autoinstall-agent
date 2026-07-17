@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-unlock-architecture.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 4cd78aaf-cb57-494b-ac6d-f48193b7cb88 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -55,6 +55,51 @@ the way the brief assumed, and the reasons matter:
 The dangerous area is **not** at-rest encryption — it is `zfs change-key`
 combined with raw send/recv, where OpenZFS has **open** correctness bugs
 today.
+
+---
+
+## 🔴 CORRECTIONS — read before acting on this report
+
+This report was adversarially reviewed. **The review found four errors, one of
+them critical.** Full analysis:
+[`2026-07-17-zfs-native-encryption-design-review.md`](2026-07-17-zfs-native-encryption-design-review.md).
+Corrections are applied inline below; they are summarised here because acting
+on the uncorrected text would break the host.
+
+| # | What this report said | Correction |
+|---|---|---|
+| **1** 🔴 | §8 treats **TPM2+PIN as a viable break-glass rung** | **REFUTED — it is a boot-hang, not a fallback.** A `systemd-tpm2` PIN token on the keystore is tried *before* the password path, returns `-ENOANO`, and enters `for(;;)` on an ask-password with **`until = 0` (no deadline)**. Its credential is `cryptsetup.luks2-pin`; clevis only matches `Id=cryptsetup:*`, so **clevis never answers and Tang is never reached**. **Verified by hand this session** in `systemd/src/cryptsetup/cryptsetup.c` v259 (`:103`, `:1519-1568`, `:2618-2620`, `:2654-2665`). **With `unimatrixone.yaml`'s current `enroll_tpm2: true` + `tpm2_pin`, U1 would hang forever on exactly the unattended reboot it must survive.** ⇒ **Enroll no TPM2/FIDO2 token on the keystore.** |
+| **2** 🔴 | §5/§8 prescribe **`headless=`** as the fix for the fail-open | **Wrong twice.** (a) clevis unlocks *by answering* the very interactive prompt `headless=` suppresses — it would destroy Tang. (b) It is **unreachable anyway**: the Ubuntu patch calls `systemd-cryptsetup attach <name> <dev>` with no CONFIG argument (`argv[4]`), so no crypttab option applies. Verified against the patch body and `cryptsetup.c:2563`. |
+| **3** 🔴 | §5: "`token-timeout=` defaults to 30s, after which authentication via password is attempted — **the automatic degradation path**" | `arg_token_timeout_usec` is real but **unsettable here**, and it does **not** bound the token-plugin PIN loop (which uses `until`). **That automatic degradation path does not exist in this design.** |
+| **4** ⚠️ | §3(c): the **enrollment-surface** argument for native encryption | **False as stated** — real mdadm RAID1 (≠ IMSM fakeraid) under LUKS keeps **one** container. Conclusion survives, reasoning retired. See §3(c). |
+
+**✅ And one gap CLOSED — the open question is resolved, in the design's
+favour.** Gap #2 ("does `rpool/keystore` inherit encryption — is it
+circular?") was resolved **independently by two agents that agreed**:
+
+- **An unencrypted child under an encrypted parent is LEGAL.** OpenZFS commit
+  [`179374cc`](https://github.com/openzfs/zfs/commit/179374ccf27eef6932777cf29ae15e1cfbf85b91)
+  — *"Allow unencrypted children of encrypted datasets"* (fixing
+  [#8737](https://github.com/openzfs/zfs/issues/8737)) — *"some legitimate
+  reasons have been brought up for this behavior to be allowed. This patch
+  simply removes this limitation from all code paths that had checks for it."*
+  The removed guards are **absent** from Ubuntu's shipped 2.4.1 tree. PROVEN.
+- **Ubuntu's actual creation code proves the layout** — curtin `block/zfs.py`:
+  `zfs_create(self.poolname, "keystore", {"encryption": "off"}, ...)`, with
+  `encryption`/`keylocation`/`keyformat` emitted as **`-O`** flags on
+  `zpool create` ⇒ **the encryption root is the bare pool `rpool`**, and
+  `rpool/keystore` is an explicitly-unencrypted sibling of `rpool/ROOT`.
+- **There is no circularity, and `encryption=off` is not plaintext.** The two
+  layers are stacked, not nested: the zvol's blocks are **LUKS ciphertext**.
+  The chain is `Tang/passphrase → LUKS → system.key → ZFS-native rpool`.
+  `encryption=off` disables only the *ZFS-native* layer for that zvol.
+- ⚠️ **But this report misdiagnosed the dracut port's real bug.** It is not a
+  layout error — it is a **zvol race**: the dracut port dropped the wait loop
+  the initramfs-tools/zsys version has, and udev creates `/dev/zvol/*` links
+  **asynchronously** (upstream ships `zfs-volume-wait.service` for exactly
+  this). The `$ENCRYPTIONROOT`-vs-`find` asymmetry is a *separate*, real
+  robustness bug that bites only non-stock layouts (someone hit it on 25.10
+  with an `rpool/enc` root). **Stock layout + our own wait hook is the fix.**
 
 ---
 
@@ -711,30 +756,73 @@ That irony should be stated plainly rather than buried.
 **(b) Per-dataset encryption roots.** Different keys for different datasets.
 Not currently a requirement for U1.
 
-**(c) 🔑 The one that is actually decisive here — enrollment surface, and it
-falls out of the already-locked IMSM decision.** INFERRED, and I want this
-attacked rather than accepted:
+**(c) 🔑 The one that is actually decisive here — ZFS self-healing requires
+native mirroring.**
 
-We have already decided to drop IMSM in favour of native ZFS mirroring
-(`project_storage_arch_drop_imsm_native_zfs`). Today, U1 has **one** LUKS
-container because IMSM presents **one** `/dev/md126` device to LUKS. Remove
-IMSM, and that stops being true:
+> ⚠️ **CORRECTED 2026-07-17.** This subsection originally argued that dropping
+> IMSM forces ZFS-on-LUKS into **2** LUKS containers (2× enrollment surface)
+> while native+keystore needs only 1. **That argument was wrong**, and the
+> adversarial review
+> ([design review §R7](2026-07-17-zfs-native-encryption-design-review.md))
+> correctly demolished it. The original text is retained below the line for
+> honesty about the error. The *conclusion* (native + keystore) survives; the
+> *reasoning* does not.
 
-| Design (post-IMSM) | LUKS containers | Enrollment surface |
-|---|---|---|
-| ZFS-on-LUKS, mirrored | **2** — one per disk (`sda3`, `sdb3`), each LUKS-formatted, both must unlock before import | **2×** everything: 2 Tang bindings, 2 TPM2 enrollments, 2 FIDO2 slots, 2 rotations, 2 revocations |
-| **Native ZFS + keystore zvol** | **1** — the keystore, *inside* the mirrored pool | **1×** everything, and ZFS mirrors the keystore for free |
+**Why the original argument failed:** it had an unstated premise — that no md
+layer may sit beneath LUKS. But **real Linux mdadm RAID1 is not IMSM
+fakeraid.** An `mdadm` RAID1 across `sda3`+`sdb3` presents a single `/dev/md*`,
+taking exactly **one** LUKS container — 1× enrollment, real mirroring, no
+fakeraid. The locked decision bans *IMSM fakeraid*; it does not make 2
+containers a technical necessity. And the "2× everything" cost model conflated
+**scriptable** cost (2 Tang binds = one `for` loop, ≈0 marginal human effort)
+with **interactive** cost (only a FIDO2 touch and a typed PIN genuinely
+double).
 
-**Dropping IMSM makes ZFS-on-LUKS strictly worse and native+keystore strictly
-better, simultaneously.** The two decisions are coupled, and the coupling was
-not visible when the IMSM decision was made. This — not the metadata-leak
-debate, not raw send — is in my judgement the strongest functional argument
-for native encryption on this host.
+**The correct argument — data integrity, not enrollment surface** (INFERRED
+from ZFS's documented self-healing model): with md beneath LUKS, **ZFS sees one
+vdev**. It can still *detect* corruption via checksum, but it **cannot repair
+it** — there is no second copy to repair *from*, and md hands up a single block,
+silently picking a half on mismatch. **Native ZFS mirroring is what makes scrub
+self-healing.** That is the reason to choose it.
 
-*(Attack this: an alternative is one LUKS container on one disk holding a
-keyfile that unlocks the second — but that is a hand-rolled
-single-point-of-failure with no distro support, and strictly worse than a
-ZFS-mirrored keystore.)*
+⚠️ **And the keystore is not "strictly better" either.** The claim below that a
+ZFS-mirrored keystore makes the duplication objection "not apply" **claims too
+much**. The keystore is **one logical LUKS2 header**; ZFS mirrors its *blocks*
+faithfully — **including a logically-corrupt-but-checksum-valid write** (a torn
+`luksAddKey`, a bad metadata update, an operator `luksKillSlot` mistake). Both
+halves receive the same corruption, because ZFS is doing its job. ZFS protects
+against **device death and bit-rot**, not **valid-but-wrong writes**. Two
+independent LUKS containers carry two **independent headers**: a botched
+enrollment on disk A leaves B openable. The keystore trades an
+*independent-header* failure domain for a *device-death* one — a different
+surface, not a dominant one. Mitigation (header backup) collides with §6's
+revocation finding: an accepted, documented tension.
+
+**The two decisive arguments are therefore: (i) ZFS self-healing requires
+native mirroring, and (ii) Ubuntu ships and maintains the keystore path.** The
+enrollment-surface framing is retired.
+
+<details>
+<summary>Original (wrong) argument, retained for the record</summary>
+
+> We have already decided to drop IMSM in favour of native ZFS mirroring. Today,
+> U1 has **one** LUKS container because IMSM presents **one** `/dev/md126`
+> device to LUKS. Remove IMSM, and that stops being true:
+>
+> | Design (post-IMSM) | LUKS containers | Enrollment surface |
+> |---|---|---|
+> | ZFS-on-LUKS, mirrored | **2** — one per disk, both must unlock before import | **2×** everything |
+> | **Native ZFS + keystore zvol** | **1** — the keystore, *inside* the mirrored pool | **1×** everything |
+>
+> **Dropping IMSM makes ZFS-on-LUKS strictly worse and native+keystore strictly
+> better, simultaneously.** ... *(Attack this: an alternative is one LUKS
+> container on one disk holding a keyfile that unlocks the second — but that is
+> a hand-rolled single-point-of-failure...)*
+
+**The error:** that parenthetical dismissed a *strawman*. The real alternative
+was md-RAID1-under-LUKS, which was never considered.
+
+</details>
 
 ### What it costs
 
@@ -1635,10 +1723,13 @@ tolerates **one** Tang server down, unattended.
 With 2-of-3, losing **two** RPis makes the host unbootable unattended. The
 fallback ladder, in the order it would actually be used:
 
-1. **TPM2 + PIN over IPMI SOL.** A human types the PIN at the console. ⚠️ But
-   §5's UKI blocker means the PCR policy here is either brittle (literal PCRs
-   on a host with a CMOS-clear history — see §4's U1 warning) or experimental
-   (pcrlock). **Treat as best-effort, not guaranteed.**
+1. ~~**TPM2 + PIN over IPMI SOL.**~~ 🔴 **REFUTED — DO NOT ENROLL THIS.** See
+   the corrections banner. A `systemd-tpm2` PIN token on the keystore is **not
+   a fallback rung — it is a boot-hang** that pre-empts Tang entirely and hangs
+   with no deadline. Enrolling it to gain a break-glass path would *destroy*
+   the primary unattended path. (Independently, §5's UKI blocker already made
+   the PCR policy here either brittle or experimental — so this rung was weak
+   even before it was refuted.)
 2. **Recovery passphrase over IPMI SOL.** `--recovery-key` gives a
    high-entropy computer-generated key. **This is the real backstop and it
    must exist.** ⚠️ Practical caveat: the prompt must actually *reach* the
@@ -1675,18 +1766,17 @@ undetermined rather than filled with plausible guesses.
    records a module being purchased or installed. **`enroll_tpm2: true` in
    `unimatrixone.yaml` may be asserting something that cannot happen.** Needs
    the §4 commands, on hardware, when authorised. **Highest-value gap.**
-2. **🔴 The keystore dataset layout / a possible Ubuntu bug.** The dracut patch
-   computes `ks="/dev/zvol/$ENCRYPTIONROOT/keystore"`, which only resolves if
-   `ENCRYPTIONROOT` is the bare pool name (`rpool`) — i.e. the pool's root
-   dataset is the encryption root. But `rpool/keystore` is then a *child* of
-   an encrypted dataset, which raises a circularity question (does it inherit
-   encryption?). Notably, the **initramfs-tools zsys version uses a
-   layout-agnostic discovery method** (`find /dev/zvol/ -name 'keystore'` +
-   `pool="$(basename $(dirname ${ks}))"`) while **the dracut port hardcodes
-   `$ENCRYPTIONROOT`** — an asymmetry that hints at a real bug in the port.
-   **This was dispatched for focused research and is unresolved at the time of
-   writing.** It does not change the architecture choice, but it changes the
-   exact `zfs create` commands, and it must be settled before implementation.
+2. ~~**The keystore dataset layout / a possible Ubuntu bug.**~~
+   ✅ **RESOLVED 2026-07-17 — see the corrections banner above.** Unencrypted
+   children of encrypted parents are **legal** (OpenZFS `179374cc`); Ubuntu's
+   curtin creates `rpool/keystore` with `encryption=off` and sets encryption
+   via `-O` on `zpool create`, so **the encryption root is the bare pool
+   `rpool`** and the dracut patch is **correct for the stock layout**. No
+   circularity — the layers are stacked, not nested. The `$ENCRYPTIONROOT`
+   asymmetry *is* a real robustness bug, but it bites only **non-stock**
+   layouts (encryption root below the pool root); it does not affect us if we
+   use the stock layout, which we should. **The real bug in the dracut port is
+   a zvol race**, requiring a wait hook we ship ourselves.
 3. **BIOS minimum version for TPM 2.0 on X10DSC+.** No Supermicro statement
    found. The "Grantley/SUM TpmProvision" note is about *provisioning tooling*,
    not support.
