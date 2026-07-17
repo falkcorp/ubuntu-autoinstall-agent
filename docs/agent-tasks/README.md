@@ -1,11 +1,11 @@
 <!-- file: docs/agent-tasks/README.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: f97394a1-66ba-4684-9aee-b99879edb817 -->
-<!-- last-edited: 2026-07-10 -->
+<!-- last-edited: 2026-07-16 -->
 
 # Agent tasks — master index
 
-Two planning packages share this tree and the [ORCHESTRATION.md](ORCHESTRATION.md)
+Three planning packages share this tree and the [ORCHESTRATION.md](ORCHESTRATION.md)
 protocol:
 
 1. **install-ops (2026-07-09)** — ✅ COMPLETE: 6 workstreams, 20 briefs, 6 waves, all
@@ -16,6 +16,38 @@ protocol:
    not duplicated here); bucket sort + fan-out strategy in
    [`BREAKDOWN-2026-07-10.md`](BREAKDOWN-2026-07-10.md); sequencing in
    [`../constellation/00-ROADMAP.md`](../constellation/00-ROADMAP.md).
+3. **deploy-system (2026-07-16)** — profiles, applications, and check-in: 5
+   workstreams, 20 briefs, 6 waves. Design in
+   [`../specs/deploy-system-design.md`](../specs/deploy-system-design.md); master task
+   table, collision matrix, and wave table in
+   [`../specs/deploy-system-plan.md`](../specs/deploy-system-plan.md) (single source —
+   not duplicated here); bucket sort + fan-out in
+   [`BREAKDOWN-2026-07-16.md`](BREAKDOWN-2026-07-16.md); sequencing in
+   [`../deploy-system/00-ROADMAP.md`](../deploy-system/00-ROADMAP.md).
+
+## Deploy-system workstreams (2026-07-16)
+
+| Workstream | Spec | Tasks | Focus |
+|---|---|---|---|
+| [profiles](profiles/) | [design](../specs/deploy-system-design.md) · [plan](../specs/deploy-system-plan.md) | 3 | pure schema, group∪host merge + provenance, global-hostname-uniqueness validation |
+| [registry](registry/) | same | 5 | snapshot-backed `ProfileStore`, ⚠ allocate-once indices + `rebind` (REG-03), content hash, ⚠ drift accept/revert (REG-05) |
+| [applications](applications/) | same | 5 | `ApplicationSpec`, Phase-5 `ApplicationInstaller`, CockroachDB install, **P0** VM-gate `degraded` fix, gate readiness assertion |
+| [checkin](checkin/) | same | 3 | `app_status` client reporter, machine-plane ingest, read-time staleness |
+| [operator-api](operator-api/) | same | 4 | `/api/profiles` + `/api/drift` routes, ⚠ `config place --from-registry` (OPS-03), SPA screens |
+
+Deploy-system baseline at planning time: main @ `82e4082`, `cargo test --lib --offline`
+= **634 passed** (50 uaa-control + 191 uaa + 391 uaa-core + 2 uaa-proto). ⚠
+review-critical three: **DS-REG-03** (fail-closed allocation — a wrong read renames the
+fleet), **DS-REG-05** (last-good-version revert), **DS-OPS-03** (the only
+behavior-changing task; mass-overwrites the webroot) — all Opus-class, line-by-line
+review, never downgrade. **DS-APP-04 is P0, depends on nothing, and should be
+dispatched immediately**: `vm-validate.sh` accepts `systemctl is-system-running` ==
+`degraded` as PASS, and `degraded` means units FAILED.
+
+**No task in this package writes SQL or a migration** — `uaa-control` has no database
+connection in production, so profiles persist in the `StatePaths` snapshot (spec D4).
+
+---
 
 ## Constellation workstreams (2026-07-10)
 
