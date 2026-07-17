@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.4.2
+// version: 1.6.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
 // last-edited: 2026-07-17
 
@@ -41,7 +41,7 @@
 //! real logged-in principal (`Extension<auth::Session>`, inserted by
 //! `auth::require_role`'s middleware) instead of a placeholder string.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,6 +52,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::audit::{self, AuditStore, MemAuditStore};
 use crate::auth::{
@@ -61,13 +64,20 @@ use crate::ca::InstallCa;
 use crate::db::{
     store::{read_snapshot, write_snapshot, StatePaths},
     AuditEventRow as DbAuditEventRow, BootTarget, EnrollmentRow as DbEnrollmentRow,
-    MachineRow as DbMachineRow, MachineStatus,
+    HostGroupRow, HostProfileRow, HostnameAllocationRow, MachineRow as DbMachineRow,
+    MachineStatus,
 };
 use crate::enroll::{self, EnrollmentStore, MemEnrollmentStore};
 use crate::machine_plane::lifecycle::normalize_mac;
+use crate::profiles::store::{ProfileStore, SnapshotProfileStore};
 use ring::rand::SecureRandom;
+use uaa_core::network::ssh_installer::config::ApplicationSpec;
+use uaa_core::profile::validate::validate as validate_profiles;
+use uaa_core::profile::{HostGroupProfile, HostProfile, InstallationConfigPartial};
 
-use super::api_types::{ApiErrorBody, AuditVerifyResult, MachineRow};
+use super::api_types::{
+    AllocationView, ApiErrorBody, AuditVerifyResult, HostGroupView, HostProfileView, MachineRow,
+};
 
 /// Webroot base for placed cloud-init configs (mirrors `machine_plane::seeds`'
 /// `CLOUD_INIT_BASE`; duplicated per-file — see that module's REUSE note).
@@ -342,6 +352,35 @@ fn not_found(message: &str) -> Response {
     )
 }
 
+/// A write failed `profile::validate` (DS-PRF-03). The message already names
+/// EVERY violated rule, joined by `; ` — see that function's doc — never just
+/// the first, so a weak operator doesn't fix one error per round-trip. Also
+/// used for the profile routes' other 400s (immutable rename, undeletable
+/// standalone group, unbound `rebind` identity) — same status, same body
+/// shape, just a caller-supplied message instead of `validate`'s.
+fn validation_error(message: impl Into<String>) -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        ApiErrorBody {
+            message: message.into(),
+        },
+    )
+}
+
+/// The profile store could not be read (spec: fail CLOSED, never an empty
+/// list — see `AppState::profile_store`'s doc and `profiles::store`'s module
+/// doc). Deliberately distinct from [`internal_error`]'s 500: 503 tells a
+/// caller/retry-loop this is a transient availability problem with the
+/// store, not a bug in the request it sent.
+fn store_unavailable(what: &str) -> Response {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ApiErrorBody {
+            message: format!("{what}: profile store is unavailable"),
+        },
+    )
+}
+
 // ── Router / handler wiring ────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -359,6 +398,17 @@ struct AppState {
     /// (which also serves `/api/machines`, `/healthz`, etc. — those have no
     /// reason to go down over an enrollment-signing concern).
     ca_dir: Arc<PathBuf>,
+    /// DS-OPS-01. Deliberately NEVER the in-memory test double from
+    /// `profiles::store` in production — that type is
+    /// `#[cfg(test)]`-gated for exactly this reason (see that module's
+    /// doc): an empty profile store is a fleet-wide-rename bug waiting to
+    /// happen, so a store construction failure must never "degrade" to
+    /// one. `SnapshotProfileStore::new` itself cannot fail (it does no I/O
+    /// at construction — see its doc); what CAN fail is a later read/write
+    /// through it, which every profile handler below surfaces as a 503 to
+    /// the request that hit it, never a router-construction-time failure
+    /// (same isolate-failure-per-request principle as `ca_dir` above).
+    profile_store: Arc<dyn ProfileStore>,
 }
 
 fn default_state() -> AppState {
@@ -368,6 +418,7 @@ fn default_state() -> AppState {
         enrollment_store: Arc::new(MemEnrollmentStore::new()),
         audit_store: Arc::new(MemAuditStore::new()),
         ca_dir: Arc::new(PathBuf::from(CA_DIR)),
+        profile_store: Arc::new(SnapshotProfileStore::new(StatePaths::default())),
     }
 }
 
@@ -502,6 +553,16 @@ fn build_router(
             .route("/api/discovered", get(handle_list_discovered))
             .route("/api/audit", get(handle_list_audit))
             .route("/api/audit/verify", get(handle_verify_audit))
+            .route("/api/groups", get(handle_list_groups))
+            .route("/api/groups/:name", get(handle_get_group))
+            .route(
+                "/api/groups/:name/profiles",
+                get(handle_list_group_profiles),
+            )
+            .route(
+                "/api/groups/:name/allocations",
+                get(handle_list_group_allocations),
+            )
             .with_state(state.clone()),
         Role::Viewer,
     );
@@ -525,6 +586,19 @@ fn build_router(
                 "/api/discovered/:mac/dismiss",
                 post(handle_dismiss_discovered),
             )
+            .route(
+                "/api/groups",
+                post(handle_create_group),
+            )
+            .route(
+                "/api/groups/:name",
+                axum::routing::put(handle_update_group).delete(handle_delete_group),
+            )
+            .route(
+                "/api/groups/:name/profiles",
+                post(handle_create_group_profile),
+            )
+            .route("/api/groups/:name/rebind", post(handle_rebind))
             .with_state(state),
         Role::Operator,
     );
@@ -761,6 +835,478 @@ async fn handle_verify_audit(State(state): State<AppState>) -> Response {
     }
 }
 
+// ── /api/groups + /api/profiles (DS-OPS-01) ───────────────────────────────
+//
+// CRUD over `HostGroupRow`/`HostProfileRow` plus `rebind`, wired through
+// `ProfileStore` (DS-REG-02/03). Reads at `Role::Viewer`, mutations at
+// `Role::Operator` — see `build_router`. Every write runs `profile::validate`
+// (DS-PRF-03) over the FULL groups+profiles snapshot (not just the row being
+// written) because `validate`'s load-bearing rule,
+// `check_global_hostname_uniqueness`, spans every group — see that
+// function's doc.
+
+/// Request body for `POST /api/groups` and `PUT /api/groups/:name`.
+/// Deliberately typed as `InstallationConfigPartial`/`Vec<ApplicationSpec>`
+/// (not `serde_json::Value`) so a malformed `defaults`/`applications`
+/// payload is rejected at the JSON-body-parsing layer with a precise serde
+/// error before `profile::validate` ever runs. Lives next to the handler
+/// that parses it, not in `api_types.rs` — that module is response-view-only
+/// (see its doc); mirrors `auth::BootstrapLoginBody`'s convention.
+#[derive(Debug, Deserialize)]
+struct GroupWriteBody {
+    name: String,
+    hostname_pattern: String,
+    is_standalone: bool,
+    #[serde(default)]
+    defaults: InstallationConfigPartial,
+    #[serde(default)]
+    applications: Vec<ApplicationSpec>,
+}
+
+/// Request body for `POST /api/groups/:name/profiles`.
+#[derive(Debug, Deserialize)]
+struct ProfileWriteBody {
+    identity: String,
+    #[serde(default)]
+    hostname_override: Option<String>,
+    #[serde(default)]
+    overrides: InstallationConfigPartial,
+    #[serde(default)]
+    applications: Vec<ApplicationSpec>,
+}
+
+/// Request body for `POST /api/groups/:name/rebind` (spec D18 — the
+/// NIC-replacement runbook).
+#[derive(Debug, Deserialize)]
+struct RebindBody {
+    old_identity: String,
+    new_identity: String,
+}
+
+/// Current wall-clock time as an RFC3339 string, for `created_at`/`updated_at`
+/// stamps. Duplicated from `profiles::store`'s private `now_rfc3339` — see
+/// this crate's established per-file-duplication convention (e.g.
+/// `CLOUD_INIT_BASE`, `mac_to_hex` above) rather than exporting a one-line
+/// helper across a module boundary.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// A simple SHA-256 content hash over `value`'s canonical JSON encoding, for
+/// `HostGroupRow`/`HostProfileRow::content_hash` (change-detection metadata,
+/// not a security boundary — nothing authenticates against this hash).
+fn content_hash<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    Sha256::digest(&bytes).to_vec()
+}
+
+fn group_to_view(row: &HostGroupRow) -> HostGroupView {
+    HostGroupView {
+        id: row.id,
+        name: row.name.clone(),
+        hostname_pattern: row.hostname_pattern.clone(),
+        is_standalone: row.is_standalone,
+        defaults: row.defaults.clone(),
+        applications: row.applications.clone(),
+        version: row.version,
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
+    }
+}
+
+fn profile_to_view(row: &HostProfileRow) -> HostProfileView {
+    HostProfileView {
+        id: row.id,
+        group_id: row.group_id,
+        identity: row.identity.clone(),
+        hostname_override: row.hostname_override.clone(),
+        overrides: row.overrides.clone(),
+        applications: row.applications.clone(),
+        version: row.version,
+        created_at: row.created_at.clone(),
+        updated_at: row.updated_at.clone(),
+    }
+}
+
+fn allocation_to_view(row: &HostnameAllocationRow) -> AllocationView {
+    AllocationView {
+        identity: row.identity.clone(),
+        index: row.index,
+        hostname: row.hostname.clone(),
+        allocated_at: row.allocated_at.clone(),
+        released_at: row.released_at.clone(),
+        rebound_to: row.rebound_to.clone(),
+    }
+}
+
+/// Deserializes a stored group row's `defaults`/`applications` JSON back into
+/// the typed `uaa_core::profile::HostGroupProfile` `profile::validate`
+/// operates on. An `Err` here means the store holds a row this handler
+/// itself never could have written (every write path serializes FROM these
+/// same types) — surfaced by the caller as a 500, not a 400, since it is not
+/// the current request's fault.
+fn group_row_to_profile(row: &HostGroupRow) -> Result<HostGroupProfile, String> {
+    let defaults: InstallationConfigPartial = serde_json::from_value(row.defaults.clone())
+        .map_err(|e| format!("group {:?}: stored defaults failed to parse: {e}", row.name))?;
+    let applications: Vec<ApplicationSpec> = serde_json::from_value(row.applications.clone())
+        .map_err(|e| {
+            format!(
+                "group {:?}: stored applications failed to parse: {e}",
+                row.name
+            )
+        })?;
+    Ok(HostGroupProfile {
+        name: row.name.clone(),
+        hostname_pattern: row.hostname_pattern.clone(),
+        is_standalone: row.is_standalone,
+        defaults,
+        applications,
+    })
+}
+
+/// Same as [`group_row_to_profile`] but for a profile row; `group_name` is
+/// resolved by the caller (a `HostProfileRow` only carries `group_id`).
+fn profile_row_to_profile(row: &HostProfileRow, group_name: &str) -> Result<HostProfile, String> {
+    let overrides: InstallationConfigPartial = serde_json::from_value(row.overrides.clone())
+        .map_err(|e| {
+            format!(
+                "host {:?}: stored overrides failed to parse: {e}",
+                row.identity
+            )
+        })?;
+    let applications: Vec<ApplicationSpec> = serde_json::from_value(row.applications.clone())
+        .map_err(|e| {
+            format!(
+                "host {:?}: stored applications failed to parse: {e}",
+                row.identity
+            )
+        })?;
+    Ok(HostProfile {
+        group_name: group_name.to_string(),
+        identity: row.identity.clone(),
+        hostname_override: row.hostname_override.clone(),
+        overrides,
+        applications,
+    })
+}
+
+/// Every group + every profile currently in the store (needed because
+/// `profile::validate`'s global hostname-uniqueness check spans ALL groups,
+/// not just the one being written). Fails CLOSED via `?` — an unreadable
+/// store here becomes the caller's 503, never an empty snapshot that would
+/// let a colliding write through.
+async fn load_all_groups_and_profiles(
+    store: &dyn ProfileStore,
+) -> anyhow::Result<(Vec<HostGroupRow>, Vec<HostProfileRow>)> {
+    let groups = store.list_groups().await?;
+    let mut profiles = Vec::new();
+    for g in &groups {
+        profiles.extend(store.list_profiles(g.id).await?);
+    }
+    Ok((groups, profiles))
+}
+
+/// Runs `profile::validate` (DS-PRF-03) over a full groups+profiles
+/// snapshot, converting rows to the typed tier first. Shared by every
+/// mutating profile handler so create/update-group and create-profile all
+/// validate against the SAME full-snapshot rule, not a narrower one.
+fn validate_snapshot(groups: &[HostGroupRow], profiles: &[HostProfileRow]) -> Result<(), String> {
+    let group_profiles: Vec<HostGroupProfile> = groups
+        .iter()
+        .map(group_row_to_profile)
+        .collect::<Result<_, _>>()?;
+
+    let names: HashMap<Uuid, &str> = groups.iter().map(|g| (g.id, g.name.as_str())).collect();
+    let host_profiles: Vec<HostProfile> = profiles
+        .iter()
+        .map(|p| {
+            let group_name = names.get(&p.group_id).copied().unwrap_or_default();
+            profile_row_to_profile(p, group_name)
+        })
+        .collect::<Result<_, _>>()?;
+
+    validate_profiles(&group_profiles, &host_profiles).map_err(|e| e.to_string())
+}
+
+async fn handle_list_groups(State(state): State<AppState>) -> Response {
+    match state.profile_store.list_groups().await {
+        Ok(mut rows) => {
+            rows.sort_by(|a, b| a.name.cmp(&b.name));
+            let views: Vec<_> = rows.iter().map(group_to_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, "profile store unreadable listing groups");
+            store_unavailable("listing groups")
+        }
+    }
+}
+
+async fn handle_get_group(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
+    match state.profile_store.get_group(&name).await {
+        Ok(Some(row)) => json_response(StatusCode::OK, group_to_view(&row)),
+        Ok(None) => not_found("group not found"),
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable looking up group");
+            store_unavailable("looking up group")
+        }
+    }
+}
+
+async fn handle_list_group_profiles(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let group = match state.profile_store.get_group(&name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found("group not found"),
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable looking up group");
+            return store_unavailable("looking up group");
+        }
+    };
+    match state.profile_store.list_profiles(group.id).await {
+        Ok(rows) => {
+            let views: Vec<_> = rows.iter().map(profile_to_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable listing profiles");
+            store_unavailable("listing profiles")
+        }
+    }
+}
+
+async fn handle_list_group_allocations(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let group = match state.profile_store.get_group(&name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found("group not found"),
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable looking up group");
+            return store_unavailable("looking up group");
+        }
+    };
+    match state.profile_store.list_allocations(group.id).await {
+        Ok(rows) => {
+            let views: Vec<_> = rows.iter().map(allocation_to_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable listing allocations");
+            store_unavailable("listing allocations")
+        }
+    }
+}
+
+async fn handle_create_group(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    Json(body): Json<GroupWriteBody>,
+) -> Response {
+    let (mut groups, profiles) =
+        match load_all_groups_and_profiles(state.profile_store.as_ref()).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(%err, "profile store unreadable creating group");
+                return store_unavailable("creating group");
+            }
+        };
+
+    let now = now_rfc3339();
+    let row = HostGroupRow {
+        id: Uuid::new_v4(),
+        name: body.name.clone(),
+        hostname_pattern: body.hostname_pattern.clone(),
+        is_standalone: body.is_standalone,
+        defaults: serde_json::to_value(&body.defaults).unwrap_or(serde_json::Value::Null),
+        applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
+        content_hash: content_hash(&(&body.defaults, &body.applications)),
+        version: 1,
+        created_at: Some(now.clone()),
+        updated_at: Some(now),
+    };
+
+    // Validate against the FULL snapshot including the new group — this is
+    // where a duplicate/colliding hostname across groups gets caught.
+    groups.push(row.clone());
+    if let Err(message) = validate_snapshot(&groups, &profiles) {
+        return validation_error(message);
+    }
+
+    if let Err(err) = state.profile_store.put_group(row.clone(), &session.login).await {
+        tracing::error!(%err, "failed to persist new group");
+        return store_unavailable("creating group");
+    }
+    json_response(StatusCode::CREATED, group_to_view(&row))
+}
+
+async fn handle_update_group(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<GroupWriteBody>,
+) -> Response {
+    // Names are immutable (spec D2) — a PUT naming a different group than the
+    // path is a rename attempt, rejected before touching the store.
+    if body.name != name {
+        return validation_error(format!(
+            "group name is immutable: path names {name:?}, body names {:?}; \
+             create a new group and rebind hosts instead (spec D2)",
+            body.name
+        ));
+    }
+
+    let (mut groups, profiles) =
+        match load_all_groups_and_profiles(state.profile_store.as_ref()).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(%err, %name, "profile store unreadable updating group");
+                return store_unavailable("updating group");
+            }
+        };
+
+    let Some(existing) = groups.iter().find(|g| g.name == name).cloned() else {
+        return not_found("group not found");
+    };
+
+    let updated = HostGroupRow {
+        id: existing.id,
+        name: existing.name.clone(),
+        hostname_pattern: body.hostname_pattern.clone(),
+        is_standalone: body.is_standalone,
+        defaults: serde_json::to_value(&body.defaults).unwrap_or(serde_json::Value::Null),
+        applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
+        content_hash: content_hash(&(&body.defaults, &body.applications)),
+        version: existing.version + 1,
+        created_at: existing.created_at.clone(),
+        updated_at: Some(now_rfc3339()),
+    };
+
+    if let Some(slot) = groups.iter_mut().find(|g| g.id == existing.id) {
+        *slot = updated.clone();
+    }
+    if let Err(message) = validate_snapshot(&groups, &profiles) {
+        return validation_error(message);
+    }
+
+    if let Err(err) = state.profile_store.put_group(updated.clone(), &session.login).await {
+        tracing::error!(%err, %name, "failed to persist group update");
+        return store_unavailable("updating group");
+    }
+    json_response(StatusCode::OK, group_to_view(&updated))
+}
+
+async fn handle_delete_group(
+    State(state): State<AppState>,
+    Extension(_session): Extension<auth::Session>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let group = match state.profile_store.get_group(&name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found("group not found"),
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable deleting group");
+            return store_unavailable("deleting group");
+        }
+    };
+    if group.is_standalone {
+        return validation_error(
+            "the standalone group cannot be deleted (spec D3)".to_string(),
+        );
+    }
+    if let Err(err) = state.profile_store.delete_group(&name).await {
+        tracing::error!(%err, %name, "failed to delete group");
+        return store_unavailable("deleting group");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn handle_create_group_profile(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ProfileWriteBody>,
+) -> Response {
+    let (groups, mut profiles) =
+        match load_all_groups_and_profiles(state.profile_store.as_ref()).await {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::error!(%err, %name, "profile store unreadable creating profile");
+                return store_unavailable("creating profile");
+            }
+        };
+
+    let Some(group) = groups.iter().find(|g| g.name == name) else {
+        return not_found("group not found");
+    };
+
+    let now = now_rfc3339();
+    let row = HostProfileRow {
+        id: Uuid::new_v4(),
+        group_id: group.id,
+        identity: normalize_mac(&body.identity),
+        hostname_override: body.hostname_override.clone(),
+        overrides: serde_json::to_value(&body.overrides).unwrap_or(serde_json::Value::Null),
+        applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
+        content_hash: content_hash(&(&body.overrides, &body.applications)),
+        version: 1,
+        created_at: Some(now.clone()),
+        updated_at: Some(now),
+    };
+
+    profiles.push(row.clone());
+    if let Err(message) = validate_snapshot(&groups, &profiles) {
+        return validation_error(message);
+    }
+
+    if let Err(err) = state.profile_store.put_profile(row.clone(), &session.login).await {
+        tracing::error!(%err, %name, "failed to persist new profile");
+        return store_unavailable("creating profile");
+    }
+    json_response(StatusCode::CREATED, profile_to_view(&row))
+}
+
+async fn handle_rebind(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RebindBody>,
+) -> Response {
+    let group = match state.profile_store.get_group(&name).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return not_found("group not found"),
+        Err(err) => {
+            tracing::error!(%err, %name, "profile store unreadable looking up group for rebind");
+            return store_unavailable("looking up group");
+        }
+    };
+
+    match state
+        .profile_store
+        .rebind(
+            state.audit_store.as_ref(),
+            &session.login,
+            group.id,
+            &body.old_identity,
+            &body.new_identity,
+        )
+        .await
+    {
+        Ok(row) => json_response(StatusCode::OK, allocation_to_view(&row)),
+        Err(err) => {
+            // Every `rebind` failure mode (unbound `old_identity`,
+            // already-bound `new_identity`) is a client input problem —
+            // never silently allocate instead (spec D18 / this task's edge
+            // semantics). The error message already names the offending
+            // identity.
+            validation_error(err.to_string())
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -835,6 +1381,7 @@ mod tests {
             enrollment_store: Arc::new(MemEnrollmentStore::new()),
             audit_store: Arc::new(MemAuditStore::new()),
             ca_dir: Arc::new(ca_dir),
+            profile_store: Arc::new(crate::profiles::store::MemProfileStore::new()),
         }
     }
 
@@ -854,6 +1401,28 @@ mod tests {
             enrollment_store,
             audit_store,
             ca_dir: Arc::new(ca_dir),
+            profile_store: Arc::new(crate::profiles::store::MemProfileStore::new()),
+        }
+    }
+
+    /// Same as [`test_state`] but with a caller-supplied `profile_store` —
+    /// needed by the profile-route tests below (a shared `MemProfileStore`
+    /// pre-seeded with a group, or the deliberately-failing store used by
+    /// `test_store_unreadable_returns_503_not_empty`).
+    fn test_state_with_profile_store(
+        webroot: PathBuf,
+        registry: Arc<dyn Registry>,
+        audit_store: Arc<dyn AuditStore>,
+        profile_store: Arc<dyn ProfileStore>,
+    ) -> AppState {
+        let ca_dir = webroot.join("ca");
+        AppState {
+            webroot: Arc::new(webroot),
+            registry,
+            enrollment_store: Arc::new(MemEnrollmentStore::new()),
+            audit_store,
+            ca_dir: Arc::new(ca_dir),
+            profile_store,
         }
     }
 
@@ -1450,5 +2019,368 @@ mod tests {
         let status = router.oneshot(get("/api/auth/status")).await.unwrap();
         let body = body_json(status).await;
         assert_eq!(body["bootstrap_token_enabled"], false);
+    }
+
+    // ── /api/groups + /api/profiles (DS-OPS-01) ───────────────────────────
+
+    use crate::db::ProfileVersionRow;
+
+    /// A `ProfileStore` that fails every call — the double
+    /// `test_store_unreadable_returns_503_not_open` needs to prove the
+    /// routes fail CLOSED (503), never an empty list, when the store cannot
+    /// be read.
+    struct FailingProfileStore;
+
+    #[async_trait::async_trait]
+    impl ProfileStore for FailingProfileStore {
+        async fn list_groups(&self) -> anyhow::Result<Vec<HostGroupRow>> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn get_group(&self, _name: &str) -> anyhow::Result<Option<HostGroupRow>> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn put_group(&self, _row: HostGroupRow, _actor: &str) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn delete_group(&self, _name: &str) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn list_profiles(&self, _group_id: Uuid) -> anyhow::Result<Vec<HostProfileRow>> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn put_profile(&self, _row: HostProfileRow, _actor: &str) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn list_allocations(
+            &self,
+            _group_id: Uuid,
+        ) -> anyhow::Result<Vec<HostnameAllocationRow>> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn allocate_index(
+            &self,
+            _group_id: Uuid,
+            _identity: &str,
+        ) -> anyhow::Result<HostnameAllocationRow> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn rebind(
+            &self,
+            _audit: &dyn AuditStore,
+            _actor: &str,
+            _group_id: Uuid,
+            _old_identity: &str,
+            _new_identity: &str,
+        ) -> anyhow::Result<HostnameAllocationRow> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn list_versions(&self, _object_id: Uuid) -> anyhow::Result<Vec<ProfileVersionRow>> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+        async fn put_version(&self, _row: ProfileVersionRow) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated store failure"))
+        }
+    }
+
+    fn sample_group_row(id: Uuid, name: &str, is_standalone: bool) -> HostGroupRow {
+        HostGroupRow {
+            id,
+            name: name.to_string(),
+            hostname_pattern: "{name}-{index:03}".to_string(),
+            is_standalone,
+            defaults: serde_json::json!({}),
+            applications: serde_json::json!([]),
+            content_hash: vec![],
+            version: 1,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// THE worst defect this task could ship: every mutating profile route
+    /// must be `Role::Operator`-gated. Drives the real router (real
+    /// `auth::require_role` middleware), unauthenticated, and asserts 401 —
+    /// never 200/201/204, which would mean the route was added outside
+    /// `build_router`'s role-grouping convention (see that fn's doc).
+    #[tokio::test]
+    async fn test_profile_mutations_require_operator() {
+        let (router, _token, _dir) = test_full_router();
+
+        for (method, uri) in [
+            ("POST", "/api/groups"),
+            ("PUT", "/api/groups/some-group"),
+            ("DELETE", "/api/groups/some-group"),
+            ("POST", "/api/groups/some-group/profiles"),
+            ("POST", "/api/groups/some-group/rebind"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require auth, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_profile_reads_require_viewer() {
+        let (router, _token, _dir) = test_full_router();
+
+        for uri in [
+            "/api/groups",
+            "/api/groups/some-group",
+            "/api/groups/some-group/profiles",
+            "/api/groups/some-group/allocations",
+        ] {
+            let resp = router.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} must require auth, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_group_validates() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(crate::profiles::store::MemProfileStore::new()),
+        );
+
+        // Two violations at once: no `{index}` placeholder AND no
+        // is_standalone=true group anywhere — the body must name BOTH, not
+        // just the first (DS-PRF-03 collects every violation).
+        let body = Json(GroupWriteBody {
+            name: "bad-group".to_string(),
+            hostname_pattern: "static-name".to_string(),
+            is_standalone: false,
+            defaults: InstallationConfigPartial::default(),
+            applications: Vec::new(),
+        });
+
+        let resp = handle_create_group(State(state), test_session(), body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_json(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("static-name"),
+            "must name the hostname_pattern violation, got: {msg}"
+        );
+        assert!(
+            msg.contains("is_standalone"),
+            "must name the missing-standalone violation, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_valid_group_create_succeeds() {
+        // Anti-over-suppression: proves an authorized operator submitting a
+        // VALID group still succeeds — without this, an over-strict
+        // validator or a mis-wired role gate would make the API reject
+        // everything while every negative test above still passes.
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(crate::profiles::store::MemProfileStore::new()),
+        );
+
+        let body = Json(GroupWriteBody {
+            name: "standalone".to_string(),
+            hostname_pattern: "{name}-{index:03}".to_string(),
+            is_standalone: true,
+            defaults: InstallationConfigPartial::default(),
+            applications: Vec::new(),
+        });
+
+        let resp = handle_create_group(State(state), test_session(), body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        assert_eq!(created["name"], "standalone");
+        assert_eq!(created["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_standalone_rejected() {
+        let dir = tempdir().unwrap();
+        let profile_store: Arc<dyn ProfileStore> =
+            Arc::new(crate::profiles::store::MemProfileStore::new());
+        profile_store
+            .put_group(sample_group_row(Uuid::new_v4(), "standalone", true), "test-operator")
+            .await
+            .unwrap();
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            profile_store,
+        );
+
+        let resp = handle_delete_group(
+            State(state),
+            test_session(),
+            AxumPath("standalone".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_rename_rejected() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(crate::profiles::store::MemProfileStore::new()),
+        );
+
+        let body = Json(GroupWriteBody {
+            name: "different-name".to_string(),
+            hostname_pattern: "{name}-{index:03}".to_string(),
+            is_standalone: true,
+            defaults: InstallationConfigPartial::default(),
+            applications: Vec::new(),
+        });
+
+        let resp = handle_update_group(
+            State(state),
+            test_session(),
+            AxumPath("original-name".to_string()),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_unknown_group_404() {
+        let dir = tempdir().unwrap();
+        let state = test_state(dir.path().to_path_buf(), Arc::new(MockRegistry::default()));
+        let resp = handle_get_group(State(state), AxumPath("no-such-group".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_rebind_audited() {
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let group_id = Uuid::new_v4();
+        store
+            .put_group(sample_group_row(group_id, "len-serv", false), "test-operator")
+            .await
+            .unwrap();
+        store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
+
+        let profile_store: Arc<dyn ProfileStore> = Arc::new(store);
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            audit_store.clone(),
+            profile_store,
+        );
+
+        let body = Json(RebindBody {
+            old_identity: "aa:bb:cc:dd:ee:01".to_string(),
+            new_identity: "aa:bb:cc:dd:ee:02".to_string(),
+        });
+
+        let resp = handle_rebind(
+            State(state),
+            test_session(),
+            AxumPath("len-serv".to_string()),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = audit_store.list_events(0).await.unwrap();
+        assert_eq!(events.len(), 1, "rebind must append exactly one audit event");
+        assert_eq!(
+            events[0].actor, "test-operator",
+            "the audit actor must be the session's login, never a placeholder"
+        );
+        assert_eq!(events[0].action, "registry.rebind");
+    }
+
+    #[tokio::test]
+    async fn test_rebind_unbound_old_identity_400() {
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let group_id = Uuid::new_v4();
+        store
+            .put_group(sample_group_row(group_id, "len-serv", false), "test-operator")
+            .await
+            .unwrap();
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(store),
+        );
+
+        let body = Json(RebindBody {
+            old_identity: "aa:bb:cc:dd:ee:99".to_string(),
+            new_identity: "aa:bb:cc:dd:ee:98".to_string(),
+        });
+
+        let resp = handle_rebind(
+            State(state),
+            test_session(),
+            AxumPath("len-serv".to_string()),
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_json(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("aa:bb:cc:dd:ee:99"),
+            "must name the unbound identity, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_unreadable_returns_503_not_empty() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(FailingProfileStore),
+        );
+
+        let resp = handle_list_groups(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(resp).await;
+        assert!(
+            body.is_object() && !body.is_array(),
+            "an unreadable store must be an error object, NEVER an empty \
+             list (which would read as 'no groups' and re-allocate the \
+             fleet from 1), got: {body}"
+        );
+        assert!(body["message"].is_string());
     }
 }
