@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/lib.rs
-// version: 1.3.1
+// version: 1.4.0
 // guid: d82472d1-7f0f-4eb4-b0a3-6e1547103eb4
-// last-edited: 2026-07-16
+// last-edited: 2026-07-17
 
 //! # Ubuntu AutoInstall Agent
 //!
@@ -24,6 +24,7 @@ pub mod luks_sync;
 pub mod network;
 pub mod pki;
 pub mod power;
+pub mod profile;
 pub mod security;
 pub mod tls;
 pub mod update;
