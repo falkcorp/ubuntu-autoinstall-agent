@@ -1,5 +1,5 @@
 <!-- file: docs/agent-tasks/checkin/README.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: e3dcaaf4-350c-46a8-96b7-9d6e5d86881a -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -34,7 +34,9 @@ Design: [`deploy-system-design.md`](../../specs/deploy-system-design.md) · Plan
 
 ## Collision / wave note
 
-No same-file collisions **within** this workstream — the three tasks own `app_status.rs`, `lifecycle.rs`, and `staleness.rs` respectively. They serialize only on their data dependency (TASK-02 needs TASK-01's payload; TASK-03 needs TASK-02's fields). **TASK-02 edits `db/mod.rs`**, which the registry workstream's TASK-01/04 also touch — check the package collision table before scheduling.
+No same-file collisions **within** this workstream — the three tasks own `app_status.rs`, `lifecycle.rs`, and `staleness.rs` respectively. They serialize only on their data dependency (TASK-02 needs TASK-01's payload; TASK-03 needs TASK-02's fields).
+
+**Cross-workstream:** TASK-02 also edits `crates/uaa-control/src/db/mod.rs` (adding `app_reports`, `last_app_status_at`, `AppStatusReportRow`), which the **registry** workstream's TASK-01 owns in wave 1. TASK-02 is wave 4, so it rebases after DS-REG-01 merges — see the collision table in [`../BREAKDOWN-2026-07-16.md`](../BREAKDOWN-2026-07-16.md). (Registry's TASK-04 does *not* edit `db/mod.rs`; it only imports `ProfileVersionRow` from it.)
 
 > **⚠ Do NOT extend `MachineStatus`.** It is the registration lifecycle (`Seen|Pending|Approved|Revoked|Unknown`), and its `Unknown(String)` variant exists to round-trip dirty Python parity data. Application health is a **separate, additive** field.
 
