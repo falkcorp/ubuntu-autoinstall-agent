@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.11.2
+// version: 2.12.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-17
 
@@ -8,6 +8,7 @@
 //! Uses a `Box<dyn CommandExecutor>` runner so the same phase logic works
 //! whether execution happens locally (`LocalClient`) or over SSH (`SshClient`).
 
+use super::applications::ApplicationInstaller;
 use super::config::{InstallationConfig, SystemInfo};
 use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
@@ -917,6 +918,13 @@ impl SshInstaller {
         sc.configure_grub_in_chroot(config).await?;
         sc.setup_luks_key_in_chroot(config).await?;
         sc.install_ca_cert_in_chroot(config).await?;
+        // Applications may rely on the install CA trust anchor written above
+        // (e.g. fetching a node cert over HTTP from the control server), so
+        // this step must run after it. FAIL-CLOSED: an application failing
+        // to install is a failed deployment and propagates with `?`, unlike
+        // the non-fatal ResetPartitionStager wrapper above.
+        let mut ai = ApplicationInstaller::new(&mut *self.runner);
+        ai.install(config).await?;
         info!("Phase 5 completed");
         Ok(())
     }
