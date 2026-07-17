@@ -1,5 +1,5 @@
 <!-- file: docs/specs/deploy-system-plan.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 84a72ca4-e93e-449b-affd-93f0bb3684fd -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -84,9 +84,9 @@ Split: 3 Haiku : 14 Sonnet : 3 Opus across 20 Bucket-1 tasks — within the expe
 |---|---|---|
 | `crates/uaa-core/src/network/ssh_installer/installer.rs` | DS-APP-02, DS-APP-03 | serialize: wave2=DS-APP-02, wave3=DS-APP-03 |
 | `crates/uaa-core/src/network/ssh_installer/applications.rs` | DS-APP-02, DS-APP-03 | serialize: wave2=DS-APP-02, wave3=DS-APP-03 |
-| `crates/uaa-control/src/db/mod.rs` | DS-REG-01, DS-REG-04 | serialize: wave1=DS-REG-01, wave4=DS-REG-04 |
+| `crates/uaa-control/src/db/mod.rs` | DS-REG-01, **DS-CHK-02** | serialize: wave1=DS-REG-01, wave4=DS-CHK-02 |
 | `crates/uaa-control/src/db/store.rs` | DS-REG-01, DS-REG-02 | serialize: wave1=DS-REG-01, wave2=DS-REG-02 |
-| `crates/uaa-control/src/profiles/store.rs` | DS-REG-02, DS-REG-03 | serialize: wave2=DS-REG-02, wave3=DS-REG-03 |
+| `crates/uaa-control/src/profiles/store.rs` | DS-REG-02, DS-REG-03, **DS-REG-04** | serialize: wave2=DS-REG-02, wave3=DS-REG-03, wave4=DS-REG-04 |
 | `crates/uaa-control/src/profiles/drift.rs` | DS-REG-04, DS-REG-05 | serialize: wave4=DS-REG-04, wave5=DS-REG-05 |
 | `crates/uaa-core/src/profile/mod.rs` | DS-PRF-01, DS-PRF-02, DS-PRF-03 | scaffold-first: wave2=DS-PRF-01 creates mod.rs + stubs; wave3=DS-PRF-02/03 fill **disjoint** stub files (`merge.rs`, `validate.rs`) and do NOT re-edit mod.rs |
 | `crates/uaa-control/src/operator/handlers.rs` | DS-OPS-01, DS-OPS-02 | serialize: wave4=DS-OPS-01, wave5=DS-OPS-02 |
@@ -94,6 +94,8 @@ Split: 3 Haiku : 14 Sonnet : 3 Opus across 20 Bucket-1 tasks — within the expe
 | `scripts/vm-validate.sh` | DS-APP-04, DS-APP-05 | serialize: wave2=DS-APP-04, wave5=DS-APP-05 |
 | `examples/configs/install/vm-test.yaml` | DS-APP-05 | single writer — no collision |
 | `crates/uaa-control/src/machine_plane/lifecycle.rs` | DS-CHK-02 | single writer — no collision |
+
+> **Recomputation note (2026-07-16):** the matrix above was recomputed from the briefs' actual edit targets after drafting, and two rows were corrected. `db/mod.rs` previously listed DS-REG-04, which only *imports* `ProfileVersionRow` and does not edit the file, while **DS-CHK-02 — which genuinely adds `app_reports`/`last_app_status_at`/`AppStatusReportRow` — was missing**. `profiles/store.rs` was missing **DS-REG-04**, which wires `capture_version` into `put_group`/`put_profile`. Both corrected rows remain wave-safe (1/4 and 2/3/4 respectively), but a shared file absent from this table is exactly the defect the mechanical audit fails on.
 
 **Scaffold-first pattern** (the repo's established CP-01 convention): `DS-PRF-01` and `DS-REG-01` each create their module's `mod.rs` **with every `pub mod` declaration and empty stub files**. Sibling tasks then fill one disjoint stub each and never re-edit `mod.rs`. Without this, every profile task would collide on `mod.rs`.
 
