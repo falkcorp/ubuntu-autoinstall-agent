@@ -1,13 +1,14 @@
 // file: crates/uaa-core/src/network/ssh_installer/mod.rs
-// version: 1.3.1
+// version: 1.4.0
 // guid: sshmod01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-17
 
 //! SSH-based Ubuntu installation with ZFS and LUKS
 //!
 //! This module provides a comprehensive SSH-based installation system
 //! for Ubuntu with ZFS and LUKS encryption.
 
+pub mod applications;
 pub mod config;
 pub mod disk_ops;
 pub mod installer;
