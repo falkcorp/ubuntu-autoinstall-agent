@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/db/mod.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: e43975b3-71de-4377-8ea5-ccd77fe75bc6
 // last-edited: 2026-07-17
 
@@ -205,6 +205,31 @@ pub struct MachineRow {
     pub installed_at: Option<String>,
     pub last_install_status: Option<String>,
     pub updated_at: Option<String>,
+    /// Application health as last reported by the host. Separate from
+    /// MachineStatus, which is the REGISTRATION lifecycle — conflating them
+    /// would break the Python parity its Unknown(String) variant preserves.
+    #[serde(default)]
+    pub app_reports: Vec<AppStatusReportRow>,
+    /// When app_reports was last written. DS-CHK-03 computes staleness from
+    /// this at READ time; nothing writes a status on absence.
+    #[serde(default)]
+    pub last_app_status_at: Option<String>,
+}
+
+/// One application's status report, as recorded on [`MachineRow::app_reports`].
+/// Mirrors `uaa-core`'s `app_status::AppStatusReport` (the wire payload shape);
+/// declared separately here per this module's row-ownership convention —
+/// followers add methods, not competing row types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStatusReportRow {
+    /// Application kind/tag from ApplicationSpec (e.g. "cockroach").
+    pub kind: String,
+    /// Systemd unit name (e.g. "cockroach.service").
+    pub unit: String,
+    /// Whether the unit was active as of this report.
+    pub active: bool,
+    /// Raw `systemctl is-active` output, trimmed.
+    pub detail: String,
 }
 
 /// `install_history` table row. `event_id` is the WAL-replay dedup key.

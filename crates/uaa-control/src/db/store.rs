@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/db/store.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: a471e102-2da9-4bf8-8531-1de7595fd24d
 // last-edited: 2026-07-17
 
@@ -489,6 +489,8 @@ mod tests {
                 installed_at: None,
                 last_install_status: None,
                 updated_at: None,
+                app_reports: Vec::new(),
+                last_app_status_at: None,
             }],
             ..Default::default()
         };

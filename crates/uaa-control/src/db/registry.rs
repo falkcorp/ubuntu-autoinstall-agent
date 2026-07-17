@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/registry.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: 02d40065-96da-4469-b679-b8bfd4f0b8b3
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Registry CRUD against CockroachDB (the `RegistryStore` trait + tokio-postgres impl).
 //!
@@ -178,6 +178,10 @@ fn row_to_machine(row: &tokio_postgres::Row) -> MachineRow {
         installed_at: row.get("installed_at"),
         last_install_status: row.get("last_install_status"),
         updated_at: row.get("updated_at"),
+        // Not a SQL column (no migration): app-status ingest is machine-plane-only
+        // snapshot state (spec Decision 4), never persisted to CockroachDB.
+        app_reports: Vec::new(),
+        last_app_status_at: None,
     }
 }
 
@@ -599,6 +603,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 

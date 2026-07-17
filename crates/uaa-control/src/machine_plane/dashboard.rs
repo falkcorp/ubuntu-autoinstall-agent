@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/dashboard.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: e4da51dc-1d66-4fd2-8de7-e09458eb455e
-// last-edited: 2026-07-13
+// last-edited: 2026-07-17
 
 //! Machine-plane status dashboard (`:25000` parity, spec Decision 12).
 //!
@@ -414,6 +414,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 

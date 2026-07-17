@@ -1,13 +1,15 @@
 // file: crates/uaa-control/src/machine_plane/lifecycle.rs
-// version: 1.1.3
+// version: 1.2.0
 // guid: f1273168-f053-480d-8baf-aa653555cb85
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Machine-plane checkin + install-event ingest (WAL append when degraded).
 //!
 //! Exact parity with `scripts/autoinstall-agent.py` (spec Decision 12) for the
 //! lifecycle POST endpoints: `/api/register`, `/api/checkin`, `/api/webhook`,
-//! `/api/finalreport`, `/api/hardware-info`, `/api/cloud-init`.
+//! `/api/finalreport`, `/api/hardware-info`, `/api/cloud-init`. `/api/app-status`
+//! (DS-CHK-02) is a constellation addition with no Python precedent, mirroring
+//! `/api/checkin`'s handler shape and ingest contract.
 //!
 //! Every response is JSON; invalid request bodies get `400 {"error": "invalid
 //! json"}` (Python `:564-568`). Persistence never talks to CockroachDB directly —
@@ -32,7 +34,7 @@ use serde_json::{json, Value};
 
 use crate::db::{
     store::{read_snapshot, wal_append, write_snapshot, StatePaths},
-    BootTarget, MachineRow, MachineStatus,
+    AppStatusReportRow, BootTarget, MachineRow, MachineStatus,
 };
 
 /// Default iPXE boot-menu directory (mirrors Python's `IPXE_BOOT_DIR`).
@@ -237,6 +239,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/register", post(handle_register))
         .route("/api/checkin", post(handle_checkin))
+        .route("/api/app-status", post(handle_app_status))
         .route("/api/webhook", post(handle_webhook))
         .route("/api/finalreport", post(handle_finalreport))
         .route("/api/hardware-info", post(handle_hardware_info))
@@ -327,6 +330,11 @@ async fn handle_register(State(state): State<AppState>, body: Bytes) -> Response
     let last_install_status = existing
         .as_ref()
         .and_then(|m| m.last_install_status.clone());
+    let app_reports = existing
+        .as_ref()
+        .map(|m| m.app_reports.clone())
+        .unwrap_or_default();
+    let last_app_status_at = existing.as_ref().and_then(|m| m.last_app_status_at.clone());
 
     let row = MachineRow {
         mac: mac.clone(),
@@ -343,6 +351,8 @@ async fn handle_register(State(state): State<AppState>, body: Bytes) -> Response
         installed_at,
         last_install_status,
         updated_at: Some(now_epoch_string()),
+        app_reports,
+        last_app_status_at,
     };
     state.registry.upsert_machine(row).await;
 
@@ -423,6 +433,75 @@ async fn handle_checkin(State(state): State<AppState>, body: Bytes) -> Response 
     json_response(
         StatusCode::OK,
         json!({"ok": true, "status": status_str, "approved": approved}),
+    )
+}
+
+// ── /api/app-status (DS-CHK-02, constellation addition, no Python precedent) ─
+
+/// Parse the `reports` array into [`AppStatusReportRow`]s. Missing/malformed
+/// per-report fields default rather than reject — this endpoint is a telemetry
+/// sink (fail-OPEN, spec Decision 4), not a validator; a missing `reports` key
+/// is treated the same as an explicit empty array.
+fn parse_app_status_reports(data: &Value) -> Vec<AppStatusReportRow> {
+    data.get("reports")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .map(|r| AppStatusReportRow {
+                    kind: r.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
+                    unit: r.get("unit").and_then(Value::as_str).unwrap_or("").to_string(),
+                    active: r.get("active").and_then(Value::as_bool).unwrap_or(false),
+                    detail: r.get("detail").and_then(Value::as_str).unwrap_or("").to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ingest an application-status report from a host (mirrors `/api/checkin`'s
+/// handler shape: `parse_json` -> `normalize_mac` -> read snapshot -> update
+/// row -> `write_snapshot`). `read_snapshot`'s fail-open behavior is CORRECT
+/// here (telemetry ingest, not allocation): a write failure is logged inside
+/// [`FileRegistry::upsert_machine`] and never surfaces as a 5xx to the caller.
+///
+/// An empty `reports` list is valid and recorded — it means "this host runs
+/// zero applications", not "nothing to report". A report for an application
+/// not in the machine's profile is recorded anyway; this handler does not
+/// validate against the profile, only records what was told.
+///
+/// Does NOT compute staleness and does NOT touch [`MachineStatus`] — DS-CHK-03
+/// derives staleness from `last_app_status_at` at READ time, and application
+/// health is a field separate from the registration lifecycle.
+async fn handle_app_status(State(state): State<AppState>, body: Bytes) -> Response {
+    let data = match parse_json(&body) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+
+    let mac = normalize_mac(data.get("mac").and_then(Value::as_str).unwrap_or(""));
+    let reports = parse_app_status_reports(&data);
+
+    let mut entry = match state.registry.get_machine(&mac).await {
+        Some(e) => e,
+        None => {
+            tracing::info!(%mac, "APP-STATUS DENIED - not registered");
+            return json_response(
+                StatusCode::FORBIDDEN,
+                json!({"ok": false, "error": "Not registered"}),
+            );
+        }
+    };
+
+    let reports_recorded = reports.len();
+    entry.app_reports = reports;
+    entry.last_app_status_at = Some(now_epoch_string());
+    entry.updated_at = Some(now_epoch_string());
+    state.registry.upsert_machine(entry).await;
+
+    tracing::info!(%mac, reports_recorded, "APP-STATUS");
+    json_response(
+        StatusCode::OK,
+        json!({"ok": true, "reports_recorded": reports_recorded}),
     )
 }
 
@@ -725,6 +804,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 
@@ -935,6 +1016,143 @@ mod tests {
             updated.tpm_ek.as_deref(),
             Some("ek-1"),
             "EK unchanged on match"
+        );
+    }
+
+    // ── /api/app-status (DS-CHK-02) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_app_status_records_reports() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(MockRegistry::default());
+        registry
+            .upsert_machine(base_machine("aa:bb:cc:dd:ee:ff", "h1"))
+            .await;
+        let state = test_state_with(registry.clone(), dir.path().to_path_buf());
+
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "reports": [
+                    {"kind": "cockroach", "unit": "cockroach.service", "active": true, "detail": "active"}
+                ]
+            }))
+            .unwrap(),
+        );
+        let resp = handle_app_status(State(state), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reports_recorded"], 1);
+
+        let updated = registry.get_machine("aa:bb:cc:dd:ee:ff").await.unwrap();
+        assert_eq!(updated.app_reports.len(), 1, "report must be recorded");
+        assert_eq!(updated.app_reports[0].kind, "cockroach");
+        assert_eq!(updated.app_reports[0].unit, "cockroach.service");
+        assert!(updated.app_reports[0].active);
+        assert_eq!(updated.app_reports[0].detail, "active");
+        assert!(
+            updated.last_app_status_at.is_some(),
+            "last_app_status_at must be stamped"
+        );
+    }
+
+    /// Anti-over-suppression: a host legitimately running zero applications must
+    /// still be recorded — an empty `reports` list is valid data, not an error
+    /// and not a skipped write. Treating it as nothing-to-do would make a host
+    /// that reports zero apps indistinguishable from a host that never checked
+    /// in at all.
+    #[tokio::test]
+    async fn test_app_status_empty_reports_is_valid() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(MockRegistry::default());
+        registry
+            .upsert_machine(base_machine("aa:bb:cc:dd:ee:ff", "h1"))
+            .await;
+        let state = test_state_with(registry.clone(), dir.path().to_path_buf());
+
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "reports": []})).unwrap(),
+        );
+        let resp = handle_app_status(State(state), body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "empty reports is not an error");
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reports_recorded"], 0);
+
+        let updated = registry.get_machine("aa:bb:cc:dd:ee:ff").await.unwrap();
+        assert_eq!(
+            updated.app_reports.len(),
+            0,
+            "zero applications is meaningful data, not a skipped write"
+        );
+        assert!(
+            updated.last_app_status_at.is_some(),
+            "timestamp must be stamped even with zero reports"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_app_status_malformed_json_400() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with(Arc::new(MockRegistry::default()), dir.path().to_path_buf());
+
+        let resp = handle_app_status(State(state), Bytes::from_static(b"not json")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid json");
+    }
+
+    #[tokio::test]
+    async fn test_app_status_does_not_touch_machine_status() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(MockRegistry::default());
+        let mut m = base_machine("aa:bb:cc:dd:ee:ff", "h1");
+        m.status = MachineStatus::Approved;
+        registry.upsert_machine(m).await;
+        let state = test_state_with(registry.clone(), dir.path().to_path_buf());
+
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "reports": []})).unwrap(),
+        );
+        let resp = handle_app_status(State(state), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let updated = registry.get_machine("aa:bb:cc:dd:ee:ff").await.unwrap();
+        assert_eq!(
+            updated.status,
+            MachineStatus::Approved,
+            "app-status ingest must never alter the registration lifecycle"
+        );
+    }
+
+    /// On-disk backward compat: a snapshot MachineRow serialized before this
+    /// task existed (no `app_reports`/`last_app_status_at` keys) must still
+    /// parse, defaulting both fields.
+    #[test]
+    fn test_snapshot_without_app_fields_still_parses() {
+        let json = r#"{
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "hostname": "h1",
+            "ip": null,
+            "type": "lenovo",
+            "status": "approved",
+            "boot_target": "local-disk",
+            "tpm_ek": null,
+            "registered_at": null,
+            "approved_at": null,
+            "last_seen": null,
+            "last_ip": null,
+            "installed_at": null,
+            "last_install_status": null,
+            "updated_at": null
+        }"#;
+        let row: MachineRow =
+            serde_json::from_str(json).expect("pre-DS-CHK-02 snapshot row must still parse");
+        assert_eq!(row.app_reports.len(), 0, "app_reports defaults to empty");
+        assert_eq!(
+            row.last_app_status_at, None,
+            "last_app_status_at defaults to None"
         );
     }
 

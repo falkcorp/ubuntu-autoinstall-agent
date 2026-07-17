@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/inventory.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: 76633c84-b337-47da-ab77-11cbf0f4b3b5
-// last-edited: 2026-07-13
+// last-edited: 2026-07-17
 
 //! Machine-plane operator/inventory endpoints (`:25000` parity, spec Decision 12).
 //!
@@ -1116,6 +1116,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 

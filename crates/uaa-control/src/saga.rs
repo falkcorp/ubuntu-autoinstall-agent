@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/saga.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 25f36b48-dfa6-49c2-b30b-46d3fdf8adcb
-// last-edited: 2026-07-10
+// last-edited: 2026-07-17
 
 //! Approve-SAGA orchestration + compensation (`saga_log` table), spec C3.
 //!
@@ -989,6 +989,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 

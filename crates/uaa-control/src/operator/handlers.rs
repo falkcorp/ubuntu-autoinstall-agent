@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.4.1
+// version: 1.4.2
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-14
+// last-edited: 2026-07-17
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -253,6 +253,8 @@ async fn backfill_placed_configs(
                 installed_at: None,
                 last_install_status: None,
                 updated_at: None,
+                app_reports: Vec::new(),
+                last_app_status_at: None,
             })
             .await;
         known.insert(hexmac);
@@ -812,6 +814,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 
