@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-recommendation.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 99164529-ac14-4478-904e-03bd8b75ade1 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -8,7 +8,7 @@
 Deliverable 3 of the [research brief](../agent-tasks/2026-07-16-zfs-native-encryption-research-prompt.md).
 Read after:
 
-1. [Research report](2026-07-17-zfs-native-encryption-unlock-architecture.md) (v1.1.0, corrected)
+1. [Research report](2026-07-17-zfs-native-encryption-unlock-architecture.md) (v1.2.0, corrected)
 2. [Adversarial design review](2026-07-17-zfs-native-encryption-design-review.md)
 
 This is my own view, in my own words, including where I disagree with the
@@ -25,9 +25,16 @@ turned out to be easy — Ubuntu already ships this exact design for dracut and
 has maintained it as recently as three months ago. The hard finding was
 elsewhere and it inverts an assumption baked into `unimatrixone.yaml`: the
 TPM2+PIN and FIDO2 enrollments we currently intend are not *extra safety* —
-each one is a **boot-hang that would destroy the unattended reboot** we are
-trying to protect. The config asserts `enroll_tpm2: true` and
-`expect_fido2: true` today; both must go.
+each one is a **boot-hang risk that would destroy the unattended reboot** we
+are trying to protect. The config asserts `enroll_tpm2: true` and
+`expect_fido2: true` today; both should go.
+
+⚠️ **One qualification I added after drafting, because my own fleet contradicted
+me** — see "Order of work" #1: the hang is **code-proven but conditional**, and
+the Lenovos run the identical config without hanging. The likeliest explanation
+is that TPM2 enrollment silently never succeeds, meaning the fleet is *already*
+Tang-only by accident. **The recommendation is the same either way**; the
+confidence attached to the reasoning is not.
 
 ---
 
@@ -36,14 +43,17 @@ trying to protect. The config asserts `enroll_tpm2: true` and
 I re-verified its headline finding by hand rather than take it on trust, and
 it is correct in every detail:
 
-- **R4 (the boot-hang) is real and critical.** `systemd-cryptsetup` tries
-  LUKS2 tokens *before* the password path (`cryptsetup.c:2654`); a
-  `systemd-tpm2` PIN token returns `-ENOANO`; that enters `for (;;)` calling
-  `ask_password_auto` with `until = 0` — and `until` is 0 because
-  `arg_timeout` defaults to `USEC_INFINITY` and `usec_add` saturates
-  (`:2618-2620`). The PIN's credential is `cryptsetup.luks2-pin`; clevis
-  matches only `Id=cryptsetup:*`. **Tang is never reached.** This is the exact
-  scenario U1 must survive, and we would have walked into it.
+- **R4 (the boot-hang) is real as a code path, and it is the right thing to
+  design around.** `systemd-cryptsetup` tries LUKS2 tokens *before* the
+  password path (`cryptsetup.c:2654`); a `systemd-tpm2` PIN token returns
+  `-ENOANO`; that enters `for (;;)` calling `ask_password_auto` with
+  `until = 0` — and `until` is 0 because `arg_timeout` defaults to
+  `USEC_INFINITY` and `usec_add` saturates (`:2618-2620`). The PIN's credential
+  is `cryptsetup.luks2-pin`; clevis matches only `Id=cryptsetup:*`. **Tang is
+  never reached.** ⚠️ **But it is conditional** — gated on `use_token_plugins()`
+  and on the token existing — **and our own fleet is evidence it may not fire
+  today.** See "Order of work" #1. The specialist stated it slightly too
+  strongly, and so did I in the first draft of this document.
 - **R7 demolished my §3(c) argument and it was right to.** I claimed dropping
   IMSM forces ZFS-on-LUKS into two LUKS containers. It doesn't — real mdadm
   RAID1 (which is *not* IMSM fakeraid) keeps one. I dismissed a strawman and
