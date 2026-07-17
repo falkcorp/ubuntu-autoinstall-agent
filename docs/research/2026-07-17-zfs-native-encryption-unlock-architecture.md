@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-unlock-architecture.md -->
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!-- guid: 4cd78aaf-cb57-494b-ac6d-f48193b7cb88 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -68,7 +68,7 @@ on the uncorrected text would break the host.
 
 | # | What this report said | Correction |
 |---|---|---|
-| **1** 🔴 | §8 treats **TPM2+PIN as a viable break-glass rung** | **REFUTED — it is a boot-hang risk, not a fallback.** **IF** a `systemd-tpm2` PIN token exists on the device, it is tried *before* the password path, returns `-ENOANO`, and enters `for(;;)` on an ask-password with **`until = 0` (no deadline)**. Its credential is `cryptsetup.luks2-pin`; clevis only matches `Id=cryptsetup:*`, so **clevis never answers and Tang is never reached**. **Verified by hand this session** in `systemd/src/cryptsetup/cryptsetup.c` v259 (`:103`, `:1519-1568`, `:2618-2620`, `:2654-2665`). ⇒ **Enroll no TPM2/FIDO2 token on the keystore.** ⚠️ **See the conditionality note below — this is code-proven, NOT proven to fire in our deployed flow.** |
+| **1** 🔴 | §8 treats **TPM2+PIN as a viable break-glass rung** | **REFUTED, but not for the reason first given.** **IF** a `systemd-tpm2` PIN token exists, it is tried *before* the password path, returns `-ENOANO`, and enters `for(;;)` on an ask-password with **`until = 0` (no deadline)**; its credential is `cryptsetup.luks2-pin`, which clevis (matching only `Id=cryptsetup:*`) never answers ⇒ **Tang is never reached**. **Verified by hand** in `systemd/src/cryptsetup/cryptsetup.c` v259 (`:103`, `:1519-1568`, `:2618-2620`, `:2654-2665`). ⚠️ **BUT the hang is (a) CONDITIONAL — our own fleet contradicts it, see below — and (b) FIXABLE via `timeout=`.** The **correct** reason to enroll no TPM2/FIDO2 token: **neither can ever be unattended** (spec-level), so neither serves the binding constraint, and the recovery key covers the attended case better. Full option space incl. the `$PIN`-in-initramfs trap: [recommendation §"The timeout question"](2026-07-17-zfs-native-encryption-recommendation.md). ⇒ **Enroll no TPM2/FIDO2 token on the keystore.** |
 | **2** 🔴 | §5/§8 prescribe **`headless=`** as the fix for the fail-open | **Wrong twice.** (a) clevis unlocks *by answering* the very interactive prompt `headless=` suppresses — it would destroy Tang. (b) It is **unreachable anyway**: the Ubuntu patch calls `systemd-cryptsetup attach <name> <dev>` with no CONFIG argument (`argv[4]`), so no crypttab option applies. Verified against the patch body and `cryptsetup.c:2563`. |
 | **3** 🔴 | §5: "`token-timeout=` defaults to 30s, after which authentication via password is attempted — **the automatic degradation path**" | `arg_token_timeout_usec` is real but **unsettable here**, and it does **not** bound the token-plugin PIN loop (which uses `until`). **That automatic degradation path does not exist in this design.** |
 | **4** ⚠️ | §3(c): the **enrollment-surface** argument for native encryption | **False as stated** — real mdadm RAID1 (≠ IMSM fakeraid) under LUKS keeps **one** container. Conclusion survives, reasoning retired. See §3(c). |

@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-recommendation.md -->
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!-- guid: 99164529-ac14-4478-904e-03bd8b75ade1 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -8,7 +8,7 @@
 Deliverable 3 of the [research brief](../agent-tasks/2026-07-16-zfs-native-encryption-research-prompt.md).
 Read after:
 
-1. [Research report](2026-07-17-zfs-native-encryption-unlock-architecture.md) (v1.2.0, corrected)
+1. [Research report](2026-07-17-zfs-native-encryption-unlock-architecture.md) (v1.3.0, corrected)
 2. [Adversarial design review](2026-07-17-zfs-native-encryption-design-review.md)
 
 This is my own view, in my own words, including where I disagree with the
@@ -20,21 +20,31 @@ specialist.
 
 **Build native ZFS encryption with the Ubuntu LUKS-keystore zvol, stock
 layout, Tang-only for unattended unlock, and a recovery key as the backstop.
-Drop TPM2 and FIDO2 from U1's boot path entirely.** The architecture question
-turned out to be easy — Ubuntu already ships this exact design for dracut and
-has maintained it as recently as three months ago. The hard finding was
-elsewhere and it inverts an assumption baked into `unimatrixone.yaml`: the
-TPM2+PIN and FIDO2 enrollments we currently intend are not *extra safety* —
-each one is a **boot-hang risk that would destroy the unattended reboot** we
-are trying to protect. The config asserts `enroll_tpm2: true` and
-`expect_fido2: true` today; both should go.
+Drop TPM2 and FIDO2 from U1's boot path.** The architecture question turned out
+to be easy — Ubuntu already ships this exact design for dracut and has
+maintained it as recently as three months ago.
 
-⚠️ **One qualification I added after drafting, because my own fleet contradicted
-me** — see "Order of work" #1: the hang is **code-proven but conditional**, and
-the Lenovos run the identical config without hanging. The likeliest explanation
-is that TPM2 enrollment silently never succeeds, meaning the fleet is *already*
-Tang-only by accident. **The recommendation is the same either way**; the
-confidence attached to the reasoning is not.
+**Why drop TPM2/FIDO2 — stated correctly:** *not* because they hang (that is
+fixable — see §"The timeout question"), but because **neither can ever be
+unattended.** That is spec-level, not configuration: CTAP2 forbids returning an
+hmac-secret without a physical touch, and a PIN requires fingers. So neither can
+serve the one constraint that actually binds. What they would buy is an
+*attended* break-glass path — and **the recovery key already covers that**, at
+SOL, with no PCR brittleness and no cost imposed on every boot. Enrolling them
+is paying real complexity for a redundant copy of something we already have,
+while creating a boot-hang we then have to engineer around.
+
+The config asserts `enroll_tpm2: true` and `expect_fido2: true` today; both
+should go.
+
+⚠️ **Two qualifications I added after drafting, because I was wrong twice:**
+
+1. **The hang is code-proven but CONDITIONAL, and our own fleet is evidence
+   against it firing** — the Lenovos run the identical config and don't hang.
+   See "Order of work" #1.
+2. **The hang is fixable, so "it hangs" was never the right reason** to reject
+   TPM2/FIDO2. See "The timeout question" below. The conclusion held; the
+   argument didn't.
 
 ---
 
@@ -43,17 +53,20 @@ confidence attached to the reasoning is not.
 I re-verified its headline finding by hand rather than take it on trust, and
 it is correct in every detail:
 
-- **R4 (the boot-hang) is real as a code path, and it is the right thing to
-  design around.** `systemd-cryptsetup` tries LUKS2 tokens *before* the
-  password path (`cryptsetup.c:2654`); a `systemd-tpm2` PIN token returns
-  `-ENOANO`; that enters `for (;;)` calling `ask_password_auto` with
-  `until = 0` — and `until` is 0 because `arg_timeout` defaults to
-  `USEC_INFINITY` and `usec_add` saturates (`:2618-2620`). The PIN's credential
-  is `cryptsetup.luks2-pin`; clevis matches only `Id=cryptsetup:*`. **Tang is
-  never reached.** ⚠️ **But it is conditional** — gated on `use_token_plugins()`
-  and on the token existing — **and our own fleet is evidence it may not fire
-  today.** See "Order of work" #1. The specialist stated it slightly too
-  strongly, and so did I in the first draft of this document.
+- **R4 (the boot-hang) is real as a code path.** `systemd-cryptsetup` tries
+  LUKS2 tokens *before* the password path (`cryptsetup.c:2654`); a
+  `systemd-tpm2` PIN token returns `-ENOANO`; that enters `for (;;)` calling
+  `ask_password_auto` with `until = 0` — and `until` is 0 because `arg_timeout`
+  defaults to `USEC_INFINITY` and `usec_add` saturates (`:2618-2620`). The
+  PIN's credential is `cryptsetup.luks2-pin`; clevis matches only
+  `Id=cryptsetup:*`. **Tang is never reached.**
+  ⚠️ **Two caveats — the specialist overstated this, and so did I at first.**
+  (1) It is **conditional**, gated on `use_token_plugins()` *and* on the token
+  existing, and **our own fleet is evidence it may not fire today** ("Order of
+  work" #1). (2) It is **fixable** via `timeout=` ("The timeout question"), so
+  it was never the right *reason* to reject TPM2/FIDO2 — it is a consequence,
+  not the argument. The design conclusion (no tokens on the keystore) is right;
+  both of us reached it via reasoning that needed repair.
 - **R7 demolished my §3(c) argument and it was right to.** I claimed dropping
   IMSM forces ZFS-on-LUKS into two LUKS containers. It doesn't — real mdadm
   RAID1 (which is *not* IMSM fakeraid) keeps one. I dismissed a strawman and
@@ -73,6 +86,73 @@ it is correct in every detail:
   disk.** Disk theft is still defeated — that's the real win — but machine
   theft plus network access is not, and cannot be while unattended reboot is
   the requirement.
+
+---
+
+## The timeout question — "can't we just modify the timeouts?"
+
+Asked by the operator, and it is the right question. **Yes, the hang is
+fixable.** I had framed it as disqualifying; it isn't. Here is the full design
+space, traced in `systemd/src/cryptsetup/cryptsetup.c` v259.
+
+### `timeout=` does work — and it costs the property we most want
+
+`timeout=` is the lever (`:360-362` → `arg_timeout` → `until` at `:2618-2620`).
+With `timeout=30`, `until` becomes a real deadline; `ask_password_auto` returns
+`-ETIME`; and — this is the part that matters — the caller does **not** abort,
+it `log_debug_errno`s and **falls through to the password loop** (`:2665-2670`),
+where clevis answers from Tang. So the boot completes. **PROVEN by reading the
+control flow.**
+
+**The catch: `until` is passed to BOTH paths — it is one variable.**
+
+```c
+crypt_activate_by_token_pin_ask_password(cd, volume, NULL, until, ...)  // token PIN loop
+get_password(cd, ..., until, ..., passphrase_type, ...)                 // ← the one clevis answers
+```
+
+`until = 0` is precisely what gives us **"wait patiently at a prompt, forever"**
+— the correct behaviour for a remote-operator host. Tang is down at 3am; the box
+sits at a prompt; the operator connects to SOL hours later, types the recovery
+key, and it boots. Set `timeout=30` and it instead exhausts `arg_tries` (default
+3) and drops to an **emergency shell** — converting *a box that waits for you*
+into *a box you must rescue*.
+
+**So with a token enrolled you must choose: kill the hang, or keep
+patient-waiting. Without a token you get both, free.** That asymmetry is the
+whole argument.
+
+### The full option space
+
+| Option | Hang? | Cost | Verdict |
+|---|---|---|---|
+| **No TPM2/FIDO2 token** | ✅ none | none | ✅ **Recommended** — patient-waiting preserved, Tang direct |
+| `timeout=N` + token | ✅ fixed | **N sec every boot** *and* **loses patient-waiting** | ❌ trades a property we want for one we have |
+| `SYSTEMD_CRYPTSETUP_USE_TOKEN_MODULE=0` + token | ✅ none | none | ⚠️ Surgical (`:1468` — `use_token_plugins()` → false, path skipped, `until` stays 0). But the token is then **never tried at boot** — enrolled in order not to be used. Marginal. |
+| `$PIN` env var in initramfs | ✅ none | **catastrophic** | 🔴 **NEVER — see below** |
+| TPM2 **without** PIN | ✅ none | security | ❌ Unseals for anyone who powers it on. Rejected by design review D8.2 — converts *theft + LAN* into *theft*. |
+
+### 🔴 The trap: `$PIN` in the initramfs
+
+`acquire_pins_from_env_variable()` (`:1480-1501`) reads `$PIN` from the
+environment and would suppress the prompt entirely. **Do not.** The initramfs
+lives on **bpool, which is unencrypted** (GRUB must read it — §7). A PIN stored
+there is readable by anyone holding the disk, which destroys the *only* thing a
+TPM PIN buys: offline-attack resistance via hardware lockout (§4). It converts
+TPM2+PIN into TPM2-without-PIN while looking like it didn't.
+
+### What this changes
+
+**Nothing in the recommendation; everything in the reasoning.** "Don't enroll
+TPM2/FIDO2 because it hangs" was wrong — it's fixable. The correct statement is
+the one in the one-paragraph answer: **neither can ever be unattended, so
+neither can serve the binding constraint, and the recovery key covers the
+attended case better.** The hang is then not a reason but a *consequence* — one
+more cost of enrolling something that cannot help.
+
+**And note this entire question dissolves under my clevis-`tpm2`-pin proposal
+below**, which never creates a systemd token at all — so there is no token path
+to time out, and `until = 0` is kept.
 
 ---
 
