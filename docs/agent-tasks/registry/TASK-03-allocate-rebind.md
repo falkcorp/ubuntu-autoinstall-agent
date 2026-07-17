@@ -107,7 +107,7 @@ REUSE — do not invent parallels:
    - **`test_allocate_refuses_on_corrupt_snapshot`** — same for a file containing `not json`.
    - `test_allocate_never_reuses_released_index` — allocate 001/002, soft-release 002, allocate a **new** identity ⇒ gets **003**, never 002.
    - `test_allocate_returning_identity_reactivates_same_index` — soft-release 002, re-allocate the **same** identity ⇒ `released_at` cleared, index still **002**.
-   - `test_allocate_lower_mac_added_later_gets_next_index` — bind aa:…:03, then aa:…:01 ⇒ the later machine gets index 2, **not** 1. (The user's original bug: no sort-order re-derivation.)
+   - `test_allocate_lower_mac_added_later_gets_next_index` — bind `6c:4b:90:bc:f7:f4` first (⇒ index 1), then bind the **numerically lower** `6c:4b:90:bc:39:b3` (⇒ index **2**, NOT 1). Use those two literal MACs; do not substitute your own. This is the operator's original bug: a machine added later with a lower MAC must never reshuffle an existing binding, because allocation is append-only rather than sort-derived.
    - `test_hostname_uniqueness_is_global` — two groups whose patterns render the same hostname ⇒ the second allocate is `Err`.
    - `test_rebind_moves_index_and_tombstones_old` — rebind old→new ⇒ new identity holds the old index+hostname; old row has `rebound_to == new_identity`.
    - `test_rebind_unknown_old_identity_errors` / `test_rebind_to_bound_identity_errors`.
