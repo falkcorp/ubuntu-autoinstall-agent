@@ -150,4 +150,4 @@ STOP — report done with exact counts; the coordinator owns push/PR/merge.
 
 ## Idempotency / Rollback
 
-**Polarity: additive.** If `grep -n '"/api/app-status"' crates/uaa-control/src/machine_plane/lifecycle.rs` hits, this task is already applied — run the acceptance checks instead of re-applying. Rollback = revert the single commit; existing snapshots are unaffected (both fields were additive and defaulted), `MachineStatus` and every existing route are untouched, and no machine's behavior changes. DS-REG-01/04 also edit `db/mod.rs` — see the collision table in `../BREAKDOWN-2026-07-16.md`.
+**Polarity: additive.** If `grep -n '"/api/app-status"' crates/uaa-control/src/machine_plane/lifecycle.rs` hits, this task is already applied — run the acceptance checks instead of re-applying. Rollback = revert the single commit; existing snapshots are unaffected (both fields were additive and defaulted), `MachineStatus` and every existing route are untouched, and no machine's behavior changes. **`db/mod.rs` is shared with DS-REG-01 (wave 1)** — this task is wave 4 and must rebase after DS-REG-01 merges; see the collision table in `../BREAKDOWN-2026-07-16.md`.

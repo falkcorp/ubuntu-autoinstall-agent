@@ -1,5 +1,5 @@
 <!-- file: docs/agent-tasks/BREAKDOWN-2026-07-16.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 9b248d1c-6ba8-4580-b375-6619606eb533 -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -27,9 +27,9 @@ Computed from every task's Exact-files list — never eyeballed. Full table with
 |---|---|---|
 | `crates/uaa-core/src/network/ssh_installer/installer.rs` | DS-APP-02, DS-APP-03 | serialize: wave2=DS-APP-02, wave3=DS-APP-03 |
 | `crates/uaa-core/src/network/ssh_installer/applications.rs` | DS-APP-02, DS-APP-03 | serialize: wave2=DS-APP-02, wave3=DS-APP-03 |
-| `crates/uaa-control/src/db/mod.rs` | DS-REG-01, DS-REG-04 | serialize: wave1=DS-REG-01, wave4=DS-REG-04 |
+| `crates/uaa-control/src/db/mod.rs` | DS-REG-01, **DS-CHK-02** | serialize: wave1=DS-REG-01, wave4=DS-CHK-02 |
 | `crates/uaa-control/src/db/store.rs` | DS-REG-01, DS-REG-02 | serialize: wave1=DS-REG-01, wave2=DS-REG-02 |
-| `crates/uaa-control/src/profiles/store.rs` | DS-REG-02, DS-REG-03 | serialize: wave2=DS-REG-02, wave3=DS-REG-03 |
+| `crates/uaa-control/src/profiles/store.rs` | DS-REG-02, DS-REG-03, **DS-REG-04** | serialize: wave2=DS-REG-02, wave3=DS-REG-03, wave4=DS-REG-04 |
 | `crates/uaa-control/src/profiles/drift.rs` | DS-REG-04, DS-REG-05 | serialize: wave4=DS-REG-04, wave5=DS-REG-05 |
 | `crates/uaa-core/src/profile/mod.rs` | DS-PRF-01, DS-PRF-02, DS-PRF-03 | scaffold-first: wave2=DS-PRF-01 creates mod.rs + stubs; wave3 fills **disjoint** stubs |
 | `crates/uaa-control/src/operator/handlers.rs` | DS-OPS-01, DS-OPS-02 | serialize: wave4=DS-OPS-01, wave5=DS-OPS-02 |
