@@ -77,6 +77,10 @@ REUSE — do not invent parallels:
   # expect: 1 hit (~line 35) — the inherited bound you must not overclaim past
   grep -n "pub fn read_snapshot_strict" crates/uaa-control/src/db/store.rs
   # expect: 1 hit — the only read you may use
+  grep -n "pub async fn guarded_mutation" crates/uaa-control/src/db/store.rs
+  # expect: 1 hit (~line 327) — wrap accept/revert writes in this
+  grep -n "pub trait ProfileStore" crates/uaa-control/src/profiles/store.rs
+  # expect: 1 hit — the store you read/write through (0 hits = DS-REG-02 not merged, STOP)
   ```
 
 ## Step-by-step
@@ -148,7 +152,7 @@ cargo clippy --offline -- -D warnings
 - [ ] Audited via `append_in_txn`, never `record` — verify: `grep -c "record(" crates/uaa-control/src/profiles/drift.rs` returns **0**, and `cargo test --lib --offline test_review_actions_are_audited` passes
 - [ ] No fail-open read — verify: `grep -c "read_snapshot(" crates/uaa-control/src/profiles/drift.rs` returns **0**
 - [ ] No overclaim — verify: `grep -ci "tamper-proof\|cannot be tampered\|prevents tampering" crates/uaa-control/src/profiles/drift.rs` returns **0**
-- [ ] "Restores intent, not the machine" is stated in the revert doc comment — verify: `grep -ci "not the machine\|intent" crates/uaa-control/src/profiles/drift.rs` returns ≥1
+- [ ] "Restores intent, not the machine" is stated in the revert doc comment — verify: `grep -c "not the machine" crates/uaa-control/src/profiles/drift.rs` returns ≥1 (exact phrase, case-sensitive — a loose `-i "intent"` would also match "intentional" and pass without the wording actually being there)
 - [ ] `cargo clippy --offline -- -D warnings` clean
 - [ ] File header bumped — verify: `grep -n "last-edited: 2026-07" crates/uaa-control/src/profiles/drift.rs`
 
