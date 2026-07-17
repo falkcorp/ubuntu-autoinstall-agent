@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.11.1
+// version: 2.11.2
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-16
+// last-edited: 2026-07-17
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -1018,6 +1018,7 @@ mod tests {
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
+            applications: vec![],
         }
     }
 

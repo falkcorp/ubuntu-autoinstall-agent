@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.6.0
+// version: 2.7.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-16
+// last-edited: 2026-07-17
 
 //! Configuration structures for SSH/local installation
 
@@ -35,6 +35,41 @@ impl InitramfsType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TangServer {
     pub url: String,
+}
+
+/// A workload assignable to a host. Closed-but-growing by design (spec
+/// Decision 15): adding HAProxy/Keepalived later is a new variant, not a
+/// plugin framework. An unknown `kind` is a hard parse error — never a
+/// silent skip, because a silently-dropped application deploys a machine
+/// missing its workload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ApplicationSpec {
+    Cockroach(CockroachSpec),
+}
+
+/// CockroachDB node parameters. `advertise`/`join` are NOT here: they are
+/// DERIVED per host from the group's sibling list (profiles/TASK-04), never
+/// authored. Defaults are the live fleet's values (verified 2026-07-16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CockroachSpec {
+    #[serde(default = "default_cockroach_version")]
+    pub version: String,
+    #[serde(default = "default_cockroach_port")]
+    pub port: u16,
+    #[serde(default = "default_cockroach_sql_port")]
+    pub sql_port: u16,
+    #[serde(default = "default_cockroach_http_addr")]
+    pub http_addr: String,
+    /// Cluster seed, always first in the join string.
+    pub seed_ip: String,
+    #[serde(default = "default_cockroach_cache")]
+    pub cache: String,
+    #[serde(default = "default_cockroach_max_sql")]
+    pub max_sql_memory: String,
+    #[serde(default = "default_cockroach_locality")]
+    pub locality: String,
 }
 
 /// Complete configuration for a machine installation.
@@ -104,6 +139,10 @@ pub struct InstallationConfig {
     /// the missing-CA case, never falling back to system roots).
     #[serde(default = "default_install_ca_cert")]
     pub install_ca_cert: String,
+    /// Applications to install into the target during Phase 5. Empty = none,
+    /// which is exactly today's behavior for every committed host config.
+    #[serde(default)]
+    pub applications: Vec<ApplicationSpec>,
 }
 
 fn default_tang_threshold() -> u8 {
@@ -124,6 +163,34 @@ pub fn default_install_ca_cert() -> String {
 
 pub fn default_network_renderer() -> String {
     "networkd".to_string()
+}
+
+fn default_cockroach_version() -> String {
+    "v25.3.0".to_string()
+}
+
+fn default_cockroach_port() -> u16 {
+    36357
+}
+
+fn default_cockroach_sql_port() -> u16 {
+    36257
+}
+
+fn default_cockroach_http_addr() -> String {
+    ":38080".to_string()
+}
+
+fn default_cockroach_cache() -> String {
+    ".25".to_string()
+}
+
+fn default_cockroach_max_sql() -> String {
+    ".25".to_string()
+}
+
+fn default_cockroach_locality() -> String {
+    "region=us,cluster-unit=lenovo".to_string()
 }
 
 impl InstallationConfig {
@@ -180,6 +247,7 @@ impl InstallationConfig {
             tpm2_pcr_ids: default_tpm2_pcr_ids(),
             expect_fido2: true,
             install_ca_cert: default_install_ca_cert(),
+            applications: Vec::new(),
         }
     }
 }
@@ -358,5 +426,72 @@ network_nameservers: ["10.0.0.1"]
             .join("\n");
         let back: InstallationConfig = serde_yaml::from_str(&yaml_without_renderer).unwrap();
         assert_eq!(back.network_renderer, "networkd");
+    }
+
+    #[test]
+    fn test_applications_defaults_to_empty_when_absent() {
+        // A minimal YAML with no `applications:` key must deserialize with an
+        // empty applications list, not fail — this is every committed host
+        // config today.
+        let yaml = r#"
+hostname: test
+disk_device: /dev/sda
+timezone: UTC
+luks_key: k
+root_password: p
+network_interface: eth0
+network_address: 10.0.0.2/24
+network_gateway: 10.0.0.1
+network_search: local
+network_nameservers: ["10.0.0.1"]
+"#;
+        let cfg: InstallationConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.applications.is_empty());
+    }
+
+    #[test]
+    fn test_applications_empty_is_todays_behavior() {
+        assert!(InstallationConfig::for_len_serv_003().applications.is_empty());
+    }
+
+    #[test]
+    fn test_cockroach_spec_defaults() {
+        let yaml = r#"
+kind: cockroach
+seed_ip: 172.16.3.92
+"#;
+        let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let ApplicationSpec::Cockroach(cockroach) = spec;
+        assert_eq!(cockroach.version, "v25.3.0");
+        assert_eq!(cockroach.port, 36357);
+        assert_eq!(cockroach.sql_port, 36257);
+        assert_eq!(cockroach.cache, ".25");
+        assert_eq!(cockroach.locality, "region=us,cluster-unit=lenovo");
+    }
+
+    #[test]
+    fn test_unknown_application_kind_rejected() {
+        // The enum is closed by design (spec Decision 15): an unknown kind
+        // must be a hard parse error naming the unknown kind, never a silent
+        // skip.
+        let yaml = r#"
+kind: redis
+"#;
+        let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
+        assert!(err.to_string().contains("redis"), "error must name the unknown kind: {err}");
+    }
+
+    #[test]
+    fn test_cockroach_spec_unknown_field_rejected() {
+        let yaml = r#"
+kind: cockroach
+seed_ip: 172.16.3.92
+typo_field: oops
+"#;
+        let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("typo_field"),
+            "error must name the unknown field: {err}"
+        );
     }
 }

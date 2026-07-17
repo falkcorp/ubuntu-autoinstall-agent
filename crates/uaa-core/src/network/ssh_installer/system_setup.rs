@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.12.0
+// version: 2.12.1
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-16
+// last-edited: 2026-07-17
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -1195,6 +1195,7 @@ mod tests {
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
+            applications: vec![],
         }
     }
 
