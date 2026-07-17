@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/profiles/store.rs
-// version: 0.3.0
+// version: 0.4.0
 // guid: b0c81b2d-2a46-40e3-855b-408cf3708503
 // last-edited: 2026-07-17
 
@@ -67,7 +67,12 @@ pub trait ProfileStore: Send + Sync {
     /// A single group by its immutable `name`, or `None` if absent.
     async fn get_group(&self, name: &str) -> Result<Option<HostGroupRow>>;
     /// Upsert a group row, keyed by `id` (never `name` — see [`HostGroupRow`] doc).
-    async fn put_group(&self, row: HostGroupRow) -> Result<()>;
+    /// `content_hash` is (re)computed from the row's content on every call —
+    /// a caller-supplied `content_hash` is ignored — and a
+    /// [`ProfileVersionRow`] is captured for `actor` on EVERY call, not only
+    /// when the body actually changed (DS-REG-04; see `profiles::drift`
+    /// module doc for why capture-on-change is too late for revert).
+    async fn put_group(&self, row: HostGroupRow, actor: &str) -> Result<()>;
     /// Removes the group row and cascades to `host_profiles` ONLY.
     /// `hostname_allocations` MUST survive this call — see module doc / spec
     /// D8: allocations outliving groups is what makes delete-and-recreate
@@ -75,8 +80,9 @@ pub trait ProfileStore: Send + Sync {
     async fn delete_group(&self, name: &str) -> Result<()>;
     /// Every profile belonging to `group_id`.
     async fn list_profiles(&self, group_id: Uuid) -> Result<Vec<HostProfileRow>>;
-    /// Upsert a profile row, keyed by `id`.
-    async fn put_profile(&self, row: HostProfileRow) -> Result<()>;
+    /// Upsert a profile row, keyed by `id`. Same `content_hash` /
+    /// `capture_version` contract as [`put_group`][ProfileStore::put_group].
+    async fn put_profile(&self, row: HostProfileRow, actor: &str) -> Result<()>;
     /// Every hostname allocation belonging to `group_id`, including released /
     /// rebound-away rows (append-only history) — the fail-closed read
     /// DS-REG-03's allocator depends on.
@@ -177,13 +183,34 @@ impl ProfileStore for SnapshotProfileStore {
             .find(|g| g.name == name))
     }
 
-    async fn put_group(&self, row: HostGroupRow) -> Result<()> {
+    async fn put_group(&self, mut row: HostGroupRow, actor: &str) -> Result<()> {
+        let body = crate::profiles::drift::group_body(&row);
+        row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        let group_id = row.id;
+
+        // Write the live row FIRST: capture_version's list_versions() reads
+        // via read_snapshot_strict (fail-closed), which — unlike
+        // read_for_mutation below — does not tolerate a not-yet-existing
+        // snapshot file. On a fresh install this write is what creates the
+        // file capture_version needs to read.
         let mut doc = self.read_for_mutation()?;
         match doc.host_groups.iter_mut().find(|g| g.id == row.id) {
             Some(existing) => *existing = row,
             None => doc.host_groups.push(row),
         }
         write_snapshot(&self.paths, &doc)?;
+
+        // Capture the version on EVERY write, unconditionally (DS-REG-04;
+        // see profiles::drift module doc for why capture-on-change is too
+        // late for DS-REG-05's revert).
+        crate::profiles::drift::capture_version(
+            self,
+            crate::profiles::drift::OBJECT_KIND_HOST_GROUP,
+            group_id,
+            &body,
+            actor,
+        )
+        .await?;
         Ok(())
     }
 
@@ -213,13 +240,28 @@ impl ProfileStore for SnapshotProfileStore {
             .collect())
     }
 
-    async fn put_profile(&self, row: HostProfileRow) -> Result<()> {
+    async fn put_profile(&self, mut row: HostProfileRow, actor: &str) -> Result<()> {
+        let body = crate::profiles::drift::profile_body(&row);
+        row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        let profile_id = row.id;
+
+        // Write the live row first — see put_group's comment on why this
+        // must precede capture_version (fail-closed list_versions read).
         let mut doc = self.read_for_mutation()?;
         match doc.host_profiles.iter_mut().find(|p| p.id == row.id) {
             Some(existing) => *existing = row,
             None => doc.host_profiles.push(row),
         }
         write_snapshot(&self.paths, &doc)?;
+
+        crate::profiles::drift::capture_version(
+            self,
+            crate::profiles::drift::OBJECT_KIND_HOST_PROFILE,
+            profile_id,
+            &body,
+            actor,
+        )
+        .await?;
         Ok(())
     }
 
@@ -448,12 +490,29 @@ impl ProfileStore for MemProfileStore {
             .cloned())
     }
 
-    async fn put_group(&self, row: HostGroupRow) -> Result<()> {
-        let mut state = self.state.lock().expect("MemProfileStore state poisoned");
-        match state.host_groups.iter_mut().find(|g| g.id == row.id) {
-            Some(existing) => *existing = row,
-            None => state.host_groups.push(row),
+    async fn put_group(&self, mut row: HostGroupRow, actor: &str) -> Result<()> {
+        let body = crate::profiles::drift::group_body(&row);
+        row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+
+        // Scope the lock so it is dropped BEFORE the capture_version().await
+        // below — capture_version -> put_version re-locks the same
+        // std::sync::Mutex, and it is not reentrant.
+        {
+            let mut state = self.state.lock().expect("MemProfileStore state poisoned");
+            match state.host_groups.iter_mut().find(|g| g.id == row.id) {
+                Some(existing) => *existing = row.clone(),
+                None => state.host_groups.push(row.clone()),
+            }
         }
+
+        crate::profiles::drift::capture_version(
+            self,
+            crate::profiles::drift::OBJECT_KIND_HOST_GROUP,
+            row.id,
+            &body,
+            actor,
+        )
+        .await?;
         Ok(())
     }
 
@@ -485,12 +544,28 @@ impl ProfileStore for MemProfileStore {
             .collect())
     }
 
-    async fn put_profile(&self, row: HostProfileRow) -> Result<()> {
-        let mut state = self.state.lock().expect("MemProfileStore state poisoned");
-        match state.host_profiles.iter_mut().find(|p| p.id == row.id) {
-            Some(existing) => *existing = row,
-            None => state.host_profiles.push(row),
+    async fn put_profile(&self, mut row: HostProfileRow, actor: &str) -> Result<()> {
+        let body = crate::profiles::drift::profile_body(&row);
+        row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+
+        // See put_group's comment: the lock must be dropped before the
+        // capture_version().await below.
+        {
+            let mut state = self.state.lock().expect("MemProfileStore state poisoned");
+            match state.host_profiles.iter_mut().find(|p| p.id == row.id) {
+                Some(existing) => *existing = row.clone(),
+                None => state.host_profiles.push(row.clone()),
+            }
         }
+
+        crate::profiles::drift::capture_version(
+            self,
+            crate::profiles::drift::OBJECT_KIND_HOST_PROFILE,
+            row.id,
+            &body,
+            actor,
+        )
+        .await?;
         Ok(())
     }
 
@@ -682,7 +757,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
         let group_id = Uuid::new_v4();
-        store.put_group(sample_group(group_id, "len-serv")).await.unwrap();
+        store
+            .put_group(sample_group(group_id, "len-serv"), "alice")
+            .await
+            .unwrap();
 
         let groups = store.list_groups().await.unwrap();
         assert_eq!(groups.len(), 1);
@@ -701,7 +779,7 @@ mod tests {
         let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
         let group_id = Uuid::new_v4();
         store
-            .put_group(sample_group(group_id, "bootstrap"))
+            .put_group(sample_group(group_id, "bootstrap"), "alice")
             .await
             .expect("first write on a fresh install must succeed");
     }
@@ -710,9 +788,15 @@ mod tests {
     async fn test_delete_group_leaves_allocations() {
         let store = MemProfileStore::new();
         let group_id = Uuid::new_v4();
-        store.put_group(sample_group(group_id, "len-serv")).await.unwrap();
         store
-            .put_profile(sample_profile(Uuid::new_v4(), group_id, "aa:bb:cc:dd:ee:ff"))
+            .put_group(sample_group(group_id, "len-serv"), "alice")
+            .await
+            .unwrap();
+        store
+            .put_profile(
+                sample_profile(Uuid::new_v4(), group_id, "aa:bb:cc:dd:ee:ff"),
+                "alice",
+            )
             .await
             .unwrap();
         store
@@ -778,7 +862,7 @@ mod tests {
         name: &str,
     ) -> SnapshotProfileStore {
         let store = SnapshotProfileStore::new(StatePaths::under(dir));
-        store.put_group(sample_group(group_id, name)).await.unwrap();
+        store.put_group(sample_group(group_id, name), "alice").await.unwrap();
         store
     }
 
@@ -832,7 +916,10 @@ mod tests {
 
         store.delete_group("len-serv").await.unwrap();
         // Recreate with the SAME immutable id (allocations key on group_id).
-        store.put_group(sample_group(group_id, "len-serv")).await.unwrap();
+        store
+            .put_group(sample_group(group_id, "len-serv"), "alice")
+            .await
+            .unwrap();
 
         for (id, expected) in ids.iter().zip(original.iter()) {
             let row = store.allocate_index(group_id, id).await.unwrap();
@@ -950,8 +1037,11 @@ mod tests {
         let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
         let mut group1 = sample_group(g1, "len");
         group1.hostname_pattern = "{name}-serv-{index:03}".into();
-        store.put_group(group1).await.unwrap();
-        store.put_group(sample_group(g2, "len-serv")).await.unwrap();
+        store.put_group(group1, "alice").await.unwrap();
+        store
+            .put_group(sample_group(g2, "len-serv"), "alice")
+            .await
+            .unwrap();
 
         let a = store.allocate_index(g1, "aa:bb:cc:dd:ee:01").await.unwrap();
         assert_eq!(a.hostname, "len-serv-001");
