@@ -99,7 +99,7 @@ cargo clippy --offline -- -D warnings
 - [ ] `cargo test --lib --offline` exits 0 — verify: `cargo test --lib --offline 2>&1 | grep -E "^test result"`
 - [ ] `cargo build --offline` exits 0 — verify: `cargo build --offline && echo BUILD_OK`
 - [ ] All four row types exist — verify: `grep -c "pub struct HostGroupRow\|pub struct HostProfileRow\|pub struct HostnameAllocationRow\|pub struct ProfileVersionRow" crates/uaa-control/src/db/mod.rs` returns 4
-- [ ] All four collections carry `#[serde(default)]` — verify: `grep -A1 "pub host_groups\|pub host_profiles\|pub hostname_allocations\|pub profile_versions" crates/uaa-control/src/db/store.rs | grep -c "serde(default)"` returns 4 (attribute precedes each field; adjust the grep direction if your formatter differs — the requirement is that each of the four has it)
+- [ ] All four collections carry `#[serde(default)]` — verify: `grep -B1 "pub host_groups\|pub host_profiles\|pub hostname_allocations\|pub profile_versions" crates/uaa-control/src/db/store.rs | grep -c "serde(default)"` returns 4. (`-B1`, not `-A1`: the attribute **precedes** the field, which is how the six existing `SnapshotDoc` collections are written — check one with `grep -B1 "pub machines" crates/uaa-control/src/db/store.rs` before running this.)
 - [ ] **No SQL, no migration** — verify: `git diff origin/main --name-only | grep -c "migrations"` returns **0**, and `git diff origin/main | grep -c "CREATE TABLE\|SQL_"` returns **0**
 - [ ] `RegistryStore` untouched — verify: `git diff origin/main --name-only | grep -c "db/registry.rs"` returns **0**
 - [ ] Backward compatibility — verify: `cargo test --lib --offline test_snapshot_without_profile_collections_still_parses`

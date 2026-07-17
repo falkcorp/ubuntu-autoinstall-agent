@@ -5,7 +5,7 @@
 
 # TASK-03 — `config place --from-registry` (dry-run default, `.bak`) ⚠ review-critical (DS-OPS-03)
 
-**Priority:** P1 · **Effort:** L · **Recommended subagent:** **Opus-class** · rust-core subagent · **Why:** the ONLY behavior-changing task in the package; it mass-overwrites every host's placed config in one loop. Never downgrade this tier, never parallelize it. · **Depends on:** DS-PRF-02 (merge) **and** DS-REG-03 (allocation)
+**Priority:** P1 · **Effort:** L · **Recommended subagent:** **Opus-class** · rust-core subagent · **Why:** the ONLY behavior-changing task in the package; it mass-overwrites every host's placed config in one loop. Never downgrade this tier, never parallelize it. · **Depends on:** DS-PRF-02 (merge), DS-REG-03 (allocation), **and DS-APP-01** (`PartialEq` for the struct-equality gate + `skip_serializing_if` for cross-version rollback safety)
 
 ## ⛔ START HERE (do this first, exactly)
 
