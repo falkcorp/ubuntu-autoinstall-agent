@@ -1,5 +1,5 @@
 <!-- file: docs/agent-tasks/profiles/TASK-01-profile-scaffold-types.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: a6354b1f-19a6-4011-abcb-cf049c2d2bf6 -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -65,8 +65,10 @@ REUSE — do not invent parallels:
   # expect: 1 hit (~line 84) — already Option<String>; hence Option<Option<String>> in a partial
   grep -n "pub debootstrap_release\|pub debootstrap_mirror" crates/uaa-core/src/network/ssh_installer/config.rs
   # expect: 2 hits — the other two Option fields needing the double-Option treatment
-  grep -n "^pub mod \|^mod " crates/uaa-core/src/lib.rs
-  # expect: several hits — add `pub mod profile;` alongside, mirroring the style
+  grep -n "^pub mod luks_sync" crates/uaa-core/src/lib.rs
+  # expect: 1 hit — copy THIS line's exact style, and add `pub mod profile;` next to it.
+  # (Do not grep all module lines: there are ~19 and an ambiguous target is how a
+  #  weak executor edits the wrong site.)
   ```
 
 ## Step-by-step
