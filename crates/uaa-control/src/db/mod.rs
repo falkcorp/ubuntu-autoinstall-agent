@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/mod.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: e43975b3-71de-4377-8ea5-ccd77fe75bc6
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Registry data-layer root for uaa-control.
 //!
@@ -312,6 +312,77 @@ pub struct SagaRow {
     pub steps: serde_json::Value,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+}
+
+/// A machine class (spec `deploy-system-design.md` § Data model). `name` IS the
+/// hostname prefix and is IMMUTABLE (Decision 2) — allocations key on [`id`]
+/// (`Uuid`), never on `name`, because keying on the mutable name would orphan
+/// every allocation on rename.
+///
+/// [`id`]: HostGroupRow::id
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostGroupRow {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub hostname_pattern: String,
+    pub is_standalone: bool,
+    pub defaults: serde_json::Value,
+    pub applications: serde_json::Value,
+    #[serde(with = "serde_bytes_hex")]
+    pub content_hash: Vec<u8>,
+    pub version: i64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One machine's irreducible facts (spec `deploy-system-design.md` § Data model).
+/// Deleted with its group (cascade). `identity` is the MAC (spec D-A/A1),
+/// stored `normalize_mac`'d.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostProfileRow {
+    pub id: uuid::Uuid,
+    pub group_id: uuid::Uuid,
+    pub identity: String,
+    pub hostname_override: Option<String>,
+    pub overrides: serde_json::Value,
+    pub applications: serde_json::Value,
+    #[serde(with = "serde_bytes_hex")]
+    pub content_hash: Vec<u8>,
+    pub version: i64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// Append-only index binding (spec `deploy-system-design.md` § Data model). NEVER
+/// deleted, NEVER cascaded (Decision 8/18). The key is `(group_id, identity)`; the
+/// asymmetry with [`HostProfileRow`] (which cascade-deletes with its group) IS the
+/// mechanism — deleting and recreating a group re-attaches every machine to the
+/// index it already had. `released_at` is a soft release (index never reused);
+/// `rebound_to` is a tombstone set by rebind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostnameAllocationRow {
+    pub group_id: uuid::Uuid,
+    pub identity: String,
+    pub index: i64,
+    pub hostname: String,
+    pub allocated_at: Option<String>,
+    pub released_at: Option<String>,
+    pub rebound_to: Option<String>,
+}
+
+/// Immutable prior version — what revert reads (spec `deploy-system-design.md` §
+/// Data model, Decisions 10, 11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileVersionRow {
+    pub id: uuid::Uuid,
+    pub object_kind: String,
+    pub object_id: uuid::Uuid,
+    pub version: i64,
+    pub body: serde_json::Value,
+    #[serde(with = "serde_bytes_hex")]
+    pub content_hash: Vec<u8>,
+    pub actor: String,
+    pub created_at: Option<String>,
 }
 
 /// Hex codec for `BYTES` columns so audit hashes survive the JSON snapshot/WAL
