@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
@@ -73,4 +73,56 @@ pub struct AuditVerifyResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiErrorBody {
     pub message: String,
+}
+
+// ── Profiles (DS-OPS-01) ──────────────────────────────────────────────────
+//
+// Hand-written `Serialize`-only views over `crate::db::{HostGroupRow,
+// HostProfileRow, HostnameAllocationRow}` (DS-REG-01/02), deliberately NOT a
+// re-export of those row types — same convention as `MachineRow` above.
+// `defaults`/`overrides`/`applications` stay `serde_json::Value` here (the
+// same representation the store persists) rather than the typed
+// `uaa_core::profile::InstallationConfigPartial` — a view is read-only wire
+// shape, not a second copy of that validation-tier type.
+
+/// One row from `GET /api/groups` / `GET /api/groups/:name` (DS-OPS-01).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostGroupView {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub hostname_pattern: String,
+    pub is_standalone: bool,
+    pub defaults: serde_json::Value,
+    pub applications: serde_json::Value,
+    pub version: i64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One row from `GET /api/groups/:name/profiles` (DS-OPS-01).
+#[derive(Debug, Clone, Serialize)]
+pub struct HostProfileView {
+    pub id: uuid::Uuid,
+    pub group_id: uuid::Uuid,
+    pub identity: String,
+    pub hostname_override: Option<String>,
+    pub overrides: serde_json::Value,
+    pub applications: serde_json::Value,
+    pub version: i64,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// One row from `GET /api/groups/:name/allocations` (DS-OPS-01). Includes
+/// released/rebound-away rows — same append-only history the store returns
+/// (see `ProfileStore::list_allocations`'s doc) — so the SPA can render the
+/// NIC-replacement history, not just the currently-bound identity.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllocationView {
+    pub identity: String,
+    pub index: i64,
+    pub hostname: String,
+    pub allocated_at: Option<String>,
+    pub released_at: Option<String>,
+    pub rebound_to: Option<String>,
 }
