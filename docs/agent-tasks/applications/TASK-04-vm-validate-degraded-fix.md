@@ -1,5 +1,5 @@
 <!-- file: docs/agent-tasks/applications/TASK-04-vm-validate-degraded-fix.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 742f395d-3e7d-4324-b1d4-d055c46d660c -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -62,10 +62,15 @@ REUSE — do not invent parallels:
   # expect: 1 hit (~line 517) — THE BUG: the edit target
   grep -n "is-system-running" scripts/vm-validate.sh
   # expect: 1-2 hits — the assertion block
-  grep -n "fail_stage" scripts/vm-validate.sh
-  # expect: several hits — the failure helper to reuse (definition + call sites)
-  grep -n "ASSERT_LOG" scripts/vm-validate.sh
-  # expect: several hits — append your output the same way
+  grep -n "fail_stage 6" scripts/vm-validate.sh
+  # expect: 2-3 hits — the Stage-6 failure calls whose style you copy. (Do NOT grep bare
+  # "fail_stage": ~18 hits across all stages, and an ambiguous target is how a weak
+  # executor edits the wrong stage.)
+  grep -n "tee -a \"\$ASSERT_LOG\"" scripts/vm-validate.sh
+  # expect: several hits — the exact append idiom to copy for your PASS line.
+  # For the one you are editing, anchor on the assertion itself:
+  grep -n -A2 "is-system-running" scripts/vm-validate.sh
+  # expect: 1 block — MU_OUT assignment + the ASSERT_LOG append + the buggy condition
   ```
 
 ## Step-by-step

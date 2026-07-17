@@ -1,5 +1,5 @@
 <!-- file: docs/agent-tasks/registry/TASK-01-snapshot-rows-scaffold.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 8433ecc7-0a7b-4687-88cf-bc5e8607fceb -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -62,8 +62,10 @@ REUSE — do not invent parallels:
   # expect: 1 hit (~line 99) — add four collections here
   grep -n "pub trait SagaStore: Send + Sync" crates/uaa-control/src/saga.rs
   # expect: 1 hit (~line 241) — the separate-trait+module precedent this scaffold follows
-  grep -n "^pub mod \|^mod " crates/uaa-control/src/lib.rs
-  # expect: several hits — add `pub mod profiles;` alongside them, mirroring the style
+  grep -n "^pub mod saga" crates/uaa-control/src/lib.rs
+  # expect: 1 hit — copy THIS line's exact style, and add `pub mod profiles;` next to it.
+  # (saga is the module this scaffold mirrors. Do not grep all module lines: there are
+  #  ~11 and an ambiguous target is how a weak executor edits the wrong site.)
   ```
 
 ## Step-by-step
