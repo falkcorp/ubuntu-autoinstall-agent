@@ -1,7 +1,27 @@
 # todo.md — ubuntu-autoinstall-agent
-# version: 2.7.0
+# version: 2.8.0
 # guid: todo0001-0000-0000-0000-000000000001
 # last-edited: 2026-07-16
+
+## PLANNED: deploy-system package — profiles, applications, check-in (2026-07-16, PR #96)
+
+- [ ] **20 briefs / 5 workstreams / 6 waves planned; none executed.** Design
+  `docs/specs/deploy-system-design.md` (v2.1), plan `docs/specs/deploy-system-plan.md`,
+  briefs `docs/agent-tasks/{profiles,registry,applications,checkin,operator-api}/`.
+- [ ] **DS-APP-04 is P0 and depends on nothing — dispatch first.** `scripts/vm-validate.sh`
+  accepts `systemctl is-system-running` == `degraded` as PASS, and `degraded` is returned
+  precisely when units have FAILED. The QEMU gate that authorizes touching hardware can
+  currently pass on a machine with broken services. Pre-existing bug, Haiku-class, ~20 lines.
+- [ ] **`uaa-control` has no CockroachDB connection in production** — `tokio_postgres` is in no
+  wiring file, `default_state()` builds `FileRegistry` + `Mem*Store`, `db::migrations::apply`
+  has no caller. Profiles therefore persist in the `StatePaths` snapshot (spec D4). Wiring a
+  real DB connection is Bucket 2 (its own operation) and would also give the built-but-unused
+  `PgAuditStore` a purpose — today the audit chain does NOT survive a restart.
+- [ ] **`read_snapshot` fails OPEN to an empty doc** on a missing/corrupt snapshot ("serving
+  EMPTY registry (degraded)"). Any future allocator reading through it would re-allocate every
+  index from 1 and rename the fleet. DS-REG-02 adds `read_snapshot_strict`; DS-REG-03 uses it.
+- [ ] Review-critical, Opus-class, never downgrade: DS-REG-03 (fail-closed allocation),
+  DS-REG-05 (last-good-version revert), DS-OPS-03 (only behavior-changing task).
 
 ## RESOLVED: operator plane (:15001) had zero authentication (raised 2026-07-13, fixed 2026-07-13)
 
