@@ -1,5 +1,5 @@
 <!-- file: docs/deploy-system/00-ROADMAP.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 5fc13d4f-0001-499e-81d1-cdbca2a67871 -->
 <!-- last-edited: 2026-07-16 -->
 
@@ -66,3 +66,15 @@ Detail docs (full detail lives there, not here):
 - **The Application axis survives.** The simplicity lens argued to collapse it into a group field; it fails because `unimatrixone` shares the Lenovos' hardware/secrets model but runs no Cockroach, so class and workload vary independently — collapsing forces a `has_cockroach: bool`, and HAProxy/Keepalived make it a third and fourth boolean.
 - **`serde_json`'s `preserve_order` is off today**, so a naive hash *looks* deterministic — which is exactly why the naive test is **vacuous** and `content_hash` canonicalizes explicitly (DS-REG-04).
 - **A pre-existing duplicate guid** exists on `main` between `docs/vm-validation.md` and `docs/agent-tasks/testing-gates/TASK-03-constellation-e2e-vm.md`. Unrelated to this package; noted so a future header lint does not blame it on the deploy-system docs.
+
+## Recorded deviation — the commit trailer
+
+This package's briefs use a **model-agnostic** trailer:
+
+```
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+The 62 briefs in the install-ops and constellation packages use `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`, and `.claude/plan-op.local.md` still declares that value. The deviation is **deliberate, not drift**: those packages were planned *and* executed under one model, whereas these briefs are dispatched to **Haiku- and Sonnet-class** agents, so a Fable-5 trailer would attest to work a different model did. A brief-verifier flagged the inconsistency (advisory, non-fatal — the trailer is present and well-formed).
+
+If the operator prefers package-wide consistency over per-model accuracy, update `.claude/plan-op.local.md`'s `commit_trailer` and the 20 briefs together — do not change one without the other.
