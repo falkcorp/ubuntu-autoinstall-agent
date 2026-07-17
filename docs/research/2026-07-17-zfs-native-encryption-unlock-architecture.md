@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-unlock-architecture.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 4cd78aaf-cb57-494b-ac6d-f48193b7cb88 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -68,10 +68,72 @@ on the uncorrected text would break the host.
 
 | # | What this report said | Correction |
 |---|---|---|
-| **1** 🔴 | §8 treats **TPM2+PIN as a viable break-glass rung** | **REFUTED — it is a boot-hang, not a fallback.** A `systemd-tpm2` PIN token on the keystore is tried *before* the password path, returns `-ENOANO`, and enters `for(;;)` on an ask-password with **`until = 0` (no deadline)**. Its credential is `cryptsetup.luks2-pin`; clevis only matches `Id=cryptsetup:*`, so **clevis never answers and Tang is never reached**. **Verified by hand this session** in `systemd/src/cryptsetup/cryptsetup.c` v259 (`:103`, `:1519-1568`, `:2618-2620`, `:2654-2665`). **With `unimatrixone.yaml`'s current `enroll_tpm2: true` + `tpm2_pin`, U1 would hang forever on exactly the unattended reboot it must survive.** ⇒ **Enroll no TPM2/FIDO2 token on the keystore.** |
+| **1** 🔴 | §8 treats **TPM2+PIN as a viable break-glass rung** | **REFUTED — it is a boot-hang risk, not a fallback.** **IF** a `systemd-tpm2` PIN token exists on the device, it is tried *before* the password path, returns `-ENOANO`, and enters `for(;;)` on an ask-password with **`until = 0` (no deadline)**. Its credential is `cryptsetup.luks2-pin`; clevis only matches `Id=cryptsetup:*`, so **clevis never answers and Tang is never reached**. **Verified by hand this session** in `systemd/src/cryptsetup/cryptsetup.c` v259 (`:103`, `:1519-1568`, `:2618-2620`, `:2654-2665`). ⇒ **Enroll no TPM2/FIDO2 token on the keystore.** ⚠️ **See the conditionality note below — this is code-proven, NOT proven to fire in our deployed flow.** |
 | **2** 🔴 | §5/§8 prescribe **`headless=`** as the fix for the fail-open | **Wrong twice.** (a) clevis unlocks *by answering* the very interactive prompt `headless=` suppresses — it would destroy Tang. (b) It is **unreachable anyway**: the Ubuntu patch calls `systemd-cryptsetup attach <name> <dev>` with no CONFIG argument (`argv[4]`), so no crypttab option applies. Verified against the patch body and `cryptsetup.c:2563`. |
 | **3** 🔴 | §5: "`token-timeout=` defaults to 30s, after which authentication via password is attempted — **the automatic degradation path**" | `arg_token_timeout_usec` is real but **unsettable here**, and it does **not** bound the token-plugin PIN loop (which uses `until`). **That automatic degradation path does not exist in this design.** |
 | **4** ⚠️ | §3(c): the **enrollment-surface** argument for native encryption | **False as stated** — real mdadm RAID1 (≠ IMSM fakeraid) under LUKS keeps **one** container. Conclusion survives, reasoning retired. See §3(c). |
+
+### ⚠️ Conditionality of correction #1 — and the Lenovo contradiction
+
+**The hang is CONDITIONAL, and the condition may not hold on our fleet.** This
+qualification exists because the evidence points two ways and the honest answer
+is to say so rather than pick the dramatic reading.
+
+**Against the hang firing:** `len-serv-001/002/003.yaml` set **exactly the same
+fields as U1** — `enroll_tpm2: true`, `tpm2_pin: REPLACE_AT_PLACE_TIME`,
+`tpm2_pcr_ids: "7"`, `expect_fido2: true`, `initramfs_type: dracut` — and the
+Lenovos **auto-unlock in production today**. If R4 fired unconditionally on that
+config, they would hang. They do not.
+
+**The gate** (`cryptsetup.c:1449-1478`, read this session): the hang path runs
+only if `use_token_plugins()` is true, which requires **all** of —
+
+1. systemd built with `HAVE_LIBCRYPTSETUP_PLUGINS` (else it returns `false`
+   outright, and `crypt_activate_by_token_pin_ask_password` itself returns
+   `-EOPNOTSUPP` and falls through harmlessly);
+2. `crypt_token_external_path()` non-NULL — i.e. the
+   `libcryptsetup-token-systemd-tpm2.so` handler is actually present *in the
+   initramfs* (we install it via **`install_optional_items`**, which is
+   silently skipped when absent — `system_setup.rs:855`);
+3. `$SYSTEMD_CRYPTSETUP_USE_TOKEN_MODULE` not set to 0;
+4. **and a `systemd-tpm2` token actually existing on the LUKS2 header.**
+
+**The most probable reconciliation (HYPOTHESIS — not proven):** condition 4
+fails on the Lenovos, i.e. **TPM2 enrollment silently never succeeded.**
+Supporting circumstantial evidence, all from our own repo:
+
+- `tpm2_pin: REPLACE_AT_PLACE_TIME` is a **placeholder**; the config's own
+  comment concedes *"if left unsubstituted, first-boot enrollment runs with a
+  bogus PIN."*
+- `expect_fido2`'s comment states it *"only records intent / drives `verify`"*
+  — FIDO2 is enrolled **manually post-install**, so a FIDO2 token likely does
+  not exist either.
+- TPM2 is enrolled **on first boot**, so any hang would appear only from the
+  **second** reboot onward — which makes "nobody has hit this" plausible rather
+  than disqualifying.
+
+**If that hypothesis is right, the irony is the important part: the fleet
+auto-unlocks *because* its TPM2/FIDO2 enrollments silently fail — it is already
+running the recommended Tang-only token set by accident. And "fixing" TPM2
+enrollment would be the change that BREAKS unattended boot fleet-wide.**
+
+> 🎯 **One command settles this, and it should be run before anyone acts on
+> correction #1 as fact:**
+> ```sh
+> cryptsetup luksDump /dev/<luks-part>   # on len-serv-001
+> ```
+> Look at the `Tokens:` section. A `clevis` token and **no** `systemd-tpm2`
+> token ⇒ hypothesis confirmed, R4 confirmed-but-latent, and enrollment is
+> quietly broken. A `systemd-tpm2` token present on a host that *does*
+> auto-unlock ⇒ **R4 does not fire in our flow and this correction needs
+> re-opening.**
+
+**Either way the recommendation is unchanged** (Tang-only on the keystore) —
+which is why this is a qualification, not a blocker. But the report must not
+assert as settled fact something its own fleet contradicts. This is the
+`feedback_verify_the_test_before_trusting_the_result` lesson applied to a
+finding I was inclined to trust because I had verified the *code*: **proving a
+code path exists is not proving it executes.**
 
 **✅ And one gap CLOSED — the open question is resolved, in the design's
 favour.** Gap #2 ("does `rpool/keystore` inherit encryption — is it

@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-07-17-zfs-native-encryption-recommendation.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 99164529-ac14-4478-904e-03bd8b75ade1 -->
 <!-- last-edited: 2026-07-17 -->
 
@@ -177,13 +177,35 @@ rediscovers at 3am.
 
 ## Order of work — cheapest disambiguation first
 
-1. **`cryptsetup luksDump` on `len-serv-001`, look for a `clevis` token.** Free,
-   no U1 needed, and it resolves the specialist's one unresolved contradiction:
-   it proved our Tang bind *command shape* fails on a non-TTY channel, yet the
-   Lenovos reportedly auto-unlock. Both can't be true unqualified. **Settle it
-   before generalising from it** — this is the
-   `feedback_verify_the_test_before_trusting_the_result` lesson applied to a
-   finding I'd otherwise be tempted to act on.
+1. 🎯 **`cryptsetup luksDump` on `len-serv-001`.** Free, no U1 needed, and it
+   settles **two** findings at once — including one of mine.
+
+   **I checked the Lenovo configs after drafting this, and they undercut my own
+   headline.** `len-serv-001/002/003.yaml` set **identical** fields to U1 —
+   `enroll_tpm2: true`, `tpm2_pin: REPLACE_AT_PLACE_TIME`, `expect_fido2: true`,
+   `initramfs_type: dracut` — and they **auto-unlock in production**. If R4
+   fired unconditionally on that config, they would hang. **So R4 is
+   conditional**, gated on `use_token_plugins()` *and* on a `systemd-tpm2`
+   token actually existing (`cryptsetup.c:1449-1478`).
+
+   **My hypothesis: TPM2 enrollment silently never succeeds on the Lenovos**
+   (the PIN is an unsubstituted placeholder; `expect_fido2` only "records
+   intent"; FIDO2 is enrolled manually). If so, **the fleet already runs the
+   Tang-only token set I'm recommending — by accident — and "fixing" TPM2
+   enrollment is what would break it.**
+
+   Read the `Tokens:` section:
+   - `clevis` present, **no** `systemd-tpm2` ⇒ hypothesis confirmed; R4 real
+     but latent; enrollment quietly broken; my recommendation is what's already
+     deployed.
+   - `systemd-tpm2` present on a host that auto-unlocks ⇒ **R4 does not fire in
+     our flow and I am wrong** — re-open correction #1.
+
+   This is `feedback_verify_the_test_before_trusting_the_result` biting me
+   specifically: I verified the *code path* by hand and was ready to call it
+   settled. **Proving a code path exists is not proving it executes.** The
+   recommendation holds either way — which is exactly why it was safe to be
+   wrong here, and why I'd rather flag it than let it ship as fact.
 2. **VM gate, not U1.** Every claim in all three documents is source-, spec-,
    or package-derived. **Nothing here is boot-proven.** The R4 hang is the
    test that matters most: it decides whether TPM2/FIDO2 can ever come back.
@@ -212,7 +234,8 @@ rather name it than let it be found later.
 | Architecture decision | **Settled** — native ZFS + Ubuntu keystore zvol, stock layout |
 | Dataset layout / circularity | **Resolved, proven twice independently** |
 | Unattended path | **Settled** — Tang only; everything else is attended |
-| TPM2 | **Open** — hangs as a systemd token (proven); *may* work as a clevis sss share (unproven); **hardware presence unknown** |
+| TPM2 | **Open** — hangs as a systemd token (**code-proven, conditional, and NOT proven to fire in our flow** — the Lenovos run the same config and don't hang); *may* work as a clevis sss share (unproven); **hardware presence unknown** |
 | FIDO2 | **Recommend removing from U1 entirely** |
-| Tang bind reliability | **Open** — fragile shape proven; Lenovo contradiction unresolved; one command settles it |
+| Tang bind reliability | **Open** — fragile shape proven; Lenovo contradiction unresolved; one `luksDump` settles it |
+| Enrollment integrity | 🔴 **Newly suspected** — TPM2/FIDO2 enrollment may be silently failing fleet-wide. Would mean the fleet is Tang-only by accident, and that `verify`'s `expect_fido2` check is not catching it. **Independent of this design; worth its own look.** |
 | Boot-proof | **None. Nothing here has been booted.** VM gate required. |
