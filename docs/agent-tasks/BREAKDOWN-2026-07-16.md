@@ -21,7 +21,7 @@ Every task was verified against the current codebase by five read-only scouts, t
 
 ### ⚠️ Same-file collision rule (drives wave ordering)
 
-Computed from every task's Exact-files list — never eyeballed. Full table with resolutions: [`../specs/deploy-system-plan.md`](../specs/deploy-system-plan.md) § collision table. Summary of the 11 collision rows:
+Computed from every task's Exact-files list — never eyeballed. Full table with resolutions: [`../specs/deploy-system-plan.md`](../specs/deploy-system-plan.md) § collision table. Summary of the 10 collision rows:
 
 | Shared file | Tasks that touch it | Resolution |
 |---|---|---|
