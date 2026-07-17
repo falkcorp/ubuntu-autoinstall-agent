@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/db/store.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: a471e102-2da9-4bf8-8531-1de7595fd24d
 // last-edited: 2026-07-17
 
@@ -52,6 +52,23 @@ pub enum StoreError {
     /// (De)serialization error for a snapshot or WAL payload.
     #[error("store serde error: {0}")]
     Serde(#[from] serde_json::Error),
+    /// [`read_snapshot_strict`]: the snapshot file could not be read at all
+    /// (missing, permission error, etc). Named `path` — unlike the generic
+    /// [`StoreError::Io`] used elsewhere in this module — because the fail-closed
+    /// caller (allocation) needs the offending path in the error it surfaces.
+    #[error("registry snapshot at {path} is unreadable: {source}")]
+    SnapshotUnreadable {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// [`read_snapshot_strict`]: the snapshot file exists but failed to parse.
+    #[error("registry snapshot at {path} is corrupt: {source}")]
+    SnapshotCorrupt {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Filesystem locations for the degraded-mode artifacts. ALWAYS constructed from
@@ -262,6 +279,29 @@ pub fn read_snapshot(paths: &StatePaths) -> SnapshotDoc {
             SnapshotDoc::default()
         }
     }
+}
+
+/// Fail-CLOSED snapshot read. Unlike [`read_snapshot`] — which serves an EMPTY doc
+/// on a missing/corrupt file, correct for telemetry — this returns `Err`, naming the
+/// path, on either failure. **Allocation MUST use this, never `read_snapshot`.** An
+/// allocator that reads an empty view concludes every index is free and re-allocates
+/// the whole fleet from 1, renaming every machine. `read_snapshot` itself is
+/// untouched by this function — it stays fail-open for telemetry ingest.
+///
+/// The distinction this function exists to preserve: "the file says there are no
+/// allocations" (a valid, parseable doc with empty collections — `Ok`, and NOT an
+/// error; every `#[serde(default)]` collection in [`SnapshotDoc`] makes a fresh
+/// install parse cleanly) vs "I cannot read the file at all" (missing, unreadable,
+/// or corrupt — `Err`). Conflating the two is the bug this type exists to prevent.
+pub fn read_snapshot_strict(paths: &StatePaths) -> Result<SnapshotDoc, StoreError> {
+    let bytes = fs::read(&paths.snapshot).map_err(|source| StoreError::SnapshotUnreadable {
+        path: paths.snapshot.clone(),
+        source,
+    })?;
+    serde_json::from_slice::<SnapshotDoc>(&bytes).map_err(|source| StoreError::SnapshotCorrupt {
+        path: paths.snapshot.clone(),
+        source,
+    })
 }
 
 /// Append one telemetry event to the WAL, minting its `event_id` at ingest. Returns
@@ -475,6 +515,62 @@ mod tests {
         let doc = read_snapshot(&paths);
         assert!(doc.machines.is_empty());
         assert!(doc.enrollments.is_empty());
+    }
+
+    /// The load-bearing test: a missing snapshot must be `Err`, naming the path —
+    /// never the empty-doc fallback `read_snapshot` uses. An allocator that ever
+    /// saw `Ok(empty)` here would conclude every hostname index is free.
+    #[test]
+    fn test_read_snapshot_strict_errors_on_missing() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let err = read_snapshot_strict(&paths).expect_err("missing snapshot must be Err");
+        assert!(
+            err.to_string().contains(&paths.snapshot.display().to_string()),
+            "error must name the path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_snapshot_strict_errors_on_corrupt() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        fs::create_dir_all(paths.snapshot.parent().unwrap()).unwrap();
+        fs::write(&paths.snapshot, b"not json").unwrap();
+
+        let err = read_snapshot_strict(&paths).expect_err("corrupt snapshot must be Err");
+        assert!(
+            err.to_string().contains(&paths.snapshot.display().to_string()),
+            "error must name the path: {err}"
+        );
+    }
+
+    /// The "fresh install" happy path: a valid snapshot with NO profile
+    /// collections present must still resolve `Ok` with empty vecs — this is
+    /// the "no allocations" vs "cannot read the file" distinction the whole
+    /// function exists to preserve. Without this test a too-strict read would
+    /// reject every new deployment.
+    #[test]
+    fn test_read_snapshot_strict_ok_on_valid_empty() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        write_snapshot(&paths, &SnapshotDoc::default()).unwrap();
+
+        let doc = read_snapshot_strict(&paths).expect("valid empty snapshot must be Ok");
+        assert!(doc.host_groups.is_empty());
+        assert!(doc.host_profiles.is_empty());
+        assert!(doc.hostname_allocations.is_empty());
+        assert!(doc.profile_versions.is_empty());
+    }
+
+    /// Proves `read_snapshot_strict` is purely additive: `read_snapshot` on the
+    /// exact same missing path still returns the fail-open empty doc, unchanged.
+    #[test]
+    fn test_read_snapshot_still_fails_open() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let doc = read_snapshot(&paths);
+        assert!(doc.machines.is_empty(), "read_snapshot must still fail open");
     }
 
     /// Backward-compatibility guard (DS-REG-01): an existing on-disk snapshot
