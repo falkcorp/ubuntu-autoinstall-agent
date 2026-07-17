@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/import_export.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 4f8e14f9-bb1f-48d3-88ce-91f6accaaf77
-// last-edited: 2026-07-10
+// last-edited: 2026-07-17
 
 //! Registry import/export (parity with the legacy JSON registries).
 //!
@@ -239,6 +239,8 @@ async fn import_machines(
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         };
 
         if store.insert_machine_if_absent(row).await? {
@@ -481,6 +483,8 @@ mod tests {
             installed_at: None,
             last_install_status: None,
             updated_at: None,
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         }
     }
 

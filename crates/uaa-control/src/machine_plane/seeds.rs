@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/seeds.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: 448eead2-d3b6-4765-8e21-2a7421d3b55e
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Machine-plane seed placement + boot-target intent (:25000 parity).
 //!
@@ -228,6 +228,8 @@ async fn record_seen_mac(registry: &dyn Registry, mac: &str, client_ip: &str) {
             installed_at: None,
             last_install_status: None,
             updated_at: Some(now),
+            app_reports: Vec::new(),
+            last_app_status_at: None,
         },
     };
     registry.upsert_machine(row).await;
@@ -739,6 +741,8 @@ mod tests {
                 installed_at: None,
                 last_install_status: None,
                 updated_at: None,
+                app_reports: Vec::new(),
+                last_app_status_at: None,
             })
             .await;
         let state = test_state_with_registry(dir.path().to_path_buf(), mock, registry.clone());
