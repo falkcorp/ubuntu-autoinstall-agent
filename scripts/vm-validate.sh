@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.0.0
+# version: 1.0.1
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
-# last-edited: 2026-07-09
+# last-edited: 2026-07-17
 #
 # QEMU+swtpm VM validation gate. THIS SCRIPT PASSING IS THE GATE — no hardware
 # attempt or len-serv-003 wipe before it passes.
@@ -514,7 +514,11 @@ fi
 
 MU_OUT="$(ssh_run 30 root "systemctl is-system-running --wait" 2>&1 || true)"
 echo "$MU_OUT" >>"$ASSERT_LOG"
-if echo "$MU_OUT" | grep -qE "running|degraded"; then
+if echo "$MU_OUT" | grep -q "degraded"; then
+  FAILED_UNITS="$(ssh_run 15 root "systemctl list-units --failed --no-legend" 2>&1 || true)"
+  echo "$FAILED_UNITS" >>"$ASSERT_LOG"
+  fail_stage 6 "system is degraded — one or more units FAILED: ${FAILED_UNITS}"
+elif echo "$MU_OUT" | grep -q "running"; then
   echo "PASS: multi-user reached (systemctl is-system-running: $MU_OUT)" | tee -a "$ASSERT_LOG"
 else
   MU_ALT="$(ssh_run 15 root "systemctl is-active multi-user.target" 2>&1 || true)"
