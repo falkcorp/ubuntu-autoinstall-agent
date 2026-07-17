@@ -75,7 +75,20 @@ REUSE — do not invent parallels:
    - `AppStatusPayload` / `AppStatusReport` (above).
    - `pub async fn collect_status(runner: &mut dyn CommandExecutor, units: &[(String, String)]) -> Vec<AppStatusReport>` — one `systemctl is-active <unit>` per `(kind, unit)`; non-zero exit ⇒ `active: false`, never an `Err`.
    - `pub async fn post_status(control_url: &str, payload: &AppStatusPayload) -> Result<()>` — the thin HTTP seam (2xx AND `ok:true`).
-   - `pub async fn report_status(...) -> Result<AppStatusOutcome>` — validate MAC, collect, post; returns `reports_sent`.
+   - The outcome type and top-level entry point, spelled out so nothing is left to inference (mirrors `luks_sync`'s `LuksSyncOutcome` / `sync_credentials`):
+     ```rust
+     #[derive(Debug, Clone, PartialEq)]
+     pub struct AppStatusOutcome { pub reports_sent: usize }
+
+     /// Validate the MAC, collect status for `units`, POST to `control_url`.
+     /// `units` is a slice of (kind, unit) pairs, e.g. [("cockroach", "cockroach.service")].
+     pub async fn report_status(
+         runner: &mut dyn CommandExecutor,
+         control_url: &str,
+         mac: &str,
+         units: &[(String, String)],
+     ) -> Result<AppStatusOutcome>;
+     ```
 4. Declare `pub mod app_status;` in `crates/uaa-core/src/lib.rs`.
 5. Keep purely additive — do not modify `luks_sync.rs` or any existing module.
 6. Add tests in `app_status.rs`'s `mod tests` (mirror `luks_sync`'s test module):
