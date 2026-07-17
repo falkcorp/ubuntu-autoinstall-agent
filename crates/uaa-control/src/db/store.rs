@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/store.rs
-// version: 1.0.1
+// version: 1.1.0
 // guid: a471e102-2da9-4bf8-8531-1de7595fd24d
-// last-edited: 2026-07-12
+// last-edited: 2026-07-17
 
 //! Degraded-mode layer (spec Decision 4).
 //!
@@ -32,7 +32,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DiscoveredMacRow, EnrollmentRow, LuksCredentialRow, MachineRow, TangServerRow, YubikeyRow,
+    DiscoveredMacRow, EnrollmentRow, HostGroupRow, HostProfileRow, HostnameAllocationRow,
+    LuksCredentialRow, MachineRow, ProfileVersionRow, TangServerRow, YubikeyRow,
 };
 
 /// Owner-only file mode for every snapshot/WAL/quarantine artifact (secrets-adjacent).
@@ -109,6 +110,20 @@ pub struct SnapshotDoc {
     pub tang_servers: Vec<TangServerRow>,
     #[serde(default)]
     pub discovered_macs: Vec<DiscoveredMacRow>,
+    /// Machine classes (spec `deploy-system-design.md` D4/D2). Profiles persist
+    /// here — in the StatePaths snapshot — NOT in CockroachDB; see
+    /// `crate::profiles` module doc for why.
+    #[serde(default)]
+    pub host_groups: Vec<HostGroupRow>,
+    /// One row per machine's irreducible facts; cascade-deletes with its group.
+    #[serde(default)]
+    pub host_profiles: Vec<HostProfileRow>,
+    /// Append-only hostname index bindings; NEVER deleted, NEVER cascaded.
+    #[serde(default)]
+    pub hostname_allocations: Vec<HostnameAllocationRow>,
+    /// Immutable prior versions of groups/profiles, read by revert.
+    #[serde(default)]
+    pub profile_versions: Vec<ProfileVersionRow>,
 }
 
 /// A single write-ahead-log entry. `event_id` is minted at ingest and is the sole
@@ -460,6 +475,107 @@ mod tests {
         let doc = read_snapshot(&paths);
         assert!(doc.machines.is_empty());
         assert!(doc.enrollments.is_empty());
+    }
+
+    /// Backward-compatibility guard (DS-REG-01): an existing on-disk snapshot
+    /// predating the profile collections carries only the six original fields.
+    /// It must still parse — a missing `#[serde(default)]` here would silently
+    /// break every running server's state on deploy.
+    #[test]
+    fn test_snapshot_without_profile_collections_still_parses() {
+        let json = serde_json::json!({
+            "machines": [],
+            "enrollments": [],
+            "yubikeys": [],
+            "luks_credentials": [],
+            "tang_servers": [],
+            "discovered_macs": []
+        });
+        let doc: SnapshotDoc = serde_json::from_value(json).unwrap();
+        assert!(doc.host_groups.is_empty());
+        assert!(doc.host_profiles.is_empty());
+        assert!(doc.hostname_allocations.is_empty());
+        assert!(doc.profile_versions.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_roundtrips_profile_collections() {
+        let dir = tempdir().unwrap();
+        let paths = StatePaths::under(dir.path());
+        let group_id = uuid::Uuid::new_v4();
+        let doc = SnapshotDoc {
+            host_groups: vec![HostGroupRow {
+                id: group_id,
+                name: "len-serv".into(),
+                hostname_pattern: "{name}-{index:03}".into(),
+                is_standalone: false,
+                defaults: serde_json::json!({}),
+                applications: serde_json::json!([]),
+                content_hash: vec![0xab, 0xcd],
+                version: 1,
+                created_at: None,
+                updated_at: None,
+            }],
+            host_profiles: vec![HostProfileRow {
+                id: uuid::Uuid::new_v4(),
+                group_id,
+                identity: "aa:bb:cc:dd:ee:ff".into(),
+                hostname_override: None,
+                overrides: serde_json::json!({}),
+                applications: serde_json::json!([]),
+                content_hash: vec![0x12],
+                version: 1,
+                created_at: None,
+                updated_at: None,
+            }],
+            hostname_allocations: vec![HostnameAllocationRow {
+                group_id,
+                identity: "aa:bb:cc:dd:ee:ff".into(),
+                index: 1,
+                hostname: "len-serv-001".into(),
+                allocated_at: None,
+                released_at: None,
+                rebound_to: None,
+            }],
+            profile_versions: vec![ProfileVersionRow {
+                id: uuid::Uuid::new_v4(),
+                object_kind: "host_group".into(),
+                object_id: group_id,
+                version: 1,
+                body: serde_json::json!({}),
+                content_hash: vec![0x34],
+                actor: "test".into(),
+                created_at: None,
+            }],
+            ..Default::default()
+        };
+
+        write_snapshot(&paths, &doc).unwrap();
+        let round = read_snapshot(&paths);
+        assert_eq!(round.host_groups.len(), 1);
+        assert_eq!(round.host_groups[0].id, group_id);
+        assert_eq!(round.host_profiles.len(), 1);
+        assert_eq!(round.hostname_allocations.len(), 1);
+        assert_eq!(round.hostname_allocations[0].hostname, "len-serv-001");
+        assert_eq!(round.profile_versions.len(), 1);
+    }
+
+    #[test]
+    fn test_content_hash_serializes_as_hex() {
+        let row = HostGroupRow {
+            id: uuid::Uuid::new_v4(),
+            name: "len-serv".into(),
+            hostname_pattern: "{name}-{index:03}".into(),
+            is_standalone: false,
+            defaults: serde_json::json!({}),
+            applications: serde_json::json!([]),
+            content_hash: vec![0xde, 0xad],
+            version: 1,
+            created_at: None,
+            updated_at: None,
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert_eq!(value["content_hash"], serde_json::json!("dead"));
     }
 
     #[test]

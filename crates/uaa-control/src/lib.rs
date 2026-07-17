@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/lib.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 377e6bf2-0687-480d-a7f4-7bd21c525206
-// last-edited: 2026-07-14
+// last-edited: 2026-07-17
 
 //! uaa-control — the constellation's central daemon (spec component C3).
 //!
@@ -29,5 +29,6 @@ pub mod ca; // PK-01, then PK-03 (serialized)
 pub mod enroll; // PK-01
 pub mod import_export; // CT-02
 pub mod operator; // CT-07
+pub mod profiles; // DS-REG-01..04
 pub mod reinstall; // CT-06
 pub mod saga; // CT-05
