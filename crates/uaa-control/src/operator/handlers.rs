@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.6.0
+// version: 1.7.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -69,6 +69,7 @@ use crate::db::{
 };
 use crate::enroll::{self, EnrollmentStore, MemEnrollmentStore};
 use crate::machine_plane::lifecycle::normalize_mac;
+use crate::profiles::drift;
 use crate::profiles::store::{ProfileStore, SnapshotProfileStore};
 use ring::rand::SecureRandom;
 use uaa_core::network::ssh_installer::config::ApplicationSpec;
@@ -76,7 +77,8 @@ use uaa_core::profile::validate::validate as validate_profiles;
 use uaa_core::profile::{HostGroupProfile, HostProfile, InstallationConfigPartial};
 
 use super::api_types::{
-    AllocationView, ApiErrorBody, AuditVerifyResult, HostGroupView, HostProfileView, MachineRow,
+    AllocationView, ApiErrorBody, AuditVerifyResult, DriftView, HostGroupView, HostProfileView,
+    MachineRow, ReviewResultView,
 };
 
 /// Webroot base for placed cloud-init configs (mirrors `machine_plane::seeds`'
@@ -563,6 +565,7 @@ fn build_router(
                 "/api/groups/:name/allocations",
                 get(handle_list_group_allocations),
             )
+            .route("/api/drift", get(handle_list_drift))
             .with_state(state.clone()),
         Role::Viewer,
     );
@@ -599,6 +602,8 @@ fn build_router(
                 post(handle_create_group_profile),
             )
             .route("/api/groups/:name/rebind", post(handle_rebind))
+            .route("/api/drift/:object_id/accept", post(handle_accept_drift))
+            .route("/api/drift/:object_id/revert", post(handle_revert_drift))
             .with_state(state),
         Role::Operator,
     );
@@ -1303,6 +1308,153 @@ async fn handle_rebind(
             // semantics). The error message already names the offending
             // identity.
             validation_error(err.to_string())
+        }
+    }
+}
+
+// ── /api/drift review routes (DS-OPS-02) ──────────────────────────────────
+//
+// A thin HTTP layer over DS-REG-05's `crate::profiles::drift::{scan_drift,
+// accept_drift, revert_drift}` — this module does NOT compute drift, does
+// NOT re-derive "last good version", and does NOT call `audit::record` (both
+// drift.rs actions already audit via `append_in_txn`; a second `record()`
+// call here would double-log against a mutation `record`'s own no-op
+// contract forbids). List at `Role::Viewer`, accept/revert at
+// `Role::Operator` — see `build_router`. The actor for accept/revert is the
+// authenticated session's login (`Extension<auth::Session>`), mirroring
+// `handle_approve_enrollment`/`handle_rebind` above — never a placeholder.
+
+/// The normative note carried on every revert response (see
+/// `api_types::ReviewResultView::note`'s doc): v1 has no re-render, so a
+/// revert changes a stored row and leaves the deployed host exactly as
+/// drifted as it was. An operator who reads "reverted" as "fleet fixed" is
+/// the failure mode this wording exists to prevent (spec D11).
+const REVERT_NOTE: &str = "revert restores the stored INTENT, not the deployed machine: the \
+     host remains exactly as drifted as it was, and re-deploying it to apply this change is a \
+     separate operator action.";
+
+/// Hex-encode `bytes` for the wire (`DriftView::stored_hash`/`actual_hash`).
+/// A local one-liner, not a shared helper — this module's established
+/// per-file-duplication convention (see `now_rfc3339`'s doc above) for a
+/// utility this small.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn drift_to_view(report: &drift::DriftReport) -> DriftView {
+    DriftView {
+        object_kind: report.object_kind.clone(),
+        object_id: report.object_id,
+        stored_hash: hex_encode(&report.stored_hash),
+        actual_hash: hex_encode(&report.actual_hash),
+        seen_count: report.seen_count,
+    }
+}
+
+/// Parse a `:object_id` path segment. A malformed UUID can never name a
+/// known object, so it is reported the same way an unknown-but-well-formed
+/// one is — 404 — rather than a separate 400 branch for what is, from the
+/// caller's perspective, the same "no such object" outcome. Returns `None`
+/// (not `Result<_, Response>`) so this stays a small `Copy` type — clippy's
+/// `result_large_err` flags a `Response`-carrying `Err` variant.
+fn parse_object_id(raw: &str) -> Option<Uuid> {
+    Uuid::parse_str(raw).ok()
+}
+
+/// Maps an `accept_drift`/`revert_drift` `Err` to its HTTP shape per this
+/// task's edge semantics: unknown object (from `find_review_target`) is 404;
+/// "not drifted" and "no good version to revert to" (both from drift.rs,
+/// already naming the object) are 400. drift.rs returns plain `anyhow::Error`
+/// with no typed variants, so this distinguishes by the one message shape
+/// that is actually a lookup failure — every other message these two
+/// functions can produce is a client-facing 400 by construction (each names
+/// the object and the specific reason). A store-level I/O failure inside
+/// `find_review_target`/`list_versions` would also fall through to this 400
+/// branch rather than a 503 — an acknowledged gap (drift.rs has no separate
+/// "store unavailable" error shape to key off of), flagged here rather than
+/// silently mis-mapped.
+fn review_error_response(err: anyhow::Error) -> Response {
+    let message = err.to_string();
+    if message.contains("is not a known host group or profile") {
+        not_found(&message)
+    } else {
+        validation_error(message)
+    }
+}
+
+async fn handle_list_drift(State(state): State<AppState>) -> Response {
+    match drift::scan_drift(state.profile_store.as_ref()).await {
+        Ok(reports) => {
+            let views: Vec<_> = reports.iter().map(drift_to_view).collect();
+            json_response(StatusCode::OK, views)
+        }
+        Err(err) => {
+            tracing::error!(%err, "profile store unreadable scanning for drift");
+            store_unavailable("scanning for drift")
+        }
+    }
+}
+
+async fn handle_accept_drift(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    AxumPath(object_id_raw): AxumPath<String>,
+) -> Response {
+    let Some(object_id) = parse_object_id(&object_id_raw) else {
+        return not_found("unknown object id");
+    };
+    match drift::accept_drift(
+        state.profile_store.as_ref(),
+        state.audit_store.as_ref(),
+        object_id,
+        &session.login,
+    )
+    .await
+    {
+        Ok(row) => json_response(
+            StatusCode::OK,
+            ReviewResultView {
+                object_kind: row.object_kind,
+                object_id: row.object_id,
+                version: row.version,
+                note: None,
+            },
+        ),
+        Err(err) => {
+            tracing::info!(%err, %object_id, "drift accept rejected");
+            review_error_response(err)
+        }
+    }
+}
+
+async fn handle_revert_drift(
+    State(state): State<AppState>,
+    Extension(session): Extension<auth::Session>,
+    AxumPath(object_id_raw): AxumPath<String>,
+) -> Response {
+    let Some(object_id) = parse_object_id(&object_id_raw) else {
+        return not_found("unknown object id");
+    };
+    match drift::revert_drift(
+        state.profile_store.as_ref(),
+        state.audit_store.as_ref(),
+        object_id,
+        &session.login,
+    )
+    .await
+    {
+        Ok(row) => json_response(
+            StatusCode::OK,
+            ReviewResultView {
+                object_kind: row.object_kind,
+                object_id: row.object_id,
+                version: row.version,
+                note: Some(REVERT_NOTE.to_string()),
+            },
+        ),
+        Err(err) => {
+            tracing::info!(%err, %object_id, "drift revert rejected");
+            review_error_response(err)
         }
     }
 }
@@ -2382,5 +2534,260 @@ mod tests {
              fleet from 1), got: {body}"
         );
         assert!(body["message"].is_string());
+    }
+
+    // ── /api/drift (DS-OPS-02) ─────────────────────────────────────────────
+
+    /// A drifted group: stored `content_hash` is the empty vec, which never
+    /// equals the real canonical hash `drift.rs` computes over any actual
+    /// body — so injecting this raw (bypassing `put_group`, which would
+    /// recompute the hash and capture a version) is always drifted, with
+    /// zero captured versions.
+    fn drifted_group_row(id: Uuid) -> HostGroupRow {
+        let mut row = sample_group_row(id, "len-serv", false);
+        row.content_hash = Vec::new();
+        row
+    }
+
+    #[tokio::test]
+    async fn test_drift_review_requires_operator() {
+        let (router, _token, _dir) = test_full_router();
+        let id = Uuid::new_v4();
+
+        for (method, uri) in [
+            ("POST", format!("/api/drift/{id}/accept")),
+            ("POST", format!("/api/drift/{id}/revert")),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must require auth, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drift_list_requires_viewer() {
+        let (router, _token, _dir) = test_full_router();
+        let resp = router.oneshot(get("/api/drift")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_drift_list_empty_is_200_not_404() {
+        // Anti-over-suppression: no drift anywhere must be the healthy 200
+        // [] answer, never a 404 that would read as a broken endpoint.
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(crate::profiles::store::MemProfileStore::new()),
+        );
+
+        let resp = handle_list_drift(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn test_review_non_drifted_object_400() {
+        let dir = tempdir().unwrap();
+        let profile_store: Arc<dyn ProfileStore> =
+            Arc::new(crate::profiles::store::MemProfileStore::new());
+        let id = Uuid::new_v4();
+        // put_group recomputes the hash, so this live row is NOT drifted.
+        profile_store
+            .put_group(sample_group_row(id, "len-serv", false), "op")
+            .await
+            .unwrap();
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            profile_store,
+        );
+
+        let resp = handle_accept_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_json(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("no drift to review") && msg.contains(&id.to_string()),
+            "must name why AND which object, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_without_good_version_400() {
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let id = Uuid::new_v4();
+        // Drifted, but no version was ever captured for it (raw inject, no
+        // put_group) — there is no last-good body to restore.
+        store.inject_group_raw(drifted_group_row(id));
+        let profile_store: Arc<dyn ProfileStore> = Arc::new(store);
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            profile_store,
+        );
+
+        let resp = handle_revert_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let msg = body_json(resp).await["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains(&id.to_string()),
+            "must name the object, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_object_404() {
+        let dir = tempdir().unwrap();
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            Arc::new(crate::profiles::store::MemProfileStore::new()),
+        );
+        let id = Uuid::new_v4();
+
+        let resp = handle_accept_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_accept_on_drifted_object_succeeds() {
+        // Anti-over-suppression: the happy path — an authenticated operator
+        // reviewing an ACTUALLY drifted object — must succeed.
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let id = Uuid::new_v4();
+        store.inject_group_raw(drifted_group_row(id));
+        let profile_store: Arc<dyn ProfileStore> = Arc::new(store);
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            profile_store,
+        );
+
+        let resp = handle_accept_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["object_id"], id.to_string());
+        assert_eq!(body["object_kind"], "host_group");
+        assert!(body["note"].is_null(), "accept must not carry the revert note");
+    }
+
+    #[tokio::test]
+    async fn test_revert_response_states_intent_not_machine() {
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let id = Uuid::new_v4();
+        // A good version exists (captured by put_group), then the live row
+        // is tampered out-of-band — the shape revert_drift needs to succeed.
+        store
+            .put_group(sample_group_row(id, "len-serv", false), "op")
+            .await
+            .unwrap();
+        let mut tampered = sample_group_row(id, "len-serv", false);
+        tampered.content_hash = vec![0xde, 0xad, 0xbe, 0xef];
+        store.inject_group_raw(tampered);
+        let profile_store: Arc<dyn ProfileStore> = Arc::new(store);
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            Arc::new(MemAuditStore::new()),
+            profile_store,
+        );
+
+        let resp = handle_revert_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let note = body["note"].as_str().expect("revert response must carry a note");
+        assert!(
+            note.contains("INTENT") && note.contains("machine") && note.to_lowercase().contains("re-deploy"),
+            "the note must state revert restores intent (not the machine) and that \
+             re-deploying is a separate action, got: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_uses_session_actor() {
+        // The audit event's actor must be the SESSION's login, never a
+        // placeholder — mirrors test_rebind_audited's assertion above.
+        let dir = tempdir().unwrap();
+        let store = crate::profiles::store::MemProfileStore::new();
+        let id = Uuid::new_v4();
+        store.inject_group_raw(drifted_group_row(id));
+        let profile_store: Arc<dyn ProfileStore> = Arc::new(store);
+        let audit_store: Arc<dyn AuditStore> = Arc::new(MemAuditStore::new());
+
+        let state = test_state_with_profile_store(
+            dir.path().to_path_buf(),
+            Arc::new(MockRegistry::default()),
+            audit_store.clone(),
+            profile_store,
+        );
+
+        let resp = handle_accept_drift(
+            State(state),
+            test_session(),
+            AxumPath(id.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = audit_store.list_events(0).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.actor == "test-operator" && e.action == "registry.drift.accept"),
+            "the audit event's actor must be the session's login, not a placeholder"
+        );
     }
 }

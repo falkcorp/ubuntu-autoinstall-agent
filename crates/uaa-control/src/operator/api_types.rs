@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
@@ -125,4 +125,47 @@ pub struct AllocationView {
     pub allocated_at: Option<String>,
     pub released_at: Option<String>,
     pub rebound_to: Option<String>,
+}
+
+// ── Drift review (DS-OPS-02) ──────────────────────────────────────────────
+//
+// Thin `Serialize`-only views over `crate::profiles::drift::DriftReport` /
+// `crate::db::ProfileVersionRow` (DS-REG-05). This module does not compute
+// drift or select a restore target — see `handlers.rs`'s drift section doc.
+
+/// One row from `GET /api/drift` — a currently-drifted group or profile,
+/// mirrored from `crate::profiles::drift::DriftReport`. Aligns with the
+/// SPA's existing `MachineRow.consistent` vocabulary: this row exists
+/// precisely when that boolean would read `false` for the object named here.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftView {
+    pub object_kind: String,
+    pub object_id: uuid::Uuid,
+    /// The object's stored `content_hash`, hex-encoded.
+    pub stored_hash: String,
+    /// The hash actually computed over the live body, hex-encoded. Differs
+    /// from `stored_hash` by definition — that disagreement IS the drift.
+    pub actual_hash: String,
+    pub seen_count: u32,
+}
+
+/// Response of `POST /api/drift/:object_id/accept` and
+/// `POST /api/drift/:object_id/revert` — the freshly appended
+/// `ProfileVersionRow` DS-REG-05's `accept_drift`/`revert_drift` returned.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewResultView {
+    pub object_kind: String,
+    pub object_id: uuid::Uuid,
+    /// The version number of the newly appended row (the adopted/restored
+    /// body), NOT the drift-evidence row `accept_drift`/`revert_drift`
+    /// capture immediately before it.
+    pub version: i64,
+    /// Set ONLY on a revert response. States plainly that this action
+    /// restored the stored INTENT, not the deployed machine: v1 has no
+    /// re-render, so the host stays exactly as drifted as it was, and
+    /// re-deploying it is a separate operator action (spec D11). `None` on
+    /// an accept response, which has no such gap to explain — accepting
+    /// adopts the machine's current (drifted) body as the new intent, so
+    /// intent and machine already agree.
+    pub note: Option<String>,
 }
