@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/store.rs
-// version: 0.4.0
+// version: 0.5.0
 // guid: b0c81b2d-2a46-40e3-855b-408cf3708503
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! `ProfileStore` — per-concern persistence trait for host groups / profiles /
 //! hostname allocations / profile versions (spec `deploy-system-design.md`,
@@ -464,6 +464,27 @@ pub struct MemProfileStore {
 impl MemProfileStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-only: insert/replace a group row EXACTLY as given, WITHOUT
+    /// recomputing its `content_hash` and WITHOUT capturing a version — the way
+    /// an out-of-band edit (a hand-edited snapshot) bypasses `put_group`. Used by
+    /// `profiles::drift`'s tests to manufacture a drifted live row.
+    pub fn inject_group_raw(&self, row: HostGroupRow) {
+        let mut state = self.state.lock().expect("MemProfileStore state poisoned");
+        match state.host_groups.iter_mut().find(|g| g.id == row.id) {
+            Some(existing) => *existing = row,
+            None => state.host_groups.push(row),
+        }
+    }
+
+    /// Test-only profile counterpart to [`inject_group_raw`].
+    pub fn inject_profile_raw(&self, row: HostProfileRow) {
+        let mut state = self.state.lock().expect("MemProfileStore state poisoned");
+        match state.host_profiles.iter_mut().find(|p| p.id == row.id) {
+            Some(existing) => *existing = row,
+            None => state.host_profiles.push(row),
+        }
     }
 }
 
