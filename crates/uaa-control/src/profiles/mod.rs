@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/mod.rs
-// version: 0.1.0
+// version: 0.2.0
 // guid: 10bb9c0d-98ab-48f9-ba74-9f89d1d6443e
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! Host group / profile management (spec `deploy-system-design.md`, DS-REG-01..04).
 //!
@@ -19,4 +19,6 @@
 
 pub mod store;
 pub mod alloc;
+pub mod convert;
 pub mod drift;
+pub mod resolve;

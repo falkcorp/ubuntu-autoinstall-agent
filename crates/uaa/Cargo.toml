@@ -15,6 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 uaa-core = { path = "../uaa-core" }
+# DS-OPS-03: `config place --from-registry` resolves configs via
+# `uaa_control::resolve_from_registry`. Cycle-free — nothing depends on this
+# binary crate, so uaa -> uaa-control -> uaa-core is a clean DAG (verified by
+# `cargo build`).
+uaa-control = { path = "../uaa-control" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

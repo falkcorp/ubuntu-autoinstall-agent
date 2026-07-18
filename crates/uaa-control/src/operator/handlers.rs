@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.7.0
+// version: 1.8.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
 // last-edited: 2026-07-18
 
@@ -75,6 +75,8 @@ use ring::rand::SecureRandom;
 use uaa_core::network::ssh_installer::config::ApplicationSpec;
 use uaa_core::profile::validate::validate as validate_profiles;
 use uaa_core::profile::{HostGroupProfile, HostProfile, InstallationConfigPartial};
+
+use crate::profiles::convert::{group_row_to_profile, profile_row_to_profile};
 
 use super::api_types::{
     AllocationView, ApiErrorBody, AuditVerifyResult, DriftView, HostGroupView, HostProfileView,
@@ -944,56 +946,10 @@ fn allocation_to_view(row: &HostnameAllocationRow) -> AllocationView {
     }
 }
 
-/// Deserializes a stored group row's `defaults`/`applications` JSON back into
-/// the typed `uaa_core::profile::HostGroupProfile` `profile::validate`
-/// operates on. An `Err` here means the store holds a row this handler
-/// itself never could have written (every write path serializes FROM these
-/// same types) — surfaced by the caller as a 500, not a 400, since it is not
-/// the current request's fault.
-fn group_row_to_profile(row: &HostGroupRow) -> Result<HostGroupProfile, String> {
-    let defaults: InstallationConfigPartial = serde_json::from_value(row.defaults.clone())
-        .map_err(|e| format!("group {:?}: stored defaults failed to parse: {e}", row.name))?;
-    let applications: Vec<ApplicationSpec> = serde_json::from_value(row.applications.clone())
-        .map_err(|e| {
-            format!(
-                "group {:?}: stored applications failed to parse: {e}",
-                row.name
-            )
-        })?;
-    Ok(HostGroupProfile {
-        name: row.name.clone(),
-        hostname_pattern: row.hostname_pattern.clone(),
-        is_standalone: row.is_standalone,
-        defaults,
-        applications,
-    })
-}
-
-/// Same as [`group_row_to_profile`] but for a profile row; `group_name` is
-/// resolved by the caller (a `HostProfileRow` only carries `group_id`).
-fn profile_row_to_profile(row: &HostProfileRow, group_name: &str) -> Result<HostProfile, String> {
-    let overrides: InstallationConfigPartial = serde_json::from_value(row.overrides.clone())
-        .map_err(|e| {
-            format!(
-                "host {:?}: stored overrides failed to parse: {e}",
-                row.identity
-            )
-        })?;
-    let applications: Vec<ApplicationSpec> = serde_json::from_value(row.applications.clone())
-        .map_err(|e| {
-            format!(
-                "host {:?}: stored applications failed to parse: {e}",
-                row.identity
-            )
-        })?;
-    Ok(HostProfile {
-        group_name: group_name.to_string(),
-        identity: row.identity.clone(),
-        hostname_override: row.hostname_override.clone(),
-        overrides,
-        applications,
-    })
-}
+// `group_row_to_profile` / `profile_row_to_profile` were relocated to
+// `crate::profiles::convert` (DS-OPS-03) so registry resolution
+// (`resolve_from_registry`) can share them without depending on this HTTP
+// handler module. They remain `pub(crate)` — never `pub`. Imported at the top.
 
 /// Every group + every profile currently in the store (needed because
 /// `profile::validate`'s global hostname-uniqueness check spans ALL groups,
