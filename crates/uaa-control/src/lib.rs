@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/lib.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: 377e6bf2-0687-480d-a7f4-7bd21c525206
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! uaa-control — the constellation's central daemon (spec component C3).
 //!
@@ -32,3 +32,7 @@ pub mod operator; // CT-07
 pub mod profiles; // DS-REG-01..04
 pub mod reinstall; // CT-06
 pub mod saga; // CT-05
+
+/// Registry resolution for `uaa config place --from-registry` (DS-OPS-03),
+/// re-exported so the `uaa` binary can call `uaa_control::resolve_from_registry`.
+pub use profiles::resolve::resolve_from_registry;

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.7.0
+// version: 2.8.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-17
+// last-edited: 2026-07-18
 
 //! Configuration structures for SSH/local installation
 
@@ -141,7 +141,15 @@ pub struct InstallationConfig {
     pub install_ca_cert: String,
     /// Applications to install into the target during Phase 5. Empty = none,
     /// which is exactly today's behavior for every committed host config.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` omits the key entirely for an app-free host so a
+    /// serialized (registry-resolved) config is byte-safe across a control
+    /// rollback: a placed config that never gained an `applications:` key can
+    /// still be parsed by an older `uaa install` binary whose
+    /// `InstallationConfig` (deny_unknown_fields) predates the field. Without
+    /// this, an app-free host would serialize `applications: []` and trip a
+    /// fail-closed parse on every PXE after a rollback (DS-OPS-03).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applications: Vec<ApplicationSpec>,
 }
 
@@ -452,6 +460,22 @@ network_nameservers: ["10.0.0.1"]
     #[test]
     fn test_applications_empty_is_todays_behavior() {
         assert!(InstallationConfig::for_len_serv_003().applications.is_empty());
+    }
+
+    #[test]
+    fn test_app_free_host_omits_applications_key() {
+        // Cross-version rollback safety (DS-OPS-03): a host with no
+        // applications must serialize WITHOUT an `applications:` key at all, so
+        // a rolled-back `uaa install` binary (whose deny_unknown_fields
+        // InstallationConfig predates the field) still parses the placed file
+        // instead of hitting a fail-closed parse on every PXE.
+        let cfg = InstallationConfig::for_len_serv_003();
+        assert!(cfg.applications.is_empty(), "fixture must be app-free");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("applications"),
+            "an app-free host must omit the applications key entirely, got:\n{yaml}"
+        );
     }
 
     #[test]

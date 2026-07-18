@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/config_place.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: 0f2da210-310d-48f5-8c58-1b95bd3c6d45
-// last-edited: 2026-07-16
+// last-edited: 2026-07-18
 
 //! Config placement — server-local port of `scripts/deploy-usb-configs.sh` (v1.1.0).
 //!
@@ -310,6 +310,23 @@ pub struct PlaceOptions {
     /// unconditionally (not a secret — see [`inject_install_ca_cert`]).
     /// Defaults to [`DEFAULT_INSTALL_CA_CERT_PATH`]; overridable for tests.
     pub install_ca_cert_path: PathBuf,
+    /// Pre-resolved per-host configs, keyed by host, when placing
+    /// `--from-registry` (DS-OPS-03). `None` = today's behavior exactly:
+    /// each host's config is read from `<src_dir>/<host>.yaml`. `Some` = the
+    /// config source is the already-resolved [`InstallationConfig`] (resolution
+    /// itself lives in `uaa-control`; this crate has no dependency on it, so the
+    /// resolved values are handed in rather than computed here), serialized to
+    /// YAML and fed through the SAME injection + hard-gate pipeline. Resolution
+    /// is all-or-nothing at the caller: this vec is only ever populated when
+    /// EVERY requested host resolved, so a half-resolved fleet never reaches
+    /// placement.
+    pub from_registry: Option<Vec<(String, InstallationConfig)>>,
+    /// Dry-run guard for the `--from-registry` path (DS-OPS-03). Defaults ON at
+    /// the CLI whenever `--from-registry` is passed: with it set, placement
+    /// computes and records a resolved-vs-committed diff and writes NOTHING. An
+    /// explicit `--no-dry-run` clears it to actually write. Ignored on the
+    /// non-registry path (that path is unchanged from today).
+    pub dry_run: bool,
 }
 
 /// Outcome of a placement run. Overall `Ok` even with refusals; the CLI maps a
@@ -320,6 +337,12 @@ pub struct PlaceReport {
     pub placed: Vec<String>,
     /// `(host, reason)` per refused host. A reason NEVER contains a secret value.
     pub refused: Vec<(String, String)>,
+    /// `(host, unified_diff)` per host previewed under a `--from-registry`
+    /// dry-run (DS-OPS-03). Populated ONLY on the dry-run path; empty on a real
+    /// placement. The diff is resolved-vs-committed and carries NO injected
+    /// secret — it is computed on the pre-injection serialized config, whose
+    /// secret slots are still `REPLACE_AT_PLACE_TIME` placeholders.
+    pub dry_run_diffs: Vec<(String, String)>,
 }
 
 impl PlaceReport {
@@ -327,6 +350,52 @@ impl PlaceReport {
     pub fn is_success(&self) -> bool {
         self.refused.is_empty()
     }
+}
+
+/// Minimal line-based diff of `old` vs `new` (no external crate). Equal lines
+/// carry a leading space, removals a `-`, additions a `+` — the shape an
+/// operator reviews before flipping `--from-registry` for real. Uses a plain
+/// LCS so insertions/removals line up rather than smearing every line after the
+/// first change. Only ever fed pre-injection text, so it never carries a secret.
+fn unified_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let (n, m) = (a.len(), b.len());
+
+    // lcs[i][j] = length of the longest common subsequence of a[i..] and b[j..].
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push(format!(" {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push(format!("-{}", a[i]));
+            i += 1;
+        } else {
+            out.push(format!("+{}", b[j]));
+            j += 1;
+        }
+    }
+    for line in &a[i..] {
+        out.push(format!("-{line}"));
+    }
+    for line in &b[j..] {
+        out.push(format!("+{line}"));
+    }
+    out.join("\n")
 }
 
 /// Server-local placement driver. Ports the shell script's whole-run secrets
@@ -360,6 +429,15 @@ pub fn place_configs(opts: &PlaceOptions) -> Result<PlaceReport> {
     let mut report = PlaceReport::default();
     for host in &hosts {
         // Unknown host → REFUSED (per-host, not a global abort).
+        //
+        // NOTE (DS-OPS-03 limitation): the dest hexmac still comes from the
+        // hardcoded `mac_for_host` map, even on the `--from-registry` path. A
+        // host present in the registry but absent from this 4-entry map
+        // resolves fine yet is refused HERE — so the brief's "registry host not
+        // in KNOWN_HOSTS is placeable" edge is not fully delivered. The real fix
+        // is to thread the allocation's `identity` (which IS the MAC) from
+        // `resolve_from_registry` through to placement; deferred as a follow-up
+        // (the operator-gated production scope is the four mapped fleet hosts).
         let mac = match mac_for_host(host) {
             Some(m) => m,
             None => {
@@ -371,14 +449,56 @@ pub fn place_configs(opts: &PlaceOptions) -> Result<PlaceReport> {
             }
         };
 
+        // Config source: the pre-resolved registry config (`--from-registry`)
+        // vs the committed `<host>.yaml` on disk (today's path). `src` is
+        // computed for both — the dry-run diff below compares the resolved
+        // config against this committed file.
         let src = opts.src_dir.join(format!("{host}.yaml"));
-        if !src.is_file() {
+        let config_text = match &opts.from_registry {
+            Some(resolved) => match resolved.iter().find(|(h, _)| h == host) {
+                Some((_, cfg)) => match serde_yaml::to_string(cfg) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        report.refused.push((
+                            host.clone(),
+                            format!("resolved config failed to serialize: {e}"),
+                        ));
+                        continue;
+                    }
+                },
+                None => {
+                    // The caller resolves EVERY requested host before placement,
+                    // so this is a programming error, not a partial fleet —
+                    // refuse loudly rather than silently place a stale file.
+                    report.refused.push((
+                        host.clone(),
+                        "no resolved config supplied for host".to_string(),
+                    ));
+                    continue;
+                }
+            },
+            None => {
+                if !src.is_file() {
+                    report
+                        .refused
+                        .push((host.clone(), format!("source not found: {}", src.display())));
+                    continue;
+                }
+                fs::read_to_string(&src)?
+            }
+        };
+
+        // Dry-run (the `--from-registry` default): record a resolved-vs-committed
+        // diff and write NOTHING. Computed on the PRE-injection text, whose
+        // secret slots are still `REPLACE_AT_PLACE_TIME`, so the diff never
+        // carries a secret value.
+        if opts.dry_run {
+            let committed = fs::read_to_string(&src).unwrap_or_default();
             report
-                .refused
-                .push((host.clone(), format!("source not found: {}", src.display())));
+                .dry_run_diffs
+                .push((host.clone(), unified_diff(&committed, &config_text)));
             continue;
         }
-        let config_text = fs::read_to_string(&src)?;
 
         // Stage into a 0600 NamedTempFile when injecting. `_staged` keeps the temp
         // file alive (and 0600) through placement, then drops (cleans up) on exit.
@@ -426,6 +546,14 @@ pub fn place_configs(opts: &PlaceOptions) -> Result<PlaceReport> {
         let dest_dir = opts.dest_base.join(hexmac(mac));
         fs::create_dir_all(&dest_dir)?;
         let dest_file = dest_dir.join("uaa.yaml");
+        // `.bak` BEFORE every overwrite on the `--from-registry` path
+        // (DS-OPS-03): preserve the previous `uaa.yaml` so rolling back a
+        // registry-driven mass placement is an inverse copy, not a
+        // re-derivation. Gated to the registry path so today's non-registry
+        // placement stays byte-identical (it writes no `.bak`).
+        if opts.from_registry.is_some() && dest_file.exists() {
+            fs::copy(&dest_file, dest_dir.join("uaa.yaml.bak"))?;
+        }
         fs::write(&dest_file, final_text.as_bytes())?;
         fs::set_permissions(&dest_file, fs::Permissions::from_mode(0o644))?;
 
@@ -565,6 +693,8 @@ mod tests {
             inject_from: None,
             hosts: vec!["len-serv-001".to_string()],
             install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+            from_registry: None,
+            dry_run: false,
         };
         let report = place_configs(&opts).unwrap();
 
@@ -597,6 +727,8 @@ mod tests {
                 "len-serv-001".to_string(),
             ],
             install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+            from_registry: None,
+            dry_run: false,
         };
         let report = place_configs(&opts).unwrap();
 
@@ -619,6 +751,8 @@ mod tests {
                 inject_from: None,
                 hosts: vec!["len-serv-001".to_string()],
                 install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+                from_registry: None,
+                dry_run: false,
             };
             let err = place_configs(&opts).unwrap_err();
             assert!(
@@ -651,6 +785,8 @@ mod tests {
             inject_from: Some(secrets_path.clone()),
             hosts: vec!["len-serv-001".to_string()],
             install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+            from_registry: None,
+            dry_run: false,
         };
         let report = place_configs(&opts).unwrap();
 
@@ -693,6 +829,8 @@ mod tests {
             inject_from: Some(secrets_path),
             hosts: vec!["len-serv-001".to_string()],
             install_ca_cert_path: ca_path,
+            from_registry: None,
+            dry_run: false,
         };
         let report = place_configs(&opts).unwrap();
 
@@ -740,5 +878,174 @@ mod tests {
         let config = "hostname: x\ninstall_ca_cert: REPLACE_AT_PLACE_TIME\n";
         let out = inject_install_ca_cert(config, Path::new("/nonexistent/ca.crt"));
         assert_eq!(out, config, "missing CA file must leave the placeholder untouched");
+    }
+
+    // ── DS-OPS-03: the PLACE side of `config place --from-registry` ──────────
+    //
+    // RESOLVE (registry → InstallationConfig) lives in `uaa-control`; this crate
+    // has no dependency on it (that would be a cycle), so these tests hand a
+    // pre-resolved `InstallationConfig` in via `PlaceOptions::from_registry` —
+    // exactly what the `uaa` CLI does after resolving. The resolution-side tests
+    // (all-or-nothing, known-host-missing, resolved==committed M2 gate) live in
+    // `uaa-control`, where the profile store is reachable.
+
+    #[test]
+    fn test_default_path_unchanged() {
+        // With `from_registry: None`, placement reads the committed
+        // `<host>.yaml` and writes it byte-for-byte (no secrets, no CA slot):
+        // exactly today's behavior. Crucially, NO `.bak` is written on this
+        // path — the backup is a `--from-registry`-only safeguard.
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let source_yaml = valid_config("len-serv-001");
+        fs::write(src.path().join("len-serv-001.yaml"), &source_yaml).unwrap();
+
+        let opts = PlaceOptions {
+            src_dir: src.path().to_path_buf(),
+            dest_base: dest.path().to_path_buf(),
+            inject_from: None,
+            hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+            from_registry: None,
+            dry_run: false,
+        };
+        let report = place_configs(&opts).unwrap();
+
+        assert!(report.is_success(), "refused: {:?}", report.refused);
+        let placed = dest.path().join("6c4b90bc39b3").join("uaa.yaml");
+        assert_eq!(
+            fs::read_to_string(&placed).unwrap(),
+            source_yaml,
+            "default path must be byte-identical to the committed source"
+        );
+        assert!(
+            !dest.path().join("6c4b90bc39b3").join("uaa.yaml.bak").exists(),
+            "the non-registry path must never write a .bak"
+        );
+    }
+
+    #[test]
+    fn test_from_registry_dry_run_writes_nothing() {
+        // `--from-registry` with dry-run ON (the default): a diff is recorded
+        // per host and the destination stays EMPTY.
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        // A committed source to diff against (proves the diff path runs).
+        fs::write(src.path().join("len-serv-001.yaml"), valid_config("len-serv-001")).unwrap();
+        let resolved: InstallationConfig =
+            serde_yaml::from_str(&valid_config("len-serv-001")).unwrap();
+
+        let opts = PlaceOptions {
+            src_dir: src.path().to_path_buf(),
+            dest_base: dest.path().to_path_buf(),
+            inject_from: None,
+            hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: PathBuf::from("/nonexistent/ca.crt"),
+            from_registry: Some(vec![("len-serv-001".to_string(), resolved)]),
+            dry_run: true,
+        };
+        let report = place_configs(&opts).unwrap();
+
+        assert!(report.placed.is_empty(), "dry-run must place nothing");
+        assert!(
+            fs::read_dir(dest.path()).unwrap().next().is_none(),
+            "dry-run must write NOTHING under dest"
+        );
+        assert_eq!(report.dry_run_diffs.len(), 1, "a diff must be recorded per host");
+        assert_eq!(report.dry_run_diffs[0].0, "len-serv-001");
+    }
+
+    #[test]
+    fn test_from_registry_writes_bak_before_overwrite() {
+        // The happy-path proof that `--no-dry-run` DOES write, and safely: an
+        // existing `uaa.yaml` is copied to `uaa.yaml.bak` (old bytes) BEFORE the
+        // new resolved config overwrites it. Without this, dry-run-by-default
+        // could silently no-op every real placement while negatives still pass.
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let dest_dir = dest.path().join("6c4b90bc39b3");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let old_bytes = "hostname: OLD-PLACED-CONFIG\n";
+        fs::write(dest_dir.join("uaa.yaml"), old_bytes).unwrap();
+
+        // A parsed config defaults `install_ca_cert` to the PLACEHOLDER, so
+        // supply a real CA to fill it (else the hard gate refuses, and nothing
+        // is written — which would defeat the point of this write-path test).
+        let ca_path = src.path().join("ca.crt");
+        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        let resolved: InstallationConfig =
+            serde_yaml::from_str(&valid_config("len-serv-001")).unwrap();
+        let opts = PlaceOptions {
+            src_dir: src.path().to_path_buf(),
+            dest_base: dest.path().to_path_buf(),
+            inject_from: None,
+            hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: ca_path,
+            from_registry: Some(vec![("len-serv-001".to_string(), resolved)]),
+            dry_run: false,
+        };
+        let report = place_configs(&opts).unwrap();
+
+        assert!(report.is_success(), "refused: {:?}", report.refused);
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("uaa.yaml.bak")).unwrap(),
+            old_bytes,
+            ".bak must hold the exact pre-overwrite bytes"
+        );
+        let new_content = fs::read_to_string(dest_dir.join("uaa.yaml")).unwrap();
+        assert!(new_content.contains("len-serv-001"), "uaa.yaml holds the newly placed config");
+        assert_ne!(new_content, old_bytes, "uaa.yaml must have been overwritten");
+    }
+
+    #[test]
+    fn test_resolved_config_still_injectable() {
+        // A registry-resolved config still carries REPLACE_AT_PLACE_TIME in its
+        // secret slots (they come from the group defaults). Serializing it must
+        // produce the EXACT `key: REPLACE_AT_PLACE_TIME` line shape
+        // `inject_secrets` keys on and the EXACT `install_ca_cert:
+        // REPLACE_AT_PLACE_TIME` string `inject_install_ca_cert` matches —
+        // otherwise injection silently finds nothing and the PLACEHOLDER hard
+        // gate refuses the host. This is a DELIBERATE fail-closed property,
+        // asserted end to end rather than relied on by luck.
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let secrets_dir = tempfile::tempdir().unwrap();
+        let secrets_path = write_secrets(
+            secrets_dir.path(),
+            "len-serv-001:\n  \
+             luks_key: \"test-passphrase\"\n  \
+             root_password: test-root-pass\n  \
+             tpm2_pin: \"12345678\"\n",
+        );
+        let ca_path = secrets_dir.path().join("ca.crt");
+        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
+            .unwrap();
+
+        // A resolved config carrying placeholders, as `merge` produces from
+        // group defaults of REPLACE_AT_PLACE_TIME.
+        let resolved: InstallationConfig =
+            serde_yaml::from_str(&placeholder_config("len-serv-001")).unwrap();
+
+        let opts = PlaceOptions {
+            src_dir: src.path().to_path_buf(),
+            dest_base: dest.path().to_path_buf(),
+            inject_from: Some(secrets_path),
+            hosts: vec!["len-serv-001".to_string()],
+            install_ca_cert_path: ca_path,
+            from_registry: Some(vec![("len-serv-001".to_string(), resolved)]),
+            dry_run: false,
+        };
+        let report = place_configs(&opts).unwrap();
+
+        assert!(report.is_success(), "refused: {:?}", report.refused);
+        let placed = dest.path().join("6c4b90bc39b3").join("uaa.yaml");
+        let content = fs::read_to_string(&placed).unwrap();
+        assert!(
+            !content.contains(PLACEHOLDER),
+            "the hard gate must see no leftover placeholder in the serialized resolved config"
+        );
+        assert!(content.contains("test-passphrase"), "secret injected into serialized resolved config");
+        assert!(content.contains("-----BEGIN CERTIFICATE-----"), "CA injected into serialized resolved config");
     }
 }
