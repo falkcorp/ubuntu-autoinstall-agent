@@ -1,18 +1,23 @@
 // file: web/src/api/client.ts
-// version: 1.1.0
+// version: 1.2.0
 // guid: a7e23f11-4508-4940-aa29-8b66b7a3d28d
-// last-edited: 2026-07-13
+// last-edited: 2026-07-18
 
 import {
   ApiError,
   ForbiddenError,
+  type AllocationView,
   type ApiErrorBody,
   type AuditEventRow,
   type AuditVerifyResult,
   type AuthStatus,
   type DiscoveredMacRow,
+  type DriftView,
   type EnrollmentRow,
+  type HostGroupView,
+  type HostProfileView,
   type MachineRow,
+  type ReviewResultView,
 } from "./types";
 
 export { ApiError, ForbiddenError };
@@ -186,4 +191,36 @@ export async function bootstrapLogin(token: string): Promise<void> {
 /** Admin-only: permanently retires the bootstrap-token login path. */
 export function disableBootstrapToken(): Promise<void> {
   return apiFetch<void>("/api/auth/bootstrap/disable", { method: "POST" });
+}
+
+// ---- Profiles (DS-OPS-01) --------------------------------------------------
+
+export function getGroups(): Promise<HostGroupView[]> {
+  return apiFetch<HostGroupView[]>("/api/groups");
+}
+
+export function getGroupProfiles(name: string): Promise<HostProfileView[]> {
+  return apiFetch<HostProfileView[]>(`/api/groups/${encodeURIComponent(name)}/profiles`);
+}
+
+export function getAllocations(name: string): Promise<AllocationView[]> {
+  return apiFetch<AllocationView[]>(`/api/groups/${encodeURIComponent(name)}/allocations`);
+}
+
+// ---- Drift review (DS-OPS-02) -----------------------------------------------
+
+export function getDrift(): Promise<DriftView[]> {
+  return apiFetch<DriftView[]>("/api/drift");
+}
+
+export function acceptDrift(objectId: string): Promise<ReviewResultView> {
+  return apiFetch<ReviewResultView>(`/api/drift/${encodeURIComponent(objectId)}/accept`, {
+    method: "POST",
+  });
+}
+
+export function revertDrift(objectId: string): Promise<ReviewResultView> {
+  return apiFetch<ReviewResultView>(`/api/drift/${encodeURIComponent(objectId)}/revert`, {
+    method: "POST",
+  });
 }

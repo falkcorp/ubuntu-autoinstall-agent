@@ -1,7 +1,7 @@
 // file: web/src/api/types.ts
-// version: 1.1.0
+// version: 1.2.0
 // guid: b7bd1fea-0d99-4db5-a81c-6d6b2a8e9100
-// last-edited: 2026-07-13
+// last-edited: 2026-07-18
 
 // Typed DTOs mirroring CT-07's operator API responses. Names are kept
 // identical to CT-07's api_types.rs (MachineRow, EnrollmentRow,
@@ -82,4 +82,65 @@ export class ForbiddenError extends Error {
     super(message);
     this.name = "ForbiddenError";
   }
+}
+
+// ── Profiles (DS-OPS-01) ──────────────────────────────────────────────────
+
+/** Application freshness state — computed client-side from last_app_status_at. */
+export type Freshness = "fresh" | "stale" | "never_reported";
+
+/** One row from GET /api/groups (DS-OPS-01). */
+export interface HostGroupView {
+  id: string;
+  name: string;
+  hostname_pattern: string;
+  is_standalone: boolean;
+  defaults: Record<string, unknown>;
+  applications: Record<string, unknown>;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** One row from GET /api/groups/:name/profiles (DS-OPS-01). */
+export interface HostProfileView {
+  id: string;
+  group_id: string;
+  identity: string;
+  hostname_override: string | null;
+  overrides: Record<string, unknown>;
+  applications: Record<string, unknown>;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** One row from GET /api/groups/:name/allocations (DS-OPS-01). */
+export interface AllocationView {
+  identity: string;
+  index: number;
+  hostname: string;
+  allocated_at: string | null;
+  released_at: string | null;
+  rebound_to: string | null;
+}
+
+// ── Drift review (DS-OPS-02) ──────────────────────────────────────────────
+
+/** One row from GET /api/drift — a currently-drifted group or profile (DS-OPS-02). */
+export interface DriftView {
+  object_kind: string;
+  object_id: string;
+  stored_hash: string;
+  actual_hash: string;
+  seen_count: number;
+}
+
+/** Response of POST /api/drift/:object_id/accept and POST /api/drift/:object_id/revert (DS-OPS-02). */
+export interface ReviewResultView {
+  object_kind: string;
+  object_id: string;
+  version: number;
+  /** Set ONLY on a revert response; explains that revert restores stored INTENT, not the deployed machine. */
+  note: string | null;
 }
