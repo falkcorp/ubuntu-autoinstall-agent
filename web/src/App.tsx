@@ -1,7 +1,7 @@
 // file: web/src/App.tsx
-// version: 2.0.0
+// version: 2.1.0
 // guid: c0b0d2e6-02e2-4339-b513-0aeac8387103
-// last-edited: 2026-07-14
+// last-edited: 2026-07-18
 
 import { useEffect, useState } from "react";
 import { NavLink, Route, Routes, useLocation } from "react-router-dom";
@@ -9,6 +9,8 @@ import Machines from "./pages/Machines";
 import Approvals from "./pages/Approvals";
 import Discovery from "./pages/Discovery";
 import Audit from "./pages/Audit";
+import Profiles from "./pages/Profiles";
+import Drift from "./pages/Drift";
 import Login from "./pages/Login";
 
 const SIDEBAR_PINNED_KEY = "uaa-sidebar-pinned";
@@ -16,6 +18,8 @@ const SIDEBAR_PINNED_KEY = "uaa-sidebar-pinned";
 const NAV_ITEMS = [
   { to: "/machines", label: "Machines", icon: IconServer },
   { to: "/approvals", label: "Pending approvals", icon: IconCheck },
+  { to: "/profiles", label: "Profiles", icon: IconProfiles },
+  { to: "/drift", label: "Drift review", icon: IconDrift },
   { to: "/discovery", label: "Discovery inbox", icon: IconRadar },
   { to: "/audit", label: "Audit", icon: IconShield },
 ];
@@ -55,6 +59,29 @@ function IconShield(): JSX.Element {
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
       <path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z" strokeLinejoin="round" />
       <path d="M9 12l2 2 4-4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function IconProfiles(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="8" cy="7" r="2" />
+      <circle cx="16" cy="7" r="2" />
+      <path d="M6 11c-1.5 0-2 1-2 2.5v2c0 .5.5 1 1 1h3" strokeLinecap="round" />
+      <path d="M18 11c1.5 0 2 1 2 2.5v2c0 .5-.5 1-1 1h-3" strokeLinecap="round" />
+      <circle cx="12" cy="17" r="2" />
+      <path d="M10 21c-1 0-2 .5-2 1.5v1c0 .5.5 1 1 1h6c.5 0 1-.5 1-1v-1c0-1-1-1.5-2-1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function IconDrift(): JSX.Element {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 5v7l5 3" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M8 8l2-2m6 0l2 2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -144,6 +171,8 @@ const TITLES: Record<string, string> = {
   "/": "Machines",
   "/machines": "Machines",
   "/approvals": "Pending approvals",
+  "/profiles": "Profiles",
+  "/drift": "Drift review",
   "/discovery": "Discovery inbox",
   "/audit": "Audit log",
 };
@@ -190,6 +219,8 @@ export default function App(): JSX.Element {
               <Route path="/" element={<Machines />} />
               <Route path="/machines" element={<Machines />} />
               <Route path="/approvals" element={<Approvals />} />
+              <Route path="/profiles" element={<Profiles />} />
+              <Route path="/drift" element={<Drift />} />
               <Route path="/discovery" element={<Discovery />} />
               <Route path="/audit" element={<Audit />} />
             </Routes>
