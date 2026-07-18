@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.0.1
+# version: 1.1.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
 # last-edited: 2026-07-17
 #
@@ -529,6 +529,30 @@ else
     echo "FAIL: multi-user not reached — is-system-running: $MU_OUT, multi-user.target: $MU_ALT" | tee -a "$ASSERT_LOG"
     fail_stage 6 "system did not reach multi-user (is-system-running nor multi-user.target active)"
   fi
+fi
+
+# CockroachDB readiness. Deliberately not a `systemctl is-active` check on
+# the cockroach unit: cockroach.service has Restart=always, so a node that
+# starts, fails to join a cluster, and retries forever sits "active
+# (running)" indefinitely — is-active would pass on a node that never
+# actually joined. The gate must prove readiness: the node answers SQL.
+# Bounded 30x5s (150s) retry so a slow-but-healthy start is not failed
+# (anti-over-suppression), while a target with no Cockroach installed at
+# all still fails (never skips).
+CRDB_READY=""
+for _ in $(seq 1 30); do
+  if ssh_run 15 root "cockroach sql --certs-dir=/var/lib/cockroach/certs --host=10.0.2.15:36257 -e 'SELECT 1'" >>"$ASSERT_LOG" 2>&1; then
+    CRDB_READY=yes
+    break
+  fi
+  sleep 5
+done
+if [ -n "$CRDB_READY" ]; then
+  echo "PASS: cockroach answers SELECT 1 (node is ready)" | tee -a "$ASSERT_LOG"
+else
+  ssh_run 15 root "systemctl status cockroach --no-pager" >>"$ASSERT_LOG" 2>&1 || true
+  ssh_run 15 root "journalctl -u cockroach --no-pager -n 50" >>"$ASSERT_LOG" 2>&1 || true
+  fail_stage 6 "cockroach never became ready (SELECT 1 failed for 150s) — see $ASSERT_LOG"
 fi
 
 # =========================================================================

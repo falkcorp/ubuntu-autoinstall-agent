@@ -1,7 +1,7 @@
 # file: examples/configs/install/vm-test.yaml
-# version: 1.1.0
+# version: 1.2.0
 # guid: 30aa53fe-528c-4b04-a29e-a5e3b71d2a54
-# last-edited: 2026-07-16
+# last-edited: 2026-07-17
 #
 # ============================================================================
 # THROWAWAY VM-ONLY TEST SECRETS — NOT REAL. Never use on hardware.
@@ -38,9 +38,9 @@ root_password: vm-test-throwaway-root-pw-NOT-A-REAL-SECRET
 
 # Fake, not a real cert — never used to validate anything, just exercises
 # Phase 5's /etc/uaa/install-ca.crt write end-to-end in the VM gate. A
-# literal REPLACE_AT_PLACE_TIME would trip the gate's placeholder check
-# (vm_validate.rs), so this uses a throwaway value instead, same as the
-# other secrets in this file.
+# literal unsubstituted placeholder token would trip the gate's placeholder
+# check (vm_validate.rs), so this uses a throwaway value instead, same as
+# the other secrets in this file.
 install_ca_cert: |
   -----BEGIN CERTIFICATE-----
   VMTESTFAKECERTNOTAREALSECRET
@@ -62,8 +62,8 @@ debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
 initramfs_type: dracut
 
 # Tang network unlock is a v1 non-goal for the VM gate (docs/specs/qemu-validation-design.md
-# Non-goals). Empty list — do NOT point this at the real Tang servers
-# (172.16.2.45-47); those protect real hardware, not a throwaway VM disk.
+# Non-goals). Empty list — do NOT point this at the real fleet Tang
+# servers; those protect real hardware, not a throwaway VM disk.
 tang_servers: []
 
 # Same operator key already committed in installer-image/nocloud/user-data
@@ -83,3 +83,11 @@ tpm2_pcr_ids: "7"
 
 # No YubiKey in a VM.
 expect_fido2: false
+
+# Single-node CockroachDB so the QEMU gate actually exercises the Phase-5
+# application path. seed_ip is this VM itself: a one-node cluster seeds
+# itself. VM-only values — never copy the fleet's locality here.
+applications:
+  - kind: cockroach
+    seed_ip: 10.0.2.15
+    locality: region=vm,cluster-unit=qemu
