@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-18
+// last-edited: 2026-07-19
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
@@ -10,7 +10,7 @@
 //! reduced+augmented view (adds `consistent`, drops the WAL-only fields),
 //! not the full persisted row.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One row from `GET /api/machines` and `GET /api/machines/{mac}`.
 #[derive(Debug, Clone, Serialize)]
@@ -41,7 +41,12 @@ pub struct EnrollmentRow {
 }
 
 /// One row from `GET /api/discovered` (unknown PXE MACs / discovery inbox).
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` (unlike its sibling view types) because this row is not just
+/// an API projection: it is the on-disk shape persisted to
+/// `discovered-macs.json` by [`crate::discovered::DiscoveredStore`], so it must
+/// round-trip back in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredMacRow {
     pub mac: String,
     pub first_seen: String,

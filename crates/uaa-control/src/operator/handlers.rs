@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.8.0
+// version: 1.9.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-18
+// last-edited: 2026-07-19
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -13,9 +13,9 @@
 //! /api/audit`, `GET /api/audit/verify`) are ALSO now real — wired against
 //! PK-01's `crate::enroll` state machine and CT-01's `crate::audit` chain,
 //! the same logic + tests that already existed, just not previously exposed
-//! over HTTP. Discovery (`GET /api/discovered`, dismiss) is still stubbed:
-//! unlike enrollments/audit, no backend exists ANYWHERE in the crate yet for
-//! `discovered_macs` — this is unbuilt feature work, not a wiring gap.
+//! over HTTP. Discovery (`GET /api/discovered`, dismiss) is now backed by
+//! `crate::discovered`'s file store (`discovered-macs.json`), fed by the
+//! dnsmasq-journal follower's ingest on the machine plane.
 //!
 //! Enrollments/audit currently run against IN-MEMORY stores
 //! ([`crate::enroll::MemEnrollmentStore`], [`crate::audit::MemAuditStore`]),
@@ -781,20 +781,24 @@ async fn handle_reject_enrollment(
     }
 }
 
-// ── Stub: discovery (no backend exists anywhere in the crate yet) ────────
+// ── /api/discovered (real, against crate::discovered's file-backed inbox) ──
+//
+// Backed by `discovered-macs.json`, populated on the machine plane (:25000) by
+// the ARP/NDP neighbor-table scanner's `POST /api/discovered`. See `crate::discovered`.
 
 async fn handle_list_discovered(State(_state): State<AppState>) -> Response {
-    json_response(
-        StatusCode::OK,
-        Vec::<super::api_types::DiscoveredMacRow>::new(),
-    )
+    json_response(StatusCode::OK, crate::discovered::DiscoveredStore::default().list())
 }
 
 async fn handle_dismiss_discovered(
     State(_state): State<AppState>,
-    AxumPath(_mac): AxumPath<String>,
+    AxumPath(mac): AxumPath<String>,
 ) -> Response {
-    not_implemented("discovery dismissal")
+    if crate::discovered::DiscoveredStore::default().dismiss(&mac) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        not_found("discovered MAC not found")
+    }
 }
 
 // ── /api/audit (real, against crate::audit's hash-chained store) ─────────

@@ -1,0 +1,38 @@
+# file: crates/uaa-control/systemd/uaa-arp-discovery.service
+# version: 1.0.0
+# guid: 4a7e9c26-1b83-4d05-8f62-9c3e0a71b5d8
+# last-edited: 2026-07-19
+#
+# Passive segment discovery scanner (172.16.2.30). Polls the kernel neighbor
+# (ARP/NDP) table and POSTs every device MAC to uaa-control's discovery inbox
+# (POST /api/discovered on :25000), surfacing it on the operator SPA's Discovery
+# page. See scripts/arp-discovery-scan.sh and crate::discovered.
+#
+# DEPLOY IS BUCKET-3 (human) WORK: an operator installs + enables this on
+# 172.16.2.30 (needs sudo). Install:
+#   sudo cp crates/uaa-control/systemd/uaa-arp-discovery.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uaa-arp-discovery.service
+
+[Unit]
+Description=uaa segment discovery scanner (ARP/NDP neighbor table -> /api/discovered)
+# The control daemon must be up to accept ingest POSTs, but only as a Want: the
+# scanner's own Restart=always + per-scan retry ride out a control-plane restart.
+Wants=uaa-control.service
+After=uaa-control.service network-online.target
+
+[Service]
+Type=exec
+ExecStart=/home/jdfalk/ubuntu-autoinstall-agent/scripts/arp-discovery-scan.sh
+Restart=always
+RestartSec=5
+# Reads the neighbor table and curls localhost — no privilege required.
+User=uaa
+Group=uaa
+# Hardening: give it nothing it doesn't need.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
