@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/arp-discovery-scan.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 8b1f4a37-2d90-4e6c-9a58-3f0c7b6e15d4
 # last-edited: 2026-07-19
 #
@@ -40,29 +40,38 @@ post_mac() {
     local mac="$1" now prev
     now="$(date +%s)"
     prev="${last_post[$mac]:-0}"
-    (( now - prev < TTL )) && return 0
+    (( now - prev < TTL )) && return 1
     if curl -fsS -m 3 -X POST -H 'Content-Type: application/json' \
         --data "{\"mac\":\"${mac}\"}" "$INGEST_URL" >/dev/null 2>&1; then
         last_post[$mac]="$now"
-    else
-        log "POST failed for ${mac} (will retry next scan)"
+        return 0
     fi
+    log "POST failed for ${mac} (will retry next scan)"
+    return 2
 }
 
 log "scanning ip neigh → ${INGEST_URL} every ${INTERVAL}s (throttle ${TTL}s/MAC)"
 
 while true; do
+    scanned=0 posted=0
     # Only entries the kernel has an lladdr for and considers valid; FAILED /
     # INCOMPLETE carry no usable MAC. Covers IPv4 ARP and IPv6 NDP alike; a
     # device present under both collapses to one MAC in the inbox.
     while read -r mac; do
         [[ -z "$mac" ]] && continue
-        post_mac "${mac,,}"
+        scanned=$(( scanned + 1 ))
+        if post_mac "${mac,,}"; then
+            posted=$(( posted + 1 ))
+        fi
     done < <(ip neigh show 2>/dev/null \
         | grep -iwE 'REACHABLE|STALE|DELAY|PROBE' \
         | grep -ioE 'lladdr ([0-9a-f]{2}:){5}[0-9a-f]{2}' \
         | awk '{print $2}' \
         | sort -u)
 
+    # One summary line per scan so the journal shows it working. "newly posted"
+    # drops to ~0 after the first scan (throttle window) — that is correct, not a
+    # failure; "tracked total" is the count of distinct MACs recorded so far.
+    log "scan: ${scanned} neighbors, ${posted} newly posted, ${#last_post[@]} tracked total"
     sleep "$INTERVAL"
 done
