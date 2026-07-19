@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/lib.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: 377e6bf2-0687-480d-a7f4-7bd21c525206
-// last-edited: 2026-07-18
+// last-edited: 2026-07-19
 
 //! uaa-control — the constellation's central daemon (spec component C3).
 //!
@@ -19,6 +19,7 @@
 
 // CT-01-owned modules (implemented here).
 pub mod db;
+pub mod discovered; // neighbor-table (ARP/NDP) discovery inbox
 pub mod listeners;
 pub mod machine_plane;
 

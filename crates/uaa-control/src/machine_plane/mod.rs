@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/machine_plane/mod.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: eee7b5c0-24d0-4406-b5f6-68d5bac52cae
-// last-edited: 2026-07-17
+// last-edited: 2026-07-19
 
 //! Legacy machine plane (`:25000`) — exact Python parity (spec Decision 12).
 //!
@@ -38,4 +38,5 @@ pub fn router() -> Router {
         .merge(lifecycle::router()) // IP-02
         .merge(inventory::router()) // IP-03
         .merge(dashboard::router()) // IP-04
+        .merge(crate::discovered::ingest_router()) // DHCP discovery inbox ingest
 }
