@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/server-deploy.sh
-# version: 1.2.1
+# version: 1.3.0
 # guid: 9e2f4a71-0b6d-4c8e-9a3f-1d5c7e8b2f60
-# last-edited: 2026-07-14
+# last-edited: 2026-07-19
 #
 # Repeatable build+deploy for the uaa constellation control daemon on the server
 # (172.16.2.30). Lives in the repo so `git pull` always ships the latest version of
@@ -44,6 +44,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SERVICE="$REPO_DIR/crates/uaa-control/systemd/uaa-control.service"
 UNIT_SOCKET="$REPO_DIR/crates/uaa-control/systemd/uaa-control.socket"
+UNIT_ARP="$REPO_DIR/crates/uaa-control/systemd/uaa-arp-discovery.service"
 SUDOERS_FILE="/etc/sudoers.d/uaa-deploy"
 BIN_UAA_CONTROL="$REPO_DIR/target/release/uaa-control"
 BIN_UAA_AGENT="$REPO_DIR/target/release/ubuntu-autoinstall-agent"
@@ -75,6 +76,7 @@ bootstrap() {
     log "installing systemd units"
     cp "$UNIT_SERVICE" /etc/systemd/system/uaa-control.service
     cp "$UNIT_SOCKET" /etc/systemd/system/uaa-control.socket
+    cp "$UNIT_ARP" /etc/systemd/system/uaa-arp-discovery.service
     systemctl daemon-reload
 
     log "installing $SUDOERS_FILE"
@@ -95,6 +97,10 @@ jdfalk ALL=(root) NOPASSWD: /usr/bin/systemctl start uaa-control.service, /usr/b
 jdfalk ALL=(root) NOPASSWD: /usr/bin/systemctl start uaa-control.socket, /usr/bin/systemctl stop uaa-control.socket, /usr/bin/systemctl restart uaa-control.socket, /usr/bin/systemctl status uaa-control.socket
 jdfalk ALL=(root) NOPASSWD: /usr/bin/systemctl enable uaa-control.service, /usr/bin/systemctl disable uaa-control.service, /usr/bin/systemctl enable uaa-control.socket, /usr/bin/systemctl disable uaa-control.socket
 jdfalk ALL=(root) NOPASSWD: /usr/bin/journalctl -u uaa-control.service, /usr/bin/journalctl -fu uaa-control.service
+jdfalk ALL=(root) NOPASSWD: /usr/bin/cp $UNIT_ARP /etc/systemd/system/uaa-arp-discovery.service
+jdfalk ALL=(root) NOPASSWD: /usr/bin/systemctl start uaa-arp-discovery.service, /usr/bin/systemctl stop uaa-arp-discovery.service, /usr/bin/systemctl restart uaa-arp-discovery.service, /usr/bin/systemctl status uaa-arp-discovery.service
+jdfalk ALL=(root) NOPASSWD: /usr/bin/systemctl enable uaa-arp-discovery.service, /usr/bin/systemctl disable uaa-arp-discovery.service, /usr/bin/systemctl enable --now uaa-arp-discovery.service, /usr/bin/systemctl disable --now uaa-arp-discovery.service
+jdfalk ALL=(root) NOPASSWD: /usr/bin/journalctl -u uaa-arp-discovery.service, /usr/bin/journalctl -fu uaa-arp-discovery.service
 EOF
     visudo -cf "$tmp"
     install -o root -g root -m 0440 "$tmp" "$SUDOERS_FILE"
@@ -125,6 +131,7 @@ stage() {
     sudo install -o root -g root -m 0755 "$BIN_UAA_AGENT" /usr/local/bin/ubuntu-autoinstall-agent
     sudo cp "$UNIT_SERVICE" /etc/systemd/system/uaa-control.service
     sudo cp "$UNIT_SOCKET" /etc/systemd/system/uaa-control.socket
+    sudo cp "$UNIT_ARP" /etc/systemd/system/uaa-arp-discovery.service
     sudo systemctl daemon-reload
 }
 
@@ -140,6 +147,19 @@ restart_control() {
     fi
 }
 
+# The passive ARP/NDP discovery scanner (scripts/arp-discovery-scan.sh, run by
+# uaa-arp-discovery.service). Restarted only if an operator has enabled it, so a
+# box without passive discovery is untouched. Picks up scanner-script/unit edits.
+restart_scanner() {
+    if systemctl is-enabled --quiet uaa-arp-discovery.service 2>/dev/null; then
+        log "restarting uaa-arp-discovery.service (picks up scanner script/unit changes)"
+        sudo systemctl restart uaa-arp-discovery.service
+    else
+        log "uaa-arp-discovery.service not enabled — skipping passive-discovery restart"
+        log "enable it with: sudo systemctl enable --now uaa-arp-discovery.service"
+    fi
+}
+
 status() {
     echo "--- autoinstall-agent.service (legacy Python, owns :25000 until --cutover) ---"
     systemctl status autoinstall-agent.service || true
@@ -149,6 +169,9 @@ status() {
     echo
     echo "--- uaa-control.socket ---"
     systemctl status uaa-control.socket || true
+    echo
+    echo "--- uaa-arp-discovery.service (passive ARP/NDP discovery scanner) ---"
+    systemctl status uaa-arp-discovery.service || true
     echo
     echo "--- health checks ---"
     for port in 25000 15000 15001 15002; do
@@ -190,6 +213,7 @@ case "${1:-}" in
         build
         stage
         restart_control
+        restart_scanner
         ;;
     *)
         echo "unknown option: $1" >&2
