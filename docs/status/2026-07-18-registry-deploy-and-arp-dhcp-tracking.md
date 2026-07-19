@@ -1,5 +1,5 @@
 <!-- file: docs/status/2026-07-18-registry-deploy-and-arp-dhcp-tracking.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 7c3d9a12-5e84-4b6f-9c1a-2e8f0d4b6a37 -->
 <!-- last-edited: 2026-07-19 -->
 
@@ -20,8 +20,11 @@ Operational status report. Terse, file:line-anchored. Companion to the
   `crates/uaa-control/src/operator/web_ui.rs:24`). Staged to
   `/usr/local/bin/uaa-control`, `uaa-control.service` restarted, healthy.
 - Deploy mechanism: `scripts/server-deploy.sh` (no args = pull + build +
-  stage + restart). Note it **only stages `uaa-control` and the legacy
-  agent**, not the `uaa` CLI — the CLI runs from `target/release/uaa`.
+  stage + restart). It stages `uaa-control` and the `uaa` package's binary —
+  which is **named `ubuntu-autoinstall-agent`** (`crates/uaa/Cargo.toml`
+  `[[bin]]`), staged at `/usr/local/bin/ubuntu-autoinstall-agent`. That single
+  binary carries the `config` CLI (`place`, `backfill`). There is no
+  `target/release/uaa`.
 - Recurring gotcha: `npm run build` deletes `web/dist/.gitkeep`, which makes
   the next `git pull --ff-only` bail ("local changes"). Restore with
   `git checkout -- web/dist/.gitkeep` before re-deploying.
@@ -43,8 +46,11 @@ never touches placed configs). It writes to `/var/lib/uaa`, so it must run as
 the `uaa` user:
 
 ```bash
-# on 172.16.2.30, needs sudo (jdfalk password):
-sudo -u uaa /home/jdfalk/ubuntu-autoinstall-agent/target/release/uaa \
+# on 172.16.2.30, needs sudo (jdfalk password). The CLI is the `uaa` package's
+# binary, which is named `ubuntu-autoinstall-agent` (crates/uaa/Cargo.toml
+# [[bin]]) and IS staged at /usr/local/bin — NOT `target/release/uaa`, which
+# does not exist on the server:
+sudo -u uaa /usr/local/bin/ubuntu-autoinstall-agent \
     config backfill --src /home/jdfalk/ubuntu-autoinstall-agent/examples/configs/install
 ```
 
