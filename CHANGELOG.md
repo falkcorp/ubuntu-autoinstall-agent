@@ -7,6 +7,10 @@
 
 All notable changes to `ubuntu-autoinstall-agent` are documented here.
 
+<!-- scriv-insert-here -->
+
+<!-- scriv-end-here: releases below predate the changelog.d fragment system. -->
+
 ## [Unreleased] — constellation planning package (2026-07-10, docs only)
 
 Planned (did NOT build) the rebuild into a Rust microservice constellation
