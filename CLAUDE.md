@@ -1,7 +1,7 @@
 <!-- file: CLAUDE.md -->
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!-- guid: b3c4d5e6-f7a8-4b9c-0d1e-2f3a4b5c6d7e -->
-<!-- last-edited: 2026-07-11 -->
+<!-- last-edited: 2026-07-21 -->
 
 # ubuntu-autoinstall-agent
 
@@ -32,3 +32,20 @@ full:
 The two are not mutually exclusive — a large execution wave usually
 produces both, cross-linked. Read both convention docs before writing
 either; do not improvise the structure.
+
+
+## 📝 Changelog & TODO — Use the Fragment System (MANDATORY)
+
+**Do not hand-edit `CHANGELOG.md`, and do not add new tasks straight into the
+`TODO.md` inbox.** Both files are assembled from per-change fragments so that
+parallel PRs never collide on them.
+
+- **`CHANGELOG.md` is assembled, not hand-edited.** Add a fragment under
+  `changelog.d/` (run `scriv create`, or write the Markdown file by hand). The
+  fragments are folded into `CHANGELOG.md` at release time by `scriv`, and a CI
+  check (`changelog-check.yml`) requires one on each PR. See `changelog.d/README.md`.
+- **New `TODO.md` tasks are added via fragments.** Drop a Markdown fragment in
+  `todo.d/` (see `todo.d/README.md`) instead of editing the `## 📥 Inbox`
+  section. `scripts/assemble_todo.py` folds fragments in daily. This is
+  **add-only**: checking a task off or removing it is a normal direct edit of
+  `TODO.md`.
