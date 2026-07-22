@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.12.2
+// version: 2.13.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -13,7 +13,23 @@ use super::config::{InitramfsType, InstallationConfig};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use tracing::{info, warn};
+
+/// grub.d drop-in that gives every installed host a serial console.
+///
+/// The fleet is headless (Supermicro/Lenovo servers watched over IPMI SOL), so
+/// the boot — including the LUKS/keystore unlock prompt — must land on `ttyS0`
+/// or it is invisible remotely *and* to the VM-gate disk-boot serial capture.
+///
+/// Written as `/etc/default/grub.d/99-uaa-serial-console.cfg`, which
+/// `grub-mkconfig` sources **after** `/etc/default/grub`, so
+/// `GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX …"` **appends** to whatever the
+/// dracut+Tang step already set rather than clobbering it. `ttyS0` is listed
+/// **last** so it is the primary console (kernel log + login getty) on a
+/// headless box; `console=tty0` keeps a local VGA console too. Harmless on a
+/// host with no physical UART (the kernel just never opens it).
+const SERIAL_CONSOLE_DROPIN: &str = "# file: /etc/default/grub.d/99-uaa-serial-console.cfg\n# Installed by ubuntu-autoinstall-agent: expose boot + LUKS unlock on ttyS0\n# (headless fleet, IPMI SOL). Sourced after /etc/default/grub, so this APPENDS.\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX console=tty0 console=ttyS0,115200n8\"\nGRUB_TERMINAL=\"console serial\"\nGRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"\n";
 
 pub struct SystemConfigurator<'a> {
     runner: &'a mut dyn CommandExecutor,
@@ -139,6 +155,23 @@ impl<'a> SystemConfigurator<'a> {
             .await
             .unwrap_or_default();
         Ok(Self::choose_esp_partition(&out, default_disk))
+    }
+
+    /// Install the serial-console grub.d drop-in on the target ([`SERIAL_CONSOLE_DROPIN`]).
+    ///
+    /// base64-piped into the chroot so the `$`, quotes, and spaces in the config
+    /// survive the SSH → `bash -lc` → file hops without fragile escaping. Fatal
+    /// (`?`): a headless server that can't be watched over SOL is a failed
+    /// deployment, and a `mkdir -p` + file write in the chroot does not
+    /// legitimately fail. MUST be called before `update-grub`.
+    async fn configure_serial_console(&mut self) -> Result<()> {
+        let b64 = BASE64.encode(SERIAL_CONSOLE_DROPIN);
+        let cmd = format!(
+            "chroot /mnt/targetos bash -lc 'mkdir -p /etc/default/grub.d && printf %s {b64} | base64 -d > /etc/default/grub.d/99-uaa-serial-console.cfg'"
+        );
+        self.log_and_execute("Configuring serial console (grub.d drop-in)", &cmd)
+            .await?;
+        Ok(())
     }
 
     /// Install base system using debootstrap
@@ -617,6 +650,10 @@ impl<'a> SystemConfigurator<'a> {
             }
         }
 
+        // Serial console for the headless fleet — MUST run before update-grub so
+        // grub-mkconfig folds it into grub.cfg. See SERIAL_CONSOLE_DROPIN.
+        self.configure_serial_console().await?;
+
         self.log_and_execute(
             "Updating GRUB config",
             "chroot /mnt/targetos bash -lc 'update-grub'",
@@ -1074,6 +1111,31 @@ impl<'a> SystemConfigurator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_serial_console_dropin_appends_and_sets_serial_terminal() {
+        // Must APPEND, not clobber, GRUB_CMDLINE_LINUX — otherwise the dracut+Tang
+        // `rd.neednet=1 ip=dhcp` flags set earlier would be lost and network-unlock
+        // would break.
+        assert!(
+            SERIAL_CONSOLE_DROPIN.contains("GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX "),
+            "drop-in must reference $GRUB_CMDLINE_LINUX so it appends"
+        );
+        // ttyS0 must come AFTER tty0 on the kernel cmdline: the last `console=`
+        // is the primary console (kernel log + login getty) — that's the one SOL
+        // watches on a headless box.
+        let cmdline = SERIAL_CONSOLE_DROPIN
+            .lines()
+            .find(|l| l.starts_with("GRUB_CMDLINE_LINUX="))
+            .expect("drop-in has a GRUB_CMDLINE_LINUX line");
+        let tty0 = cmdline.find("console=tty0").expect("tty0 present");
+        let ttys0 = cmdline.find("console=ttyS0,115200n8").expect("ttyS0 present");
+        assert!(tty0 < ttys0, "ttyS0 must be last so it is the primary console");
+        // GRUB's own menu on serial too, at a matching baud.
+        assert!(SERIAL_CONSOLE_DROPIN.contains("GRUB_TERMINAL=\"console serial\""));
+        assert!(SERIAL_CONSOLE_DROPIN
+            .contains("GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0"));
+    }
 
     #[test]
     fn test_build_esp_detection_command_contains_expected_parts() {
