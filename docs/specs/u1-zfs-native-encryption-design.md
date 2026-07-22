@@ -1,5 +1,5 @@
 <!-- file: docs/specs/u1-zfs-native-encryption-design.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: e7a1c9d4-2b6f-4e83-9a15-8c4d0f7b3e21 -->
 <!-- last-edited: 2026-07-22 -->
 
@@ -80,8 +80,16 @@ Partition scheme (both Optanes symmetric; SSDs whole-disk):
 1. **ZFS native encryption + Ubuntu stock keystore-zvol layout** — not plain
    ZFS-on-LUKS, not a custom encryptionroot. Stock means no patched
    `zfs-load-key.sh` to carry across `zfs-linux` updates (a real 25.10 bug hit
-   an `rpool/enc` custom root). Encryptionroot = the bare `rpool`; keystore =
-   `rpool/keystore` (`encryption=off`), `keylocation=file:///run/keystore/rpool/system.key`.
+   an `rpool/enc` custom root). Encryptionroot = the stock `rpool/ROOT` (and
+   `rpool/USERDATA`); the pool **root** `rpool` and `rpool/keystore` are left
+   **unencrypted**, `keylocation=file:///run/keystore/rpool/system.key` on the
+   encryptionroots. (Corrected 2026-07-22 after a live build on U1 real hardware:
+   an earlier draft said "encryptionroot = the bare `rpool`", which is
+   impossible — ZFS **inherits** encryption downward, so a child of an encrypted
+   dataset cannot be `encryption=off`; the keystore zvol MUST hang off an
+   unencrypted parent. `rpool/ROOT`+`rpool/USERDATA` are the *stock* Ubuntu
+   encryptionroots, not a custom `rpool/enc`, so the "stock, not custom" intent
+   above still holds.)
 2. **4-drive topology with a `special` allocation-class vdev.** Bulk data on
    the SSD mirror; metadata on the Optane mirror. This is what lets 16 G Optanes
    accelerate a multi-TB pool without matching its size, and puts "the vast
@@ -96,11 +104,27 @@ Partition scheme (both Optanes symmetric; SSDs whole-disk):
    for free.
 4. **Unlock policy D2-B — clevis SSS `t=2` over {3 Tang + TPM2 peer}.** On the
    keystore LUKS:
-   `{"t":2,"pins":{"tang":[3× {url,thp}],"tpm2":{"pcr_ids":"7"}}}`. TPM2 is a
-   *sub-threshold peer share* (1 < t=2): it improves availability (survives 2
-   Tang down) without weakening the threat model (a lone TPM2 can never reach
-   t=2). VM-gate-validated: the clevis token type is foreign to systemd, so it
-   never triggers the R4 boot-hang.
+   `{"t":2,"pins":{"tang":[3× {url,thp}],"tpm2":{"pcr_ids":"7","pcr_bank":"sha256"}}}`.
+   TPM2 is a *sub-threshold peer share* (1 < t=2): it improves availability
+   (survives 2 Tang down) without weakening the threat model (a lone TPM2 can
+   never reach t=2). VM-gate-validated: the clevis token type is foreign to
+   systemd, so it never triggers the R4 boot-hang.
+   - **Why `t=2`, not "all 3 Tang required" (`t=3`/`t=4`)** (settled 2026-07-22):
+     the threat protection comes from the **TPM2 share being PCR7-bound and
+     physically un-removable**, *not* from the Tang count. Stolen/off-LAN, no
+     Tang is reachable → TPM alone = 1 < 2 → **stays locked** regardless of
+     threshold. Raising `t` to require more Tang buys **no** anti-theft margin
+     (off-LAN is already locked) and **destroys availability**: the home Tang
+     servers are RPis that reboot / drop PoE / fail (rpi-serv-002 was found down
+     during the U1 build), so "all 3 required" bricks boot on any single RPi
+     outage. `t=2` is exactly the "survives 2 Tang down" property. On-LAN
+     evil-maid hardening is a *different* lever (TPM+PIN / physical presence),
+     deliberately deferred (Decision 5, R4 hang) — not the Tang count.
+   - **`pcr_bank` MUST be `sha256`** (found 2026-07-22 on the live bind): clevis
+     defaults the tpm2 pin to `pcr_bank:"sha1"`, but Secure Boot (Decision 7)
+     measures PCR 7 into the **SHA-256** bank; some firmware doesn't even
+     populate the sha1 bank. Bind against sha256 explicitly or the peer unseal
+     breaks once SB is on.
 5. **No `systemd-tpm2` / `systemd-fido2` tokens.** `enroll_tpm2: false`,
    `expect_fido2: false`. These hang the boot (R4) *and* can never be
    unattended. The clevis `tpm2` **pin** (Decision 4) is a different mechanism
