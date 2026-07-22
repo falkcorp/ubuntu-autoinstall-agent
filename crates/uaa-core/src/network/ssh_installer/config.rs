@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.8.0
+// version: 2.10.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-18
+// last-edited: 2026-07-22
 
 //! Configuration structures for SSH/local installation
 
@@ -151,6 +151,69 @@ pub struct InstallationConfig {
     /// fail-closed parse on every PXE after a rollback (DS-OPS-03).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applications: Vec<ApplicationSpec>,
+    /// Storage layout the installer builds for this host. Defaults to
+    /// [`StorageMode::PlainLuks`] — the single-disk ZFS-on-LUKS path every
+    /// Lenovo (`len-serv-*`) uses today — so a config that omits the key is
+    /// byte-for-byte unchanged. Only `unimatrixone` sets `NativeKeystore`.
+    /// See `docs/specs/u1-zfs-native-encryption-{design,plan}.md`.
+    ///
+    /// `skip_serializing_if` omits the key for a `PlainLuks` host, so a
+    /// registry-resolved Lenovo config serializes exactly as before — no new
+    /// `storage-mode:` key to trip an older `deny_unknown_fields` binary on a
+    /// control rollback (same rationale as `applications`).
+    #[serde(default, skip_serializing_if = "StorageMode::is_default")]
+    pub storage_mode: StorageMode,
+    /// Multi-disk roster for [`StorageMode::NativeKeystore`] (by-id device
+    /// paths + roles). Ignored under `PlainLuks`, which uses `disk_device`.
+    /// `skip_serializing_if` keeps a `PlainLuks` config's serialization free of
+    /// an empty `disks: []` key (same cross-version-rollback safety as
+    /// `applications`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<DiskSpec>,
+}
+
+/// Which encryption/storage layout the installer builds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageMode {
+    /// Single disk → LUKS → ZFS `rpool` on the mapper. The proven Lenovo path
+    /// (`disk_ops::prepare_disk`); `disks` is ignored, `disk_device` drives it.
+    #[default]
+    PlainLuks,
+    /// ZFS **native** encryption on the Ubuntu keystore-zvol layout across the
+    /// multi-disk `disks` roster: bulk data mirror + Optane `special` metadata
+    /// mirror, a `rpool/keystore` zvol, clevis SSS unlock. U1 only.
+    NativeKeystore,
+}
+
+impl StorageMode {
+    /// `true` for the default (`PlainLuks`) — the serde `skip_serializing_if`
+    /// predicate that keeps a Lenovo config's serialization key-for-key unchanged.
+    pub fn is_default(&self) -> bool {
+        matches!(self, StorageMode::PlainLuks)
+    }
+}
+
+/// Role a physical disk plays in the [`StorageMode::NativeKeystore`] layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiskRole {
+    /// Fast/small device (Optane): carries ESP + bpool member + the `special`
+    /// (metadata) vdev member.
+    System,
+    /// Bulk device (SSD): a whole-disk `rpool` data-vdev member.
+    Data,
+}
+
+/// One disk in the [`StorageMode::NativeKeystore`] roster.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskSpec {
+    /// Stable device path — `/dev/disk/by-id/...`, **never** `sdX`/`nvmeXnY`
+    /// (enumeration order is not stable across boots on a 4-drive box).
+    pub id: String,
+    /// What this disk is for.
+    pub role: DiskRole,
 }
 
 fn default_tang_threshold() -> u8 {
@@ -256,6 +319,8 @@ impl InstallationConfig {
             expect_fido2: true,
             install_ca_cert: default_install_ca_cert(),
             applications: Vec::new(),
+            storage_mode: StorageMode::PlainLuks,
+            disks: Vec::new(),
         }
     }
 }
@@ -476,6 +541,48 @@ network_nameservers: ["10.0.0.1"]
             !yaml.contains("applications"),
             "an app-free host must omit the applications key entirely, got:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn test_plain_luks_host_omits_storage_keys() {
+        // Cross-version rollback safety (U1 Phase 1): a stock PlainLuks host —
+        // every len-serv — must serialize WITHOUT `storage-mode:` or `disks:`,
+        // so a rolled-back control binary (whose deny_unknown_fields
+        // InstallationConfig predates the U1 keystore fields) still parses the
+        // placed file byte-for-byte as it did before U1. Only unimatrixone,
+        // which sets NativeKeystore, emits these keys.
+        let cfg = InstallationConfig::for_len_serv_003();
+        assert_eq!(cfg.storage_mode, StorageMode::PlainLuks, "fixture is PlainLuks");
+        assert!(cfg.disks.is_empty(), "fixture has no multi-disk roster");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("storage-mode") && !yaml.contains("storage_mode"),
+            "a PlainLuks host must omit the storage-mode key entirely, got:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("disks"),
+            "a PlainLuks host must omit the disks key entirely, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn test_native_keystore_host_emits_storage_mode() {
+        // The inverse guard: when a host IS NativeKeystore the discriminator must
+        // actually appear (the field key is snake_case like every other
+        // InstallationConfig field; only the enum *value* is kebab-cased), else
+        // the installer would silently fall back to the PlainLuks path on U1.
+        let mut cfg = InstallationConfig::for_len_serv_003();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+        cfg.disks = vec![DiskSpec {
+            id: "/dev/disk/by-id/nvme-optane".to_string(),
+            role: DiskRole::System,
+        }];
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            yaml.contains("storage_mode: native-keystore"),
+            "NativeKeystore must serialize the discriminator (kebab-case value), got:\n{yaml}"
+        );
+        assert!(yaml.contains("disks"), "a NativeKeystore host must emit its disks roster");
     }
 
     #[test]

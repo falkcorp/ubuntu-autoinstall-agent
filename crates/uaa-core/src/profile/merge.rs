@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
-// last-edited: 2026-07-17
+// last-edited: 2026-07-22
 
 //! Merge logic for `InstallationConfigPartial` -> `InstallationConfig` (DS-PRF-02).
 //!
@@ -433,6 +433,12 @@ pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(Installati
         expect_fido2,
         install_ca_cert,
         applications,
+        // Default (PlainLuks / no disks) for now: profile-level wiring of the
+        // storage mode (Lenovo group default vs the U1 NativeKeystore override)
+        // lands in Phase 7 of the U1 plan. Phase 1 keeps every registry-resolved
+        // config on the existing single-disk path.
+        storage_mode: Default::default(),
+        disks: Vec::new(),
     };
 
     Ok((config, provenance))

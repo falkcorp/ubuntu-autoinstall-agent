@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.12.0
+// version: 2.12.1
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-17
+// last-edited: 2026-07-22
 
 //! Command implementations for the CLI
 
@@ -791,6 +791,10 @@ fn create_local_installation_config(
         // refuse to trust it until the CA is delivered by hand.
         install_ca_cert: uaa_core::network::ssh_installer::config::default_install_ca_cert(),
         applications: Vec::new(),
+        // Interactive live-install path stays on the stock plain-LUKS layout;
+        // native-keystore + multi-disk (U1) is driven from profiles, not here.
+        storage_mode: Default::default(),
+        disks: Vec::new(),
     })
 }
 
