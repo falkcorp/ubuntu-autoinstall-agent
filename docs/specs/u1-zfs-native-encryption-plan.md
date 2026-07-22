@@ -1,5 +1,5 @@
 <!-- file: docs/specs/u1-zfs-native-encryption-plan.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: f3b8e0a7-6c14-4d92-8b53-1e9a7c2f4d60 -->
 <!-- last-edited: 2026-07-22 -->
 
@@ -34,7 +34,27 @@ storage_mode: enum { PlainLuks (default), NativeKeystore }
 All new code is reached **only** under `NativeKeystore`. A Lenovo-config test
 suite runs in every phase's gate to prove the default path is unchanged.
 
-Also add (design §3, §6):
+### These modes are profiles, not per-host YAML (machine templates)
+
+`storage_mode` and the fields below are **profile-level attributes** in the
+deploy-system registry ([`deploy-system-design.md`](deploy-system-design.md)),
+not one-off keys authored per host. The two machine types are two templates:
+
+| Template | Registry shape | `storage_mode` | Members |
+|---|---|---|---|
+| **Lenovo** | HostGroupProfile `len-serv` | `PlainLuks` (group default) | `len-serv-001/002/003` (indexed, inherit) |
+| **U1** | standalone HostProfile `unimatrixone` | `NativeKeystore` (host) | `unimatrixone` |
+
+The profile merge (`crate::profile::merge`, group defaults + host overrides)
+already produces `InstallationConfig`; adding these fields to the profile
+partial types is all that's needed to make a template carry its storage mode.
+Both profiles **already exist in the registry** (the 2026-07-21 backfill
+reified `len-serv-001/002/003` + `unimatrixone`). Consequence: **`len-serv-003`
+needs none of this work** — it resolves to `PlainLuks` and deploys via the
+existing path today (`resolve profile → config place → PXE`); this migration
+only adds the `NativeKeystore` branch the U1 profile selects.
+
+Also add (design §3, §6) — as profile-mergeable fields:
 - `TangServer { url, thp: Option<String> }` — thumbprint pinning (Decision 6).
   `thp` optional in the type, **required by validation** when
   `storage_mode = NativeKeystore`.
