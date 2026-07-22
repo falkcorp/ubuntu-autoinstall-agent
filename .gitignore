@@ -499,3 +499,4 @@ Thumbs.db
 
 # codex scratch
 .codex-tmp/
+.worktrees/
