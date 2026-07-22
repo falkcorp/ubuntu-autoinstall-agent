@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/mod.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: a24bb30b-4056-4a4d-9817-673754a41981
-// last-edited: 2026-07-17
+// last-edited: 2026-07-22
 
 //! Host-group / per-host profile scaffolding (DS-PRF-01).
 //!
@@ -72,6 +72,10 @@ pub struct InstallationConfigPartial {
     pub expect_fido2: Option<bool>,
     pub install_ca_cert: Option<String>,
     pub applications: Option<Vec<ApplicationSpec>>,
+    /// Storage layout (PlainLuks default | NativeKeystore). See config.rs.
+    pub storage_mode: Option<crate::network::ssh_installer::config::StorageMode>,
+    /// Multi-disk roster for NativeKeystore hosts (by-id + role).
+    pub disks: Option<Vec<crate::network::ssh_installer::config::DiskSpec>>,
 }
 
 /// Deserializes a "double option" field (`Option<Option<T>>`) so that a
@@ -128,6 +132,8 @@ impl PartialEq for InstallationConfigPartial {
             && self.expect_fido2 == other.expect_fido2
             && self.install_ca_cert == other.install_ca_cert
             && self.applications == other.applications
+            && self.storage_mode == other.storage_mode
+            && self.disks == other.disks
     }
 }
 
@@ -222,6 +228,8 @@ mod tests {
             expect_fido2: None,
             install_ca_cert: None,
             applications: None,
+            storage_mode: None,
+            disks: None,
         });
     }
 
