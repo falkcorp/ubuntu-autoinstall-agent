@@ -98,6 +98,19 @@ impl<'a> DiskNativeManager<'a> {
         .await?;
         self.log_and_execute("Settle udev", "udevadm settle").await?;
 
+        // Format each System disk's ESP as FAT32 — the base-system install mounts
+        // it at /boot/efi and grub-install writes the signed shim there. (bpool /
+        // special / data partitions are ZFS members and are formatted by `zpool
+        // create`, so only the ESP needs an mkfs.) Two independent ESPs, one per
+        // Optane, per the two-ESPs-in-NVRAM design.
+        for (i, dp) in plan.system_disks().enumerate() {
+            self.log_and_execute(
+                &format!("Format ESP on {}", dp.id),
+                &format!("mkfs.vfat -F32 -n ESP{} {}-part1", i + 1, dp.id),
+            )
+            .await?;
+        }
+
         info!("NativeKeystore partitioning complete");
         Ok(())
     }
