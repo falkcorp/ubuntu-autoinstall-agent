@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.1.1
+// version: 1.1.2
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
 // last-edited: 2026-07-22
 
@@ -406,6 +406,23 @@ pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(Installati
     let (applications, apps_source) = union_applications(&group.applications, &host.applications);
     provenance.0.insert("applications".to_string(), apps_source);
 
+    // Storage layout resolves host-override → group-default → PlainLuks. A
+    // NativeKeystore host (U1 / server profile) carries both its `storage_mode`
+    // and its `disks` roster in the override; a Lenovo host omits both and gets
+    // the byte-identical PlainLuks path.
+    let storage_mode = host
+        .overrides
+        .storage_mode
+        .clone()
+        .or_else(|| group.defaults.storage_mode.clone())
+        .unwrap_or_default();
+    let disks = host
+        .overrides
+        .disks
+        .clone()
+        .or_else(|| group.defaults.disks.clone())
+        .unwrap_or_default();
+
     // Every `resolve_required` call above either populated `missing` (and we
     // already returned on that) or returned `Some`; these `expect`s just
     // spell that invariant out for the compiler.
@@ -433,12 +450,8 @@ pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(Installati
         expect_fido2,
         install_ca_cert,
         applications,
-        // Default (PlainLuks / no disks) for now: profile-level wiring of the
-        // storage mode (Lenovo group default vs the U1 NativeKeystore override)
-        // lands in Phase 7 of the U1 plan. Phase 1 keeps every registry-resolved
-        // config on the existing single-disk path.
-        storage_mode: Default::default(),
-        disks: Vec::new(),
+        storage_mode,
+        disks,
     };
 
     Ok((config, provenance))
