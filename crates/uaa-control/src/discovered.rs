@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/discovered.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 2f9c7b41-6d8e-4a3f-9b5c-1e7d0a4b8c62
-// last-edited: 2026-07-19
+// last-edited: 2026-07-22
 
 //! Discovery inbox — every device that ARPs/DHCPs on the segment, surfaced for
 //! operator triage (`GET /api/discovered` → SPA Discovery page).
@@ -76,23 +76,40 @@ impl DiscoveredStore {
         rows
     }
 
-    /// Upsert `mac`: a first sighting gets `first_seen == last_seen == now` and
-    /// `dismissed = false`; a returning MAC only advances `last_seen`, so an
-    /// operator's earlier dismiss and the original first-seen both survive
-    /// re-sightings. Returns `false` (recording nothing) for a malformed MAC —
-    /// the follower parses untrusted journal text, so garbage must not create a
-    /// row. Idempotent-ish: re-POSTing the same MAC never duplicates it.
-    pub fn record(&self, mac: &str) -> bool {
+    /// Upsert `mac` with the `ip` it was seen at and its resolved `hostname`
+    /// (both optional). A first sighting gets `first_seen == last_seen == now`
+    /// and `dismissed = false`; a returning MAC advances `last_seen` and
+    /// **refreshes `ip`/`hostname` when newly known** (a MAC first seen before
+    /// its name resolved gets named on a later scan), while preserving the
+    /// original `first_seen` and any operator `dismissed`. Returns `false` for a
+    /// malformed MAC (the scanner parses untrusted `ip neigh` text). Idempotent:
+    /// re-POSTing never duplicates a MAC.
+    pub fn record(&self, mac: &str, ip: Option<&str>, hostname: Option<&str>) -> bool {
         let Some(mac) = canonical_mac(mac) else {
             return false;
         };
+        // Blank strings from the scanner (unresolved) collapse to None.
+        let ip = ip.filter(|s| !s.is_empty()).map(str::to_string);
+        let hostname = hostname.filter(|s| !s.is_empty()).map(str::to_string);
         let now = now_epoch_string();
         let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows = read_rows(&self.path);
         match rows.iter_mut().find(|r| r.mac == mac) {
-            Some(existing) => existing.last_seen = now,
+            Some(existing) => {
+                existing.last_seen = now;
+                // Only overwrite with a fresh value; never clobber a known
+                // name/ip back to None on a scan that failed to resolve.
+                if ip.is_some() {
+                    existing.ip = ip;
+                }
+                if hostname.is_some() {
+                    existing.hostname = hostname;
+                }
+            }
             None => rows.push(DiscoveredMacRow {
                 mac,
+                ip,
+                hostname,
                 first_seen: now.clone(),
                 last_seen: now,
                 dismissed: false,
@@ -185,14 +202,16 @@ fn now_epoch_string() -> String {
 // ── Machine-plane ingest (:25000) ───────────────────────────────────────────
 
 /// Body of `POST /api/discovered`. The scanner sends the MAC it read from the
-/// neighbor table; `ip` is accepted for forward-compatibility but not persisted
-/// (`DiscoveredMacRow` has no ip field yet — a MAC can hold several over time).
+/// neighbor table plus the `ip` it was seen at and the `hostname` it resolved
+/// (`getent hosts <ip>` server-side). Both optional — an unresolved device
+/// posts just its MAC and lands as an unidentified row.
 #[derive(Debug, Deserialize)]
 struct IngestBody {
     mac: String,
     #[serde(default)]
-    #[allow(dead_code)]
     ip: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
 }
 
 /// The ingest sub-router merged into `machine_plane::router()`. Unauthenticated,
@@ -209,7 +228,7 @@ fn build_ingest_router(store: Arc<DiscoveredStore>) -> Router {
 }
 
 async fn handle_ingest(State(store): State<Arc<DiscoveredStore>>, Json(body): Json<IngestBody>) -> Response {
-    if store.record(&body.mac) {
+    if store.record(&body.mac, body.ip.as_deref(), body.hostname.as_deref()) {
         StatusCode::NO_CONTENT.into_response()
     } else {
         // A malformed MAC is the follower's problem, not a server fault, but 400
@@ -237,7 +256,7 @@ mod tests {
     #[test]
     fn record_creates_then_refreshes_without_duplicating() {
         let (store, _d) = temp_store();
-        assert!(store.record("6c:4b:90:bc:39:b3"));
+        assert!(store.record("6c:4b:90:bc:39:b3", None, None));
         let rows = store.list();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].mac, "6c:4b:90:bc:39:b3");
@@ -246,21 +265,43 @@ mod tests {
 
         // Re-record: still one row, first_seen preserved.
         let first_seen = rows[0].first_seen.clone();
-        assert!(store.record("6C:4B:90:BC:39:B3")); // different case → same MAC
+        assert!(store.record("6C:4B:90:BC:39:B3", None, None)); // different case → same MAC
         let rows = store.list();
         assert_eq!(rows.len(), 1, "a returning MAC must not duplicate");
         assert_eq!(rows[0].first_seen, first_seen, "first_seen must survive re-sighting");
     }
 
     #[test]
+    fn identity_is_stored_then_refreshed_never_clobbered() {
+        let (store, _d) = temp_store();
+        // First sighting before the name resolved: MAC only.
+        assert!(store.record("6c:4b:90:bc:39:b3", None, None));
+        assert!(store.list()[0].hostname.is_none());
+
+        // A later scan resolves it → named + ip attached.
+        assert!(store.record("6c:4b:90:bc:39:b3", Some("172.16.2.45"), Some("rpi-serv-001")));
+        let row = store.list().into_iter().next().unwrap();
+        assert_eq!(row.hostname.as_deref(), Some("rpi-serv-001"));
+        assert_eq!(row.ip.as_deref(), Some("172.16.2.45"));
+
+        // A scan that fails to resolve must NOT wipe the known name.
+        assert!(store.record("6c:4b:90:bc:39:b3", None, None));
+        assert_eq!(
+            store.list()[0].hostname.as_deref(),
+            Some("rpi-serv-001"),
+            "an unresolved re-sighting must not clobber a known hostname"
+        );
+    }
+
+    #[test]
     fn dismiss_sets_flag_and_survives_resighting() {
         let (store, _d) = temp_store();
-        store.record("aa:bb:cc:dd:ee:ff");
+        store.record("aa:bb:cc:dd:ee:ff", None, None);
         assert!(store.dismiss("aa:bb:cc:dd:ee:ff"));
         assert!(store.list()[0].dismissed);
 
         // A dismissed MAC that DHCPs again stays dismissed, only last_seen moves.
-        store.record("aa:bb:cc:dd:ee:ff");
+        store.record("aa:bb:cc:dd:ee:ff", None, None);
         let rows = store.list();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].dismissed, "dismiss must survive a later re-sighting");
@@ -275,9 +316,9 @@ mod tests {
     #[test]
     fn malformed_mac_records_nothing() {
         let (store, _d) = temp_store();
-        assert!(!store.record("not-a-mac"));
-        assert!(!store.record("6c:4b:90:bc:39")); // 5 octets
-        assert!(!store.record("")); // empty
+        assert!(!store.record("not-a-mac", None, None));
+        assert!(!store.record("6c:4b:90:bc:39", None, None)); // 5 octets
+        assert!(!store.record("", None, None)); // empty
         assert!(store.list().is_empty());
     }
 

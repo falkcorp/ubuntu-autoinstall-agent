@@ -32,6 +32,8 @@ export interface EnrollmentRow {
 /** One row from GET /api/discovered (unknown PXE MACs / discovery inbox). */
 export interface DiscoveredMacRow {
   mac: string;
+  ip?: string | null;
+  hostname?: string | null;
   first_seen: string;
   last_seen: string;
   dismissed: boolean;

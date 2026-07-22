@@ -1,13 +1,22 @@
 // file: web/src/pages/Machines.tsx
-// version: 1.0.1
+// version: 1.1.0
 // guid: a19e686a-0212-4f7a-a751-25d7d67e6acf
-// last-edited: 2026-07-10
+// last-edited: 2026-07-22
 
 import { useCallback, useState } from "react";
 import { approveMachine, listMachines, reinstallMachine } from "../api/client";
 import type { MachineRow } from "../api/types";
 import { EmptyView, ErrorView, LoadingView } from "../components/StateViews";
 import { useAsync } from "../hooks/useAsync";
+
+/** Render a unix-epoch string (what the API stores) as a local date-time. */
+function formatSeen(epoch: string): string {
+  const secs = Number(epoch);
+  if (!epoch || Number.isNaN(secs) || secs === 0) {
+    return "—";
+  }
+  return new Date(secs * 1000).toLocaleString();
+}
 
 const REINSTALL_COOLDOWN_WARNING =
   "Reinstalling wipes and re-provisions this machine from scratch. A machine " +
@@ -93,17 +102,19 @@ export default function Machines(): JSX.Element {
                     <span className="badge badge-drift">drift</span>
                   )}
                 </td>
-                <td>{machine.last_seen}</td>
+                <td>{formatSeen(machine.last_seen)}</td>
                 <td>
-                  <button
-                    type="button"
-                    disabled={pending === machine.mac}
-                    onClick={() => {
-                      void handleApprove(machine.mac);
-                    }}
-                  >
-                    Approve
-                  </button>
+                  {machine.status !== "approved" && (
+                    <button
+                      type="button"
+                      disabled={pending === machine.mac}
+                      onClick={() => {
+                        void handleApprove(machine.mac);
+                      }}
+                    >
+                      Approve
+                    </button>
+                  )}
                   <button
                     type="button"
                     disabled={pending === machine.mac}
