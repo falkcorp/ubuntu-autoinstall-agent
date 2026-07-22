@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.10.1
+// version: 2.10.2
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -435,11 +435,15 @@ mod tests {
         // unimatrixone is the NativeKeystore (ZFS native-encryption) path — the
         // future server profile. Different unlock policy: enroll_tpm2/expect_fido2
         // OFF (D2-B uses a clevis tpm2 pin, not the hanging systemd-tpm2 token).
+        // unimatrixone is now a SANITIZED NativeKeystore TEMPLATE: host-unique
+        // values (disk serials, IP, MAC, hostname) are REPLACE_AT_PLACE_TIME
+        // placeholders — real values live in the registry backend, not git (no
+        // fleet-topology/MAC exposure). We assert the NativeKeystore *shape* and
+        // that the host-unique fields are placeholders, not real values.
         let u1 = load("unimatrixone");
         assert_eq!(u1.storage_mode, StorageMode::NativeKeystore, "u1: NativeKeystore");
-        assert_eq!(u1.network_address, "172.16.2.35/23", "u1: network_address");
         assert_eq!(u1.initramfs_type, InitramfsType::Dracut, "u1: dracut");
-        // 4-disk roster: 2 system (Optane) + 2 data (SSD), all by-id.
+        // 4-disk roster shape: 2 system (Optane) + 2 data (SSD).
         assert_eq!(u1.disks.len(), 4, "u1: 4-disk roster");
         assert_eq!(
             u1.disks.iter().filter(|d| d.role == DiskRole::System).count(),
@@ -451,15 +455,21 @@ mod tests {
             2,
             "u1: 2 data disks"
         );
-        assert!(
-            u1.disks.iter().all(|d| d.id.starts_with("/dev/disk/by-id/")),
-            "u1: disks must be by-id"
-        );
         assert_eq!(u1.tang_servers.len(), 3, "u1: 3 tang servers");
         assert_eq!(u1.tang_threshold, 2, "u1: tang threshold (D2-B t=2)");
         assert!(!u1.enroll_tpm2, "u1: enroll_tpm2 OFF (clevis tpm2 pin instead)");
         assert!(!u1.expect_fido2, "u1: expect_fido2 OFF");
+        // Host-unique fleet data (IP, disk serials) must be sanitized
+        // placeholders — never real topology / spoofable identifiers committed
+        // to the repo. (hostname is just a name, not sensitive; it's also what
+        // the registry derives on resolve, so it stays real.)
+        assert_eq!(u1.hostname, "unimatrixone", "u1: hostname");
+        assert_eq!(u1.network_address, "REPLACE_AT_PLACE_TIME", "u1: address placeholder");
         assert_eq!(u1.luks_key, "REPLACE_AT_PLACE_TIME", "u1: luks_key placeholder");
+        assert!(
+            u1.disks.iter().all(|d| d.id.starts_with("REPLACE_AT_PLACE_TIME")),
+            "u1: disk ids must be place-time placeholders, not real serials"
+        );
     }
 
     #[test]
