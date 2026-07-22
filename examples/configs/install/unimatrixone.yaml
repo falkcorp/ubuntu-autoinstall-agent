@@ -1,64 +1,52 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 2.0.0
+# version: 3.0.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
 # last-edited: 2026-07-22
 #
-# Per-host install config for unimatrixone (U1, Supermicro X10DSC+).
-# Deserializes into `InstallationConfig` (crates/uaa-core/src/network/ssh_installer/config.rs);
-# run via `uaa install --config`. Served at http://172.16.2.30/cloud-init/unimatrixone.yaml.
+# NativeKeystore (ZFS native-encryption) install TEMPLATE — the future standard
+# "server profile". This is a SANITIZED schema example: every host-unique
+# identifier (disk by-id serials, IP/MAC, hostname) is a REPLACE_AT_PLACE_TIME
+# placeholder. The REAL per-host values live in the registry backend (server
+# side, /var/lib/uaa) and are injected by `uaa config place` — they are NOT
+# committed to git (no fleet topology / MAC exposure). See
+# docs/specs/u1-zfs-native-encryption-{design,plan}.md.
 #
-# ===========================================================================
-# STORAGE: ZFS NATIVE ENCRYPTION + keystore-zvol (the future standard "server
-# profile"), NOT the legacy single-disk ZFS-on-LUKS path the len-servs use.
-# Supersedes the old Intel IMSM/mdadm /dev/md/Volume0_0 config — IMSM was
-# dropped (fakeraid, CMOS-clear-fragile). See
-# docs/specs/u1-zfs-native-encryption-{design,plan}.md and the live-hardware
-# validation (2026-07-22). Topology (4 drives, all by-id — never sdX/nvmeXnY):
-#   - 2× Intel Optane M10 16G (system): ESP + bpool member + special-vdev member
-#   - 2× Crucial BX500 1TB   (data):    whole-disk rpool data mirror
-# ===========================================================================
+# Deserializes into `InstallationConfig` (crates/uaa-core/.../config.rs).
 #
-# Host facts: IP 172.16.2.35/23, NIC ens5f0 (Intel 82599 10GbE, MAC
-# ac:1f:6b:40:fc:e2), power via IPMI 172.16.3.150 (ADMIN/ADMIN).
-#
-# SECRETS below are PLACEHOLDERS. `from_yaml_file` does NO substitution — the
-# place-time step replaces every REPLACE_AT_PLACE_TIME token before serving.
+# Topology (4 drives, all by-id — never sdX/nvmeXnY):
+#   - 2× Optane (system): ESP + bpool member + special-vdev member
+#   - 2× SSD    (data):    whole-disk rpool data mirror
 
 hostname: unimatrixone
 timezone: America/New_York
 
 storage_mode: native-keystore
-# Role-tagged disk roster (by-id, verified on the live target 2026-07-22).
-# `system` = Optane (ESP+bpool+special); `data` = SSD (whole-disk rpool mirror).
+# Role-tagged disk roster, by-id. `system` = Optane (ESP+bpool+special);
+# `data` = SSD (whole-disk rpool mirror). Real serials injected at place-time.
 disks:
-  - id: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT7250004C016D
+  - id: REPLACE_AT_PLACE_TIME_SYSTEM_0
     role: system
-  - id: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT72320CJD016D
+  - id: REPLACE_AT_PLACE_TIME_SYSTEM_1
     role: system
-  - id: /dev/disk/by-id/ata-CT1000BX500SSD1_2426E8BA1574
+  - id: REPLACE_AT_PLACE_TIME_DATA_0
     role: data
-  - id: /dev/disk/by-id/ata-CT1000BX500SSD1_2426E8BA2F4F
+  - id: REPLACE_AT_PLACE_TIME_DATA_1
     role: data
 
 # Required by the schema but IGNORED under native-keystore (the `disks` roster
-# drives partitioning). Points at the first Optane so any stray reference is a
-# real device, never garbage.
-disk_device: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT7250004C016D
+# drives partitioning). Placeholder — injected at place-time.
+disk_device: REPLACE_AT_PLACE_TIME
 
-# --- secrets: injected per-host at place-time ---
+# --- secrets + host-unique values: injected per-host at place-time ---
 # For native-keystore, luks_key is the keystore-LUKS recovery passphrase
 # (break-glass at IPMI SOL); clevis Tang+TPM2 does the unattended unlock.
 luks_key: REPLACE_AT_PLACE_TIME
 root_password: REPLACE_AT_PLACE_TIME
-
-# NOT a per-host secret — the same install CA cert for every host, filled in by
-# `uaa config place` from /var/lib/uaa/ca/ca.crt on the server. Fails closed if
-# left unsubstituted.
 install_ca_cert: REPLACE_AT_PLACE_TIME
 
-network_interface: ens5f0
-network_address: 172.16.2.35/23
-network_gateway: 172.16.2.1
+network_interface: REPLACE_AT_PLACE_TIME
+network_address: REPLACE_AT_PLACE_TIME
+network_gateway: REPLACE_AT_PLACE_TIME
 network_search: jf.local
 network_nameservers:
   - 172.16.2.1
@@ -82,8 +70,6 @@ tang_threshold: 2
 
 ssh_authorized_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan"
-  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local"
-  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820"
 
 # D2-B decision 5: NO systemd-tpm2 / systemd-fido2 tokens — they hang the boot
 # (R4) and can never be unattended. The TPM2 factor is the clevis tpm2 PIN
