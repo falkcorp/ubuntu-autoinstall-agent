@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-19
+// last-edited: 2026-07-22
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
@@ -49,6 +49,15 @@ pub struct EnrollmentRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredMacRow {
     pub mac: String,
+    /// Last IP the scanner saw this MAC at (from the neighbor table). Drives
+    /// hostname resolution. `#[serde(default)]` so pre-enrichment rows still load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip: Option<String>,
+    /// Resolved hostname (server-side `getent hosts <ip>`, i.e. `/etc/hosts`,
+    /// DNS, and dnsmasq). `Some` marks a known machine the operator can act on;
+    /// `None` is an unidentified device (phone/IoT), hidden by default in the SPA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub first_seen: String,
     pub last_seen: String,
     pub dismissed: bool,

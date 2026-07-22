@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.9.0
+// version: 1.10.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-19
+// last-edited: 2026-07-22
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -272,6 +272,48 @@ async fn backfill_placed_configs(
             })
             .await;
         known.insert(hexmac);
+    }
+}
+
+/// Upsert a `Seen` row for every *named* discovered device — a MAC the ARP/NDP
+/// scanner resolved to a hostname (`getent hosts <ip>`) — not already known.
+/// This is what makes the fleet the server can see on the wire (rpi-servs,
+/// len-servs, …) appear in Machines and be approvable, while **unidentified**
+/// consumer devices (phones/IoT, `hostname == None`) stay out of the list. A
+/// dismissed discovered row is skipped. Never regresses an existing row.
+async fn backfill_discovered_named(registry: &dyn Registry, known: &mut HashSet<String>) {
+    for row in crate::discovered::DiscoveredStore::default().list() {
+        let Some(hostname) = row.hostname.filter(|h| !h.is_empty()) else {
+            continue; // unidentified noise — never enters the fleet list
+        };
+        if row.dismissed {
+            continue;
+        }
+        let hex = mac_to_hex(&row.mac);
+        if known.contains(&hex) {
+            continue;
+        }
+        registry
+            .upsert_machine(DbMachineRow {
+                mac: row.mac.clone(),
+                hostname,
+                ip: row.ip.clone(),
+                r#type: String::new(),
+                status: MachineStatus::Seen,
+                boot_target: BootTarget::LocalDisk,
+                tpm_ek: None,
+                registered_at: None,
+                approved_at: None,
+                last_seen: Some(row.last_seen.clone()),
+                last_ip: row.ip.clone(),
+                installed_at: None,
+                last_install_status: None,
+                updated_at: Some(row.last_seen.clone()),
+                app_reports: Vec::new(),
+                last_app_status_at: None,
+            })
+            .await;
+        known.insert(hex);
     }
 }
 
@@ -650,6 +692,7 @@ async fn handle_list_machines(State(state): State<AppState>) -> Response {
         .map(|m| mac_to_hex(&m.mac))
         .collect();
     backfill_placed_configs(state.registry.as_ref(), &state.webroot, &mut known).await;
+    backfill_discovered_named(state.registry.as_ref(), &mut known).await;
 
     let mut machines = state.registry.list_machines().await;
     machines.sort_by(|a, b| a.mac.cmp(&b.mac));
