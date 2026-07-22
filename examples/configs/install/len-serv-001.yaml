@@ -1,15 +1,15 @@
 # file: examples/configs/install/len-serv-001.yaml
-# version: 1.1.0
+# version: 1.2.0
 # guid: a1b2c3d4-0001-4a1b-8c2d-1e2f3a4b5c61
-# last-edited: 2026-07-16
+# last-edited: 2026-07-22
 #
 # Per-host ZFS-on-LUKS install config for len-serv-001.
 # Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs);
 # fetched by the Option-2 installer image and run via `uaa install --config`.
 # Served at http://172.16.2.30/cloud-init/len-serv-001.yaml (place-time copy of this).
 #
-# Fleet fact (verified 2026-06-20): 172.16.3.92/23, NIC enp1s0f0,
-# MAC 6c:4b:90:bc:39:b3, NVMe -> /dev/nvme0n1 (p-suffix partitions), amd64.
+# Host-unique facts (MAC/IP/NIC) are NOT committed — they live in the registry
+# backend and are injected at place-time. This file is a schema template.
 #
 # SECRETS below are PLACEHOLDERS. `from_yaml_file` does NO substitution, so the
 # place-time step must replace every REPLACE_AT_PLACE_TIME token with the real
