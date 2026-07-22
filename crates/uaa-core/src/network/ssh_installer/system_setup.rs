@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.14.0
+// version: 2.14.1
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -9,7 +9,7 @@
 //! kernel command line receives `rd.neednet=1 ip=dhcp` so the Tang servers are
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
-use super::config::{InitramfsType, InstallationConfig, StorageMode};
+use super::config::{DiskRole, InitramfsType, InstallationConfig, StorageMode};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -43,7 +43,11 @@ impl<'a> SystemConfigurator<'a> {
     /// Build the command used to detect the ESP partition by GUID
     fn build_esp_detection_command(guid: &str) -> String {
         format!(
-            "bash -lc 'lsblk -rP -o PATH,PARTTYPE | grep -i \"PARTTYPE=\\\"{0}\\\"\" | head -n1 | sed -n \"s/.*PATH=\\\"\\([^\\\" ]*\\)\\\".*/\\1/p\"'",
+            // `-P` (pairs) WITHOUT `-r`: util-linux on Ubuntu 26.04 makes --raw
+            // and --pairs mutually exclusive, so `lsblk -rP` errors out and the
+            // detection silently returns nothing. `-P` alone still emits the
+            // KEY=\"value\" pairs this sed parses.
+            "bash -lc 'lsblk -P -o PATH,PARTTYPE | grep -i \"PARTTYPE=\\\"{0}\\\"\" | head -n1 | sed -n \"s/.*PATH=\\\"\\([^\\\" ]*\\)\\\".*/\\1/p\"'",
             guid
         )
     }
@@ -144,9 +148,21 @@ impl<'a> SystemConfigurator<'a> {
         }
     }
 
-    /// Detect the ESP partition path by GUID PARTTYPE; fallback to partition 1 of the
-    /// configured disk (suffix-aware: nvme0n1p1 / sda1) if not found
-    async fn detect_esp_partition_path(&mut self, default_disk: &str) -> Result<String> {
+    /// Detect the ESP partition path.
+    ///
+    /// NativeKeystore: resolve directly to `<first System disk>-part1` (by-id).
+    /// GUID detection can't be used here — the USB installer stick's ESP is also
+    /// type EF00, so `head -n1` could pick it over the target disk — and there is
+    /// no single `disk_device` to fall back on.
+    ///
+    /// PlainLuks: GUID PARTTYPE detection, fallback to partition 1 of the
+    /// configured disk (suffix-aware: nvme0n1p1 / sda1) if not found.
+    async fn detect_esp_partition_path(&mut self, config: &InstallationConfig) -> Result<String> {
+        if config.storage_mode == StorageMode::NativeKeystore {
+            if let Some(sys) = config.disks.iter().find(|d| d.role == DiskRole::System) {
+                return Ok(format!("{}-part1", sys.id));
+            }
+        }
         let guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
         let cmd = Self::build_esp_detection_command(guid);
         let out = self
@@ -154,7 +170,7 @@ impl<'a> SystemConfigurator<'a> {
             .execute_with_output(&cmd)
             .await
             .unwrap_or_default();
-        Ok(Self::choose_esp_partition(&out, default_disk))
+        Ok(Self::choose_esp_partition(&out, &config.disk_device))
     }
 
     /// Install the serial-console grub.d drop-in on the target ([`SERIAL_CONSOLE_DROPIN`]).
@@ -183,7 +199,7 @@ impl<'a> SystemConfigurator<'a> {
             "mkdir -p /mnt/targetos/boot/efi",
         )
         .await?;
-        let esp_part = self.detect_esp_partition_path(&config.disk_device).await?;
+        let esp_part = self.detect_esp_partition_path(config).await?;
         self.log_and_execute(
             "Mounting ESP",
             &format!("mount {} /mnt/targetos/boot/efi", esp_part),
@@ -360,7 +376,7 @@ impl<'a> SystemConfigurator<'a> {
             "Ensure ESP mountpoint",
             "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
         ).await;
-        let esp_part = self.detect_esp_partition_path(&config.disk_device).await?;
+        let esp_part = self.detect_esp_partition_path(config).await?;
         let _ = self.log_and_execute(
             "Mount ESP if not mounted",
             &format!(
@@ -370,7 +386,7 @@ impl<'a> SystemConfigurator<'a> {
         ).await;
 
         // fstab entry for ESP (UUID-based)
-        let esp_part = self.detect_esp_partition_path(&config.disk_device).await?;
+        let esp_part = self.detect_esp_partition_path(config).await?;
         let esp_uuid_out = self
             .runner
             .execute_with_output(&format!(
@@ -602,7 +618,7 @@ impl<'a> SystemConfigurator<'a> {
             "Ensure ESP mountpoint",
             "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
         ).await;
-        let esp_part = self.detect_esp_partition_path(&config.disk_device).await?;
+        let esp_part = self.detect_esp_partition_path(config).await?;
         let _ = self.log_and_execute(
             "Mount ESP if not mounted",
             &format!(
@@ -1246,7 +1262,9 @@ mod tests {
         let guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
         let cmd = SystemConfigurator::build_esp_detection_command(guid);
         assert!(cmd.starts_with("bash -lc '"));
-        assert!(cmd.contains("lsblk -rP -o PATH,PARTTYPE"));
+        // `-P` not `-rP`: --raw/--pairs are mutually exclusive on Ubuntu 26.04.
+        assert!(cmd.contains("lsblk -P -o PATH,PARTTYPE"));
+        assert!(!cmd.contains("lsblk -rP"), "must not use -rP (breaks on 26.04)");
         assert!(cmd.contains("grep -i \"PARTTYPE=\\\""));
         assert!(cmd.contains(guid));
         assert!(cmd.ends_with("'"));
