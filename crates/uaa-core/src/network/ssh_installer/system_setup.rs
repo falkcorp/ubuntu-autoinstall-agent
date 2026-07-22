@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.13.0
+// version: 2.14.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -9,7 +9,7 @@
 //! kernel command line receives `rd.neednet=1 ip=dhcp` so the Tang servers are
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
-use super::config::{InitramfsType, InstallationConfig};
+use super::config::{InitramfsType, InstallationConfig, StorageMode};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -670,7 +670,13 @@ impl<'a> SystemConfigurator<'a> {
 
     /// Configure LUKS crypttab and optionally enroll Tang via Clevis SSS.
     pub async fn setup_luks_key_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
-        info!("Configuring LUKS crypttab in chroot");
+        info!("Configuring LUKS crypttab in chroot (storage_mode = {:?})", config.storage_mode);
+
+        // NativeKeystore (U1 / server profile) binds clevis + crypttab to the
+        // keystore-zvol LUKS, not a root p4 — a wholly different device path.
+        if config.storage_mode == StorageMode::NativeKeystore {
+            return self.setup_keystore_luks_in_chroot(config).await;
+        }
 
         let part = partition_path(&config.disk_device, 4);
         let uuid_out = self
@@ -695,9 +701,9 @@ impl<'a> SystemConfigurator<'a> {
         //   - crypt/tpm2/fido2 → systemd-cryptenroll TPM2+PIN and YubiKey keyslots
         self.configure_dracut_crypt_modules(config).await?;
 
-        // Enroll Tang servers via Clevis SSS when configured
+        // Enroll Tang servers via Clevis SSS when configured (PlainLuks: tang-only).
         if !config.tang_servers.is_empty() {
-            self.enroll_tang_clevis(config, &part).await?;
+            self.enroll_tang_clevis(config, &part, false).await?;
         }
 
         // Stage TPM2+PIN enrollment for first boot (binds the *installed*
@@ -714,6 +720,87 @@ impl<'a> SystemConfigurator<'a> {
             &format!("chroot /mnt/targetos bash -lc '{}'", regen_cmd),
         ).await;
 
+        Ok(())
+    }
+
+    /// NativeKeystore Phase 5: crypttab + dracut + clevis D2-B for the
+    /// keystore-zvol LUKS (`/dev/zvol/rpool/keystore`) — the device holding the
+    /// ZFS `system.key`. Runs on the host (the zvol/LUKS is not visible in the
+    /// chroot), mirroring the PlainLuks path but pointed at the keystore.
+    async fn setup_keystore_luks_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
+        let keystore_dev = "/dev/zvol/rpool/keystore";
+        info!("Configuring keystore-LUKS crypttab + clevis (device {keystore_dev})");
+
+        // crypttab: unlock the keystore in the initramfs (by LUKS UUID). The
+        // clevis dracut module answers the passphrase prompt via Tang+TPM2.
+        let uuid_out = self
+            .runner
+            .execute_with_output(&format!("cryptsetup luksUUID {keystore_dev} 2>/dev/null || true"))
+            .await?;
+        let uuid = uuid_out.trim();
+        let crypttab_entry = if uuid.is_empty() {
+            format!("keystore-rpool {keystore_dev} none luks,initramfs")
+        } else {
+            format!("keystore-rpool UUID={uuid} none luks,initramfs")
+        };
+        let _ = self.runner.execute(&format!(
+            "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{crypttab_entry}' > /mnt/targetos/etc/crypttab"
+        )).await;
+
+        // dracut: clevis/network/tpm2/zfs modules + the D7.1 keystore-wait hook.
+        self.configure_dracut_crypt_modules(config).await?;
+        self.install_keystore_dracut_module().await?;
+
+        // Clevis D2-B bind on the keystore LUKS (tang + tpm2 peer, sha256).
+        if !config.tang_servers.is_empty() {
+            self.enroll_tang_clevis(config, keystore_dev, true).await?;
+        }
+
+        // Regenerate the initramfs so crypttab + clevis + the keystore-wait
+        // module are baked in.
+        let regen_cmd = config.initramfs_type.regenerate_cmd();
+        let _ = self
+            .log_and_execute(
+                "Regenerate initramfs (keystore)",
+                &format!("chroot /mnt/targetos bash -lc '{regen_cmd}'"),
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Embed + install the `91uaa-keystore-wait` dracut module into the target
+    /// and enable it (D7.1). The two files are compiled into the binary via
+    /// `include_str!`, so there is no runtime fetch; base64-piped in to survive
+    /// the shell hops.
+    async fn install_keystore_dracut_module(&mut self) -> Result<()> {
+        const MODULE_SETUP: &str =
+            include_str!("../../../../../dracut/91uaa-keystore-wait/module-setup.sh");
+        const KEYSTORE_WAIT: &str =
+            include_str!("../../../../../dracut/91uaa-keystore-wait/keystore-wait.sh");
+        let dir = "/mnt/targetos/usr/lib/dracut/modules.d/91uaa-keystore-wait";
+        self.runner.execute(&format!("mkdir -p {dir}")).await?;
+        for (name, content) in [
+            ("module-setup.sh", MODULE_SETUP),
+            ("keystore-wait.sh", KEYSTORE_WAIT),
+        ] {
+            let b64 = BASE64.encode(content);
+            self.runner
+                .execute(&format!(
+                    "printf %s {b64} | base64 -d > {dir}/{name} && chmod 0755 {dir}/{name}"
+                ))
+                .await?;
+        }
+        // Enable the module for this host's initramfs (module name = dir minus
+        // the NN priority prefix).
+        self.runner
+            .execute(
+                "mkdir -p /mnt/targetos/etc/dracut.conf.d && \
+                 printf 'add_dracutmodules+=\" uaa-keystore-wait \"\\n' \
+                 > /mnt/targetos/etc/dracut.conf.d/91-uaa-keystore.conf",
+            )
+            .await?;
+        info!("Installed 91uaa-keystore-wait dracut module");
         Ok(())
     }
 
@@ -760,24 +847,36 @@ impl<'a> SystemConfigurator<'a> {
         &mut self,
         config: &InstallationConfig,
         luks_part: &str,
+        include_tpm2_peer: bool,
     ) -> Result<()> {
         info!(
-            "Enrolling {} Tang servers via Clevis SSS (threshold={})",
+            "Enrolling {} Tang servers via Clevis SSS (threshold={}, tpm2_peer={})",
             config.tang_servers.len(),
-            config.tang_threshold
+            config.tang_threshold,
+            include_tpm2_peer,
         );
 
-        // Build the SSS pin JSON for clevis
-        // {"t":2,"pins":{"tang":[{"url":"http://172.16.2.45"},...]}}
+        // Build the SSS pin JSON for clevis.
+        // PlainLuks: {"t":2,"pins":{"tang":[{"url":...},...]}}
+        // NativeKeystore D2-B: adds a tpm2 PEER share bound to PCR7 in the
+        // SHA-256 bank (clevis defaults to sha1, which Secure Boot doesn't
+        // populate). A lone tpm2 share is 1 < t=2, so it improves availability
+        // (survives 2 Tang down) without weakening the off-LAN threat model.
         let tang_entries: Vec<String> = config
             .tang_servers
             .iter()
             .map(|s| format!(r#"{{"url":"{}"}}"#, s.url))
             .collect();
+        let tpm2_pin = if include_tpm2_peer {
+            format!(r#","tpm2":{{"pcr_ids":"{}","pcr_bank":"sha256"}}"#, config.tpm2_pcr_ids)
+        } else {
+            String::new()
+        };
         let sss_config = format!(
-            r#"{{"t":{},"pins":{{"tang":[{}]}}}}"#,
+            r#"{{"t":{},"pins":{{"tang":[{}]{}}}}}"#,
             config.tang_threshold,
-            tang_entries.join(",")
+            tang_entries.join(","),
+            tpm2_pin,
         );
 
         // Write the LUKS passphrase to a root-only tempfile so it never appears
@@ -1057,6 +1156,11 @@ impl<'a> SystemConfigurator<'a> {
             ("Unmounting /dev (recursive)", "umount -R /mnt/targetos/dev || true"),
             ("Unmounting /run (recursive)", "umount -R /mnt/targetos/run || true"),
             ("Unmounting ESP", "umount /mnt/targetos/boot/efi || true"),
+            // NativeKeystore: the keystore-rpool mapper holds /dev/zvol/rpool/keystore
+            // open, so it MUST be torn down before `zpool export rpool` (else the
+            // export fails with the pool busy). No-op on PlainLuks (|| true).
+            ("Unmounting keystore", "umount /run/keystore/rpool 2>/dev/null || true"),
+            ("Closing keystore LUKS mapper", "cryptsetup status keystore-rpool >/dev/null 2>&1 && cryptsetup close keystore-rpool || true"),
             ("Exporting bpool", "zpool export bpool || true"),
             ("Exporting rpool", "zpool export rpool || true"),
             ("Unmounting /mnt/luks if mounted", "mountpoint -q /mnt/luks && umount -lf /mnt/luks || true"),
