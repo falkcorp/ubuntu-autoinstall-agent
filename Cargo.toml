@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Network Operations
 # Use rustls-tls to avoid OpenSSL dependency issues on cross/musl targets
-reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
 # Prefer vendored sources on Windows to simplify CI; default elsewhere
 ssh2 = { version = "0.9", default-features = false, features = ["vendored-openssl"] }
 
