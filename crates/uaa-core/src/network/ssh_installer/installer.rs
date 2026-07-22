@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.13.0
+// version: 2.13.1
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -824,10 +824,22 @@ impl SshInstaller {
         info!("Setting up installation variables");
 
         self.runner.execute("systemctl stop zed || true").await?;
-        self.runner
-            .execute(&format!("timedatectl set-timezone {}", config.timezone))
-            .await?;
-        self.runner.execute("timedatectl set-ntp on").await?;
+        // Best-effort: `timedatectl` sets the LIVE env's clock, which is cosmetic
+        // — the installed system's timezone is written in-chroot
+        // (setup_basic_system_files). In a live ISO it can time out on the D-Bus
+        // call (no NTP daemon / no network time), which must NOT fail the whole
+        // install (observed timing out on U1 with `Connection timed out`).
+        let _ = self
+            .runner
+            .execute(&format!(
+                "timedatectl set-timezone {} 2>/dev/null || true",
+                config.timezone
+            ))
+            .await;
+        let _ = self
+            .runner
+            .execute("timedatectl set-ntp on 2>/dev/null || true")
+            .await;
 
         let vars = [
             ("DISK", config.disk_device.as_str()),

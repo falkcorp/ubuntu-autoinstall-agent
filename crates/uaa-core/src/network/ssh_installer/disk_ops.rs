@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/disk_ops.rs
-// version: 2.5.0
+// version: 2.5.1
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-16
+// last-edited: 2026-07-22
 
 //! Disk operations for SSH installation
 
@@ -117,6 +117,17 @@ impl<'a> DiskManager<'a> {
                 "zfs unmount -a 2>/dev/null || true",
             )
             .await;
+        // NativeKeystore: the keystore-rpool mapper holds /dev/zvol/rpool/keystore
+        // open, so it MUST be torn down BEFORE `zpool export -a` — otherwise the
+        // export blocks forever on the busy pool (observed hanging a re-install of
+        // a partially-installed NativeKeystore host). No-op on PlainLuks.
+        let _ = self
+            .log_and_execute(
+                "Recovery: unmount + close keystore mapper",
+                "umount /run/keystore/rpool 2>/dev/null || true; \
+                 cryptsetup close keystore-rpool 2>/dev/null || true",
+            )
+            .await;
         let _ = self
             .log_and_execute(
                 "Recovery: zpool export -a",
@@ -156,7 +167,7 @@ impl<'a> DiskManager<'a> {
             .await;
         let _ = self.log_and_execute(
             "Recovery: close any crypt mappers",
-            "for m in $(ls /dev/mapper 2>/dev/null | grep -E '^(luks|crypt)' || true); do cryptsetup close \"$m\" 2>/dev/null || true; done"
+            "for m in $(ls /dev/mapper 2>/dev/null | grep -E '^(luks|crypt|keystore)' || true); do cryptsetup close \"$m\" 2>/dev/null || true; done"
         ).await;
 
         // 6) Finally wipe the disk and GPT
@@ -175,10 +186,15 @@ impl<'a> DiskManager<'a> {
         // unmount all ZFS, force-export every imported pool (which releases the
         // underlying disk/mapper), and close LUKS. Without this, a re-run over a
         // prior install fails at wipefs and cascades.
+        // Close the NativeKeystore mapper BEFORE the pool export loop — it holds
+        // /dev/zvol/rpool/keystore open, and `zpool export rpool` blocks on the
+        // busy pool otherwise. No-op on PlainLuks.
         let release_cmd = "for i in 1 2 3; do \
              mount | awk '$3 ~ \"/mnt/targetos\" {print $3}' | sort -r | xargs -r -n1 umount -lf 2>/dev/null || true; \
              done; \
              zfs unmount -a 2>/dev/null || true; \
+             umount /run/keystore/rpool 2>/dev/null || true; \
+             cryptsetup close keystore-rpool 2>/dev/null || true; \
              for p in $(zpool list -H -o name 2>/dev/null); do zpool export -f \"$p\" 2>/dev/null || true; done; \
              cryptsetup close luks 2>/dev/null || true";
         self.log_and_execute(
