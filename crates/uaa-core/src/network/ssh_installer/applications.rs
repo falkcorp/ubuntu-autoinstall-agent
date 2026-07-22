@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-17
+// last-edited: 2026-07-22
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -391,6 +391,8 @@ mod tests {
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
+            storage_mode: Default::default(),
+            disks: Vec::new(),
         }
     }
 
