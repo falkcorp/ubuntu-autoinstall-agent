@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/arp-discovery-scan.sh
-# version: 1.2.0
+# version: 1.2.1
 # guid: 8b1f4a37-2d90-4e6c-9a58-3f0c7b6e15d4
 # last-edited: 2026-07-22
 #
@@ -68,8 +68,10 @@ while true; do
     declare -A mac_ip
     while read -r line; do
         [[ -z "$line" ]] && continue
-        local_ip="$(awk '{print $1}' <<<"$line")"
-        local_mac="$(grep -ioE 'lladdr ([0-9a-f]{2}:){5}[0-9a-f]{2}' <<<"$line" | awk '{print $2}')"
+        # `|| true`: grep exits 1 on no-match, which under `set -e`+pipefail in a
+        # command substitution would kill the whole scanner. Same for getent below.
+        local_ip="$(awk '{print $1}' <<<"$line" || true)"
+        local_mac="$(grep -ioE 'lladdr ([0-9a-f]{2}:){5}[0-9a-f]{2}' <<<"$line" | awk '{print $2}' || true)"
         [[ -z "$local_mac" ]] && continue
         local_mac="${local_mac,,}"
         case "$local_ip" in
@@ -84,7 +86,8 @@ while true; do
         ip="${mac_ip[$mac]}"
         # getent reads /etc/hosts + DNS (so 172.16.2.45 -> rpi-serv-001.local);
         # strip a trailing .local for a clean name. Empty for unidentified devices.
-        host="$(getent hosts "$ip" 2>/dev/null | awk '{print $2}')"
+        # getent exits 2 on not-found, so `|| true` keeps `set -e` from killing us.
+        host="$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' || true)"
         host="${host%.local}"
         [[ -n "$host" ]] && named=$(( named + 1 ))
         if post_mac "$mac" "$ip" "$host"; then
