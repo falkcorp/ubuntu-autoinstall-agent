@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.10.0
+// version: 2.10.1
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -396,50 +396,70 @@ mod tests {
         // explicitly enabled (they must NOT rely on serde defaults for tang/tpm2).
         // Scoped to these four files only — the legacy examples/configs/*.yaml use
         // an older, incompatible schema and are intentionally not loaded here.
-        let cases = [
-            ("len-serv-001", "/dev/nvme0n1", "172.16.3.92/23"),
-            ("len-serv-002", "/dev/nvme0n1", "172.16.3.94/23"),
-            ("len-serv-003", "/dev/nvme0n1", "172.16.3.96/23"),
-            ("unimatrixone", "/dev/md/Volume0_0", "172.16.2.35/23"),
-        ];
-        for (host, disk, addr) in cases {
-            // workspace: examples/ stays at repo root; ../.. from crate dir
+        let load = |host: &str| -> InstallationConfig {
             let path = format!(
                 "{}/../../examples/configs/install/{}.yaml",
                 env!("CARGO_MANIFEST_DIR"),
                 host
             );
-            let cfg = InstallationConfig::from_yaml_file(&path)
-                .unwrap_or_else(|e| panic!("{host} config must parse: {e}"));
+            InstallationConfig::from_yaml_file(&path)
+                .unwrap_or_else(|e| panic!("{host} config must parse: {e}"))
+        };
 
+        // The len-servs are the PlainLuks (legacy single-disk) path.
+        let plain = [
+            ("len-serv-001", "/dev/nvme0n1", "172.16.3.92/23"),
+            ("len-serv-002", "/dev/nvme0n1", "172.16.3.94/23"),
+            ("len-serv-003", "/dev/nvme0n1", "172.16.3.96/23"),
+        ];
+        for (host, disk, addr) in plain {
+            let cfg = load(host);
+            assert_eq!(cfg.storage_mode, StorageMode::PlainLuks, "{host}: PlainLuks");
             assert_eq!(cfg.hostname, host, "{host}: hostname");
             assert_eq!(cfg.disk_device, disk, "{host}: disk_device");
             assert_eq!(cfg.network_address, addr, "{host}: network_address");
             assert_eq!(cfg.initramfs_type, InitramfsType::Dracut, "{host}: dracut");
-
-            // Tang + TPM2 must be explicit, not defaulted away.
             assert_eq!(cfg.tang_servers.len(), 3, "{host}: 3 tang servers");
             assert_eq!(cfg.tang_threshold, 2, "{host}: tang threshold");
             assert!(cfg.enroll_tpm2, "{host}: enroll_tpm2");
             assert!(cfg.expect_fido2, "{host}: expect_fido2");
-            assert!(
-                cfg.tpm2_pin.is_some(),
-                "{host}: tpm2_pin must be present (placeholder), not None"
-            );
-
-            // Guard against ever committing real secrets: the example files must
-            // carry placeholder tokens for every secret field.
-            assert_eq!(cfg.luks_key, "REPLACE_AT_PLACE_TIME", "{host}: luks_key placeholder");
-            assert_eq!(
-                cfg.root_password, "REPLACE_AT_PLACE_TIME",
-                "{host}: root_password placeholder"
-            );
             assert_eq!(
                 cfg.tpm2_pin.as_deref(),
                 Some("REPLACE_AT_PLACE_TIME"),
                 "{host}: tpm2_pin placeholder"
             );
+            assert_eq!(cfg.luks_key, "REPLACE_AT_PLACE_TIME", "{host}: luks_key placeholder");
+            assert_eq!(cfg.root_password, "REPLACE_AT_PLACE_TIME", "{host}: root_password");
         }
+
+        // unimatrixone is the NativeKeystore (ZFS native-encryption) path — the
+        // future server profile. Different unlock policy: enroll_tpm2/expect_fido2
+        // OFF (D2-B uses a clevis tpm2 pin, not the hanging systemd-tpm2 token).
+        let u1 = load("unimatrixone");
+        assert_eq!(u1.storage_mode, StorageMode::NativeKeystore, "u1: NativeKeystore");
+        assert_eq!(u1.network_address, "172.16.2.35/23", "u1: network_address");
+        assert_eq!(u1.initramfs_type, InitramfsType::Dracut, "u1: dracut");
+        // 4-disk roster: 2 system (Optane) + 2 data (SSD), all by-id.
+        assert_eq!(u1.disks.len(), 4, "u1: 4-disk roster");
+        assert_eq!(
+            u1.disks.iter().filter(|d| d.role == DiskRole::System).count(),
+            2,
+            "u1: 2 system disks"
+        );
+        assert_eq!(
+            u1.disks.iter().filter(|d| d.role == DiskRole::Data).count(),
+            2,
+            "u1: 2 data disks"
+        );
+        assert!(
+            u1.disks.iter().all(|d| d.id.starts_with("/dev/disk/by-id/")),
+            "u1: disks must be by-id"
+        );
+        assert_eq!(u1.tang_servers.len(), 3, "u1: 3 tang servers");
+        assert_eq!(u1.tang_threshold, 2, "u1: tang threshold (D2-B t=2)");
+        assert!(!u1.enroll_tpm2, "u1: enroll_tpm2 OFF (clevis tpm2 pin instead)");
+        assert!(!u1.expect_fido2, "u1: expect_fido2 OFF");
+        assert_eq!(u1.luks_key, "REPLACE_AT_PLACE_TIME", "u1: luks_key placeholder");
     }
 
     #[test]

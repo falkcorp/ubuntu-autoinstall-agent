@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/mod.rs
-// version: 1.5.0
+// version: 1.6.0
 // guid: sshmod01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -10,6 +10,7 @@
 
 pub mod applications;
 pub mod config;
+pub mod disk_native;
 pub mod disk_ops;
 pub mod installer;
 pub mod investigation;
@@ -19,6 +20,7 @@ pub mod partitions;
 pub mod reset_partition;
 pub mod status;
 pub mod system_setup;
+pub mod zfs_native;
 pub mod zfs_ops;
 
 pub use config::{InstallationConfig, SystemInfo};

@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.12.1
+// version: 2.13.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-22
 
@@ -9,13 +9,15 @@
 //! whether execution happens locally (`LocalClient`) or over SSH (`SshClient`).
 
 use super::applications::ApplicationInstaller;
-use super::config::{InstallationConfig, SystemInfo};
+use super::config::{InstallationConfig, StorageMode, SystemInfo};
+use super::disk_native::DiskNativeManager;
 use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
 use super::packages::PackageManager;
 use super::partitions::partition_path;
 use super::reset_partition::ResetPartitionStager;
 use super::system_setup::SystemConfigurator;
+use super::zfs_native::ZfsNativeManager;
 use super::zfs_ops::ZfsManager;
 use crate::network::{CommandExecutor, LocalClient, SshClient};
 use crate::Result;
@@ -870,17 +872,36 @@ impl SshInstaller {
         config: &InstallationConfig,
         auth: &WipeAuthorization,
     ) -> Result<()> {
-        info!("Phase 2: Disk preparation");
-        let mut dm = DiskManager::new(&mut *self.runner);
-        dm.prepare_disk(config, auth).await?;
+        info!("Phase 2: Disk preparation (storage_mode = {:?})", config.storage_mode);
+        // storage_mode selects the disk path; PlainLuks (default) is the proven
+        // single-disk Lenovo path, byte-identical to before; NativeKeystore is
+        // the multi-disk U1 / server-profile partitioner.
+        match config.storage_mode {
+            StorageMode::PlainLuks => {
+                let mut dm = DiskManager::new(&mut *self.runner);
+                dm.prepare_disk(config, auth).await?;
+            }
+            StorageMode::NativeKeystore => {
+                let mut dm = DiskNativeManager::new(&mut *self.runner);
+                dm.prepare_disks(config, auth).await?;
+            }
+        }
         info!("Phase 2 completed");
         Ok(())
     }
 
     async fn phase_3_zfs_creation(&mut self, config: &InstallationConfig) -> Result<()> {
-        info!("Phase 3: ZFS creation");
-        let mut zm = ZfsManager::new(&mut *self.runner, &mut self.variables);
-        zm.create_zfs_pools(config).await?;
+        info!("Phase 3: ZFS creation (storage_mode = {:?})", config.storage_mode);
+        match config.storage_mode {
+            StorageMode::PlainLuks => {
+                let mut zm = ZfsManager::new(&mut *self.runner, &mut self.variables);
+                zm.create_zfs_pools(config).await?;
+            }
+            StorageMode::NativeKeystore => {
+                let mut zm = ZfsNativeManager::new(&mut *self.runner, &mut self.variables);
+                zm.create_native_pools(config).await?;
+            }
+        }
         info!("Phase 3 completed");
         Ok(())
     }

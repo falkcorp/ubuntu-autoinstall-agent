@@ -1,51 +1,61 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 1.2.0
+# version: 2.0.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
-# last-edited: 2026-07-16
+# last-edited: 2026-07-22
 #
-# Per-host ZFS-on-LUKS install config for unimatrixone (Supermicro X10DSC+).
-# Deserializes into `InstallationConfig` (src/network/ssh_installer/config.rs);
-# fetched by the Option-2 installer image and run via `uaa install --config`.
-# Served at http://172.16.2.30/cloud-init/unimatrixone.yaml (place-time copy of this).
+# Per-host install config for unimatrixone (U1, Supermicro X10DSC+).
+# Deserializes into `InstallationConfig` (crates/uaa-core/src/network/ssh_installer/config.rs);
+# run via `uaa install --config`. Served at http://172.16.2.30/cloud-init/unimatrixone.yaml.
 #
-# Host facts: IP 172.16.2.35/23, PXE/data NIC = Intel 82599 10GbE, MAC ac:1f:6b:40:fc:e2,
-# power via IPMI 172.16.3.150 (ADMIN/ADMIN), NOT DASH.
+# ===========================================================================
+# STORAGE: ZFS NATIVE ENCRYPTION + keystore-zvol (the future standard "server
+# profile"), NOT the legacy single-disk ZFS-on-LUKS path the len-servs use.
+# Supersedes the old Intel IMSM/mdadm /dev/md/Volume0_0 config — IMSM was
+# dropped (fakeraid, CMOS-clear-fragile). See
+# docs/specs/u1-zfs-native-encryption-{design,plan}.md and the live-hardware
+# validation (2026-07-22). Topology (4 drives, all by-id — never sdX/nvmeXnY):
+#   - 2× Intel Optane M10 16G (system): ESP + bpool member + special-vdev member
+#   - 2× Crucial BX500 1TB   (data):    whole-disk rpool data mirror
+# ===========================================================================
 #
-# DISK: the Supermicro "BIOS RAID" is Intel IMSM/BIOS fake-RAID assembled by mdadm
-# into a single ~884.93 GiB volume presenting as /dev/md126 (VERIFIED live via fdisk,
-# 2026-07-09 — NOT /dev/sda; /dev/sda is a RAID *member*, wiping it destroys the array).
-# md devices take the `p` partition suffix (/dev/md126p1..p4), which the installer's
-# hardcoded {}p1 scheme already handles correctly.
+# Host facts: IP 172.16.2.35/23, NIC ens5f0 (Intel 82599 10GbE, MAC
+# ac:1f:6b:40:fc:e2), power via IPMI 172.16.3.150 (ADMIN/ADMIN).
 #
-# ⚠️ mdadm TODO (blocks u1 boot, not the Lenovos): the installer does NOT yet add
-# `mdadm` to the target package set, nor a dracut `mdraid` module. /dev/md126 must be
-# re-assembled inside the target initramfs BEFORE LUKS/ZFS unlock, so before installing
-# u1 the target needs `mdadm` installed + dracut `mdraid` in the initramfs. Tracked as a
-# work item; validate on the QEMU/mdadm path, not on hardware first.
-#
-# SECRETS below are PLACEHOLDERS. `from_yaml_file` does NO substitution, so the
-# place-time step must replace every REPLACE_AT_PLACE_TIME token with the real
-# per-host secret before serving. Never commit real luks_key/root_password/tpm2_pin.
+# SECRETS below are PLACEHOLDERS. `from_yaml_file` does NO substitution — the
+# place-time step replaces every REPLACE_AT_PLACE_TIME token before serving.
 
 hostname: unimatrixone
-# Stable IMSM volume name (udev symlink -> /dev/md126), so it survives the
-# md126/md127 kernel-name swap across boots. Partitions: /dev/md/Volume0_0p1..p4.
-disk_device: /dev/md/Volume0_0
 timezone: America/New_York
 
+storage_mode: native-keystore
+# Role-tagged disk roster (by-id, verified on the live target 2026-07-22).
+# `system` = Optane (ESP+bpool+special); `data` = SSD (whole-disk rpool mirror).
+disks:
+  - id: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT7250004C016D
+    role: system
+  - id: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT72320CJD016D
+    role: system
+  - id: /dev/disk/by-id/ata-CT1000BX500SSD1_2426E8BA1574
+    role: data
+  - id: /dev/disk/by-id/ata-CT1000BX500SSD1_2426E8BA2F4F
+    role: data
+
+# Required by the schema but IGNORED under native-keystore (the `disks` roster
+# drives partitioning). Points at the first Optane so any stray reference is a
+# real device, never garbage.
+disk_device: /dev/disk/by-id/nvme-INTEL_MEMPEK1W016GA_PHBT7250004C016D
+
 # --- secrets: injected per-host at place-time ---
+# For native-keystore, luks_key is the keystore-LUKS recovery passphrase
+# (break-glass at IPMI SOL); clevis Tang+TPM2 does the unattended unlock.
 luks_key: REPLACE_AT_PLACE_TIME
 root_password: REPLACE_AT_PLACE_TIME
 
-# NOT a per-host secret — the same install CA cert for every host, filled in
-# automatically by `uaa config place` from /var/lib/uaa/ca/ca.crt on the
-# server (Decision 7). Written to /etc/uaa/install-ca.crt on the target so
-# `uaa enroll` finds it. Left unsubstituted here it fails closed.
+# NOT a per-host secret — the same install CA cert for every host, filled in by
+# `uaa config place` from /var/lib/uaa/ca/ca.crt on the server. Fails closed if
+# left unsubstituted.
 install_ca_cert: REPLACE_AT_PLACE_TIME
 
-# NIC confirmed on the live target 2026-07-09: the 82599 port with 172.16.2.35 +
-# MAC ac:1f:6b:40:fc:e2 is `ens5f0` (systemd predictable name, PCI-path based, so
-# stable into the installed system). ens5f1 is the second, unused port.
 network_interface: ens5f0
 network_address: 172.16.2.35/23
 network_gateway: 172.16.2.1
@@ -59,7 +69,11 @@ debootstrap_release: resolute
 debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
 initramfs_type: dracut
 
-# clevis Tang SSS: 2-of-3 must respond to auto-unlock on-LAN.
+# Unlock policy D2-B — clevis SSS t=2 over {3 Tang (thumbprint-pinned) + 1 TPM2
+# peer (PCR7, sha256 bank)}, bound to the keystore-zvol LUKS. Any 2 of the 4
+# shares unlock: survives 2 Tang down (TPM + 1 Tang), stays locked off-LAN (TPM
+# alone < 2). The TPM2 peer is a clevis *pin* (added automatically under
+# native-keystore), NOT the systemd-tpm2 token path — see enroll_tpm2 below.
 tang_servers:
   - url: http://172.16.2.45
   - url: http://172.16.2.46
@@ -71,13 +85,9 @@ ssh_authorized_keys:
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local"
   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820"
 
-# TPM2 + PIN keyslot enrolled on FIRST boot (binds installed-system PCRs).
-# TPM was enabled/activated/owned in BIOS (see project memory). tpm2_pin is a secret
-# placeholder: if left unsubstituted, first-boot enrollment runs with a bogus PIN.
-enroll_tpm2: true
-tpm2_pin: REPLACE_AT_PLACE_TIME
+# D2-B decision 5: NO systemd-tpm2 / systemd-fido2 tokens — they hang the boot
+# (R4) and can never be unattended. The TPM2 factor is the clevis tpm2 PIN
+# (added by the native-keystore clevis bind), a different mechanism. So:
+enroll_tpm2: false
 tpm2_pcr_ids: "7"
-
-# FIDO2/YubiKey keyslot enrolled MANUALLY post-install; this only asserts intent
-# so `verify` checks a fido2 keyslot exists.
-expect_fido2: true
+expect_fido2: false
