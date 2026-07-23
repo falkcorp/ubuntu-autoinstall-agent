@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/disk_native.rs
-// version: 1.0.0
+// version: 2.0.0
 // guid: caac7413-829a-44ec-9a7f-9f725b27faba
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Multi-disk partitioner for [`StorageMode::NativeKeystore`] (U1 / the future
 //! server profile) — the *applier* that turns [`layout::plan_layout`]'s pure
@@ -9,18 +9,21 @@
 //!
 //! Parallel to [`super::disk_ops::DiskManager`] (the single-disk PlainLuks
 //! path), selected by `config.storage_mode` in the installer's Phase 2. It
-//! **only** partitions: the System (Optane) disks get `ESP + bpool + special`;
-//! the Data (SSD) disks are left whole-disk (consumed raw by `rpool`). The pool,
-//! keystore zvol, and its LUKS are Phase 3 ([`super::zfs_native`]) — there is no
-//! root-LUKS mapper here (unlike PlainLuks, whose p4 is the encrypted root).
+//! **only** partitions: the System (bootable SATA SSD) disks get
+//! `ESP + bpool + data`; the Special (Optane) disks get a single half-disk
+//! `special` member (the other half is left free for a future spinning array —
+//! see [`super::layout`]). Every disk is partitioned; there are no whole-disk
+//! vdevs. The pool, keystore zvol, and its LUKS are Phase 3
+//! ([`super::zfs_native`]) — there is no root-LUKS mapper here (unlike
+//! PlainLuks, whose p4 is the encrypted root).
 //!
-//! Every command mirrors the sequence hand-validated on the real U1 hardware
-//! (2026-07-22): `wipefs -a` + `sgdisk --zap-all` per disk, then
+//! Every command mirrors the sequence hand-validated on real U1 hardware:
+//! `wipefs -a` + `sgdisk --zap-all` per disk, then
 //! `sgdisk -n N:0:<end> -t N:<code> -c N:<label>` per partition.
 //!
 //! [`StorageMode::NativeKeystore`]: super::config::StorageMode::NativeKeystore
 
-use super::config::{DiskRole, InstallationConfig};
+use super::config::InstallationConfig;
 use super::installer::WipeAuthorization;
 use super::layout::{self, PartSize, Partition};
 use crate::network::CommandExecutor;
@@ -68,8 +71,8 @@ impl<'a> DiskNativeManager<'a> {
 
         self.cleanup_existing().await?;
 
-        // Wipe every target disk (System + Data), then lay down partitions only
-        // on the System disks; Data disks stay whole-disk for the rpool mirror.
+        // Wipe then partition every target disk: System (SSD) → ESP+bpool+data,
+        // Special (Optane) → the half-disk special member. No whole-disk vdevs.
         for dp in &plan.disks {
             self.wipe_disk(&dp.id).await?;
             for part in &dp.partitions {
@@ -80,29 +83,24 @@ impl<'a> DiskNativeManager<'a> {
                 )
                 .await?;
             }
-            if dp.role == DiskRole::Data {
-                info!("{} left whole-disk (rpool data member)", dp.id);
-            }
         }
 
         // Re-read partition tables and wait for the by-id `-partN` symlinks the
-        // pool creation (Phase 3) will reference.
-        let system_ids: Vec<&str> = plan
-            .system_disks()
-            .map(|d| d.id.as_str())
-            .collect();
+        // pool creation (Phase 3) will reference — on every disk now, since both
+        // roles carry ZFS member partitions (System p2/p3, Special p1).
+        let all_ids: Vec<&str> = plan.disks.iter().map(|d| d.id.as_str()).collect();
         self.log_and_execute(
             "Re-read partition tables",
-            &format!("partprobe {} 2>/dev/null || true", system_ids.join(" ")),
+            &format!("partprobe {} 2>/dev/null || true", all_ids.join(" ")),
         )
         .await?;
         self.log_and_execute("Settle udev", "udevadm settle").await?;
 
         // Format each System disk's ESP as FAT32 — the base-system install mounts
         // it at /boot/efi and grub-install writes the signed shim there. (bpool /
-        // special / data partitions are ZFS members and are formatted by `zpool
+        // data / special partitions are ZFS members and are formatted by `zpool
         // create`, so only the ESP needs an mkfs.) Two independent ESPs, one per
-        // Optane, per the two-ESPs-in-NVRAM design.
+        // bootable SATA SSD, per the two-ESPs-in-NVRAM design.
         for (i, dp) in plan.system_disks().enumerate() {
             self.log_and_execute(
                 &format!("Format ESP on {}", dp.id),
@@ -195,10 +193,10 @@ mod tests {
 
     fn u1_roster() -> Vec<DiskSpec> {
         vec![
-            DiskSpec { id: "/dev/disk/by-id/nvme-OPT0".into(), role: DiskRole::System },
-            DiskSpec { id: "/dev/disk/by-id/nvme-OPT1".into(), role: DiskRole::System },
-            DiskSpec { id: "/dev/disk/by-id/ata-SSD0".into(), role: DiskRole::Data },
-            DiskSpec { id: "/dev/disk/by-id/ata-SSD1".into(), role: DiskRole::Data },
+            DiskSpec { id: "/dev/disk/by-id/ata-SSD0".into(), role: DiskRole::System },
+            DiskSpec { id: "/dev/disk/by-id/ata-SSD1".into(), role: DiskRole::System },
+            DiskSpec { id: "/dev/disk/by-id/nvme-OPT0".into(), role: DiskRole::Special },
+            DiskSpec { id: "/dev/disk/by-id/nvme-OPT1".into(), role: DiskRole::Special },
         ]
     }
 
@@ -211,28 +209,31 @@ mod tests {
     }
 
     #[test]
-    fn optane_partition_commands_match_validated_hand_run() {
+    fn system_ssd_partition_commands_are_esp_bpool_data() {
         let plan = plan_layout(&u1_roster()).expect("valid roster");
-        let opt0 = plan.system_disks().next().expect("a system disk");
-        let cmds: Vec<String> = opt0
+        let ssd0 = plan.system_disks().next().expect("a system disk");
+        let cmds: Vec<String> = ssd0
             .partitions
             .iter()
-            .map(|p| DiskNativeManager::build_sgdisk(&opt0.id, p))
+            .map(|p| DiskNativeManager::build_sgdisk(&ssd0.id, p))
             .collect();
-        // p1 ESP 1G EF00, p2 bpool 2G BE00, p3 special rest BF00 — exactly the
-        // sequence proven on real U1 hardware.
+        // p1 ESP 1G EF00, p2 bpool 2G BE00, p3 data rest BF00 — boot lives on the
+        // bootable SATA SSD now (the firmware can't boot the Optane).
         assert!(cmds[0].contains("sgdisk -n 1:0:+1G -t 1:EF00 -c 1:'ESP1'"));
         assert!(cmds[1].contains("sgdisk -n 2:0:+2G -t 2:BE00 -c 2:'bpool-0'"));
-        assert!(cmds[2].contains("sgdisk -n 3:0:0 -t 3:BF00 -c 3:'special-0'"));
-        assert!(cmds[2].ends_with(&opt0.id));
+        assert!(cmds[2].contains("sgdisk -n 3:0:0 -t 3:BF00 -c 3:'data-0'"));
+        assert!(cmds[2].ends_with(&ssd0.id));
     }
 
     #[test]
-    fn data_disks_have_no_partition_commands() {
+    fn special_optane_gets_one_half_disk_partition() {
         let plan = plan_layout(&u1_roster()).expect("valid roster");
-        for d in plan.data_disks() {
-            assert!(d.partitions.is_empty(), "SSD {} is whole-disk", d.id);
-        }
+        let opt0 = plan.special_disks().next().expect("a special disk");
+        assert_eq!(opt0.partitions.len(), 1, "Optane has exactly one special member");
+        let cmd = DiskNativeManager::build_sgdisk(&opt0.id, &opt0.partitions[0]);
+        // p1 special, fixed 6G (half the drive, NOT ':0' remainder), BF00.
+        assert!(cmd.contains("sgdisk -n 1:0:+6G -t 1:BF00 -c 1:'special-0'"), "got: {cmd}");
+        assert!(cmd.ends_with(&opt0.id));
     }
 
     #[test]

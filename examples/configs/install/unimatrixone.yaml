@@ -1,7 +1,7 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 3.0.0
+# version: 3.1.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
-# last-edited: 2026-07-22
+# last-edited: 2026-07-23
 #
 # NativeKeystore (ZFS native-encryption) install TEMPLATE — the future standard
 # "server profile". This is a SANITIZED schema example: every host-unique
@@ -13,25 +13,29 @@
 #
 # Deserializes into `InstallationConfig` (crates/uaa-core/.../config.rs).
 #
-# Topology (4 drives, all by-id — never sdX/nvmeXnY):
-#   - 2× Optane (system): ESP + bpool member + special-vdev member
-#   - 2× SSD    (data):    whole-disk rpool data mirror
+# Topology (4 drives, all by-id — never sdX/nvmeXnY). REVISED 2026-07-23: the
+# X10DSC+ firmware cannot boot from NVMe, so the ESP + bpool moved onto the
+# bootable SATA SSDs; the Optanes keep the metadata (special) vdev.
+#   - 2× SSD    (system):  ESP + bpool member + rpool data mirror (bootable)
+#   - 2× Optane (special): half-disk special (metadata) vdev; other half left
+#                          free for a future spinning-disk array's special vdev
 
 hostname: unimatrixone
 timezone: America/New_York
 
 storage_mode: native-keystore
-# Role-tagged disk roster, by-id. `system` = Optane (ESP+bpool+special);
-# `data` = SSD (whole-disk rpool mirror). Real serials injected at place-time.
+# Role-tagged disk roster, by-id. `system` = bootable SATA SSD (ESP + bpool +
+# rpool data); `special` = Optane (half-disk metadata vdev). Real serials
+# injected at place-time.
 disks:
-  - id: REPLACE_AT_PLACE_TIME_SYSTEM_0
+  - id: REPLACE_AT_PLACE_TIME_SYSTEM_SSD_0
     role: system
-  - id: REPLACE_AT_PLACE_TIME_SYSTEM_1
+  - id: REPLACE_AT_PLACE_TIME_SYSTEM_SSD_1
     role: system
-  - id: REPLACE_AT_PLACE_TIME_DATA_0
-    role: data
-  - id: REPLACE_AT_PLACE_TIME_DATA_1
-    role: data
+  - id: REPLACE_AT_PLACE_TIME_SPECIAL_OPTANE_0
+    role: special
+  - id: REPLACE_AT_PLACE_TIME_SPECIAL_OPTANE_1
+    role: special
 
 # Required by the schema but IGNORED under native-keystore (the `disks` roster
 # drives partitioning). Placeholder — injected at place-time.

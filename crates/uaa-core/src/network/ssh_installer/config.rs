@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.10.2
+// version: 2.11.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Configuration structures for SSH/local installation
 
@@ -198,11 +198,15 @@ impl StorageMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DiskRole {
-    /// Fast/small device (Optane): carries ESP + bpool member + the `special`
-    /// (metadata) vdev member.
+    /// Bootable bulk device (SATA SSD): carries the ESP + bpool member + the
+    /// `rpool` **data** vdev member (as `p3`). This is the boot disk — the
+    /// X10DSC+ firmware cannot boot from NVMe, so the ESP/bootloader must live
+    /// here, not on the Optane (see [`super::layout`], design 2026-07-23).
     System,
-    /// Bulk device (SSD): a whole-disk `rpool` data-vdev member.
-    Data,
+    /// Fast small device (Optane): a **half-disk** `rpool` `special` (metadata)
+    /// vdev member. The other half is left free, reserved for a future
+    /// spinning-disk array's special vdev.
+    Special,
 }
 
 /// One disk in the [`StorageMode::NativeKeystore`] roster.
@@ -443,17 +447,17 @@ mod tests {
         let u1 = load("unimatrixone");
         assert_eq!(u1.storage_mode, StorageMode::NativeKeystore, "u1: NativeKeystore");
         assert_eq!(u1.initramfs_type, InitramfsType::Dracut, "u1: dracut");
-        // 4-disk roster shape: 2 system (Optane) + 2 data (SSD).
+        // 4-disk roster shape: 2 system (bootable SATA SSD) + 2 special (Optane).
         assert_eq!(u1.disks.len(), 4, "u1: 4-disk roster");
         assert_eq!(
             u1.disks.iter().filter(|d| d.role == DiskRole::System).count(),
             2,
-            "u1: 2 system disks"
+            "u1: 2 system (SSD) disks"
         );
         assert_eq!(
-            u1.disks.iter().filter(|d| d.role == DiskRole::Data).count(),
+            u1.disks.iter().filter(|d| d.role == DiskRole::Special).count(),
             2,
-            "u1: 2 data disks"
+            "u1: 2 special (Optane) disks"
         );
         assert_eq!(u1.tang_servers.len(), 3, "u1: 3 tang servers");
         assert_eq!(u1.tang_threshold, 2, "u1: tang threshold (D2-B t=2)");

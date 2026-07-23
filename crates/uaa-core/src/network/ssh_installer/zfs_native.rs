@@ -1,16 +1,18 @@
 // file: crates/uaa-core/src/network/ssh_installer/zfs_native.rs
-// version: 1.0.0
+// version: 2.0.0
 // guid: bca3258c-2a81-4e7d-a50b-50128c83b2cc
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! ZFS **native-encryption** pool + keystore builder for
 //! [`StorageMode::NativeKeystore`] (U1 / the future server profile) — Phase 3's
 //! parallel to [`super::zfs_ops::ZfsManager`], selected by `config.storage_mode`.
 //!
-//! Builds, in the order proven on real U1 hardware (2026-07-22):
-//! 1. `bpool` = mirror of the two System (Optane) `p2`s — GRUB-compatible `/boot`.
-//! 2. `rpool` = mirror(Data SSDs) `[data]` + mirror(System `p3`s) `[special]`,
-//!    **root unencrypted**, `special_small_blocks=0`.
+//! Builds, in the order proven on real U1 hardware:
+//! 1. `bpool` = mirror of the two System (bootable SATA SSD) `p2`s —
+//!    GRUB-compatible `/boot` on a disk the firmware can boot (the Optane can't).
+//! 2. `rpool` = mirror(System `p3`s) `[data]` + mirror(Special/Optane `p1`s)
+//!    `[special]`, **root unencrypted**, `special_small_blocks=0` (metadata only
+//!    — the data pool is SSD, so no small-file offload is worthwhile).
 //! 3. `rpool/keystore` zvol (`encryption=off`) → LUKS2 (opened with the
 //!    `luks_key` recovery passphrase) → ext4 → `system.key` (32 raw bytes).
 //! 4. `rpool/ROOT` + `rpool/USERDATA` as the **encryptionroots**
@@ -66,11 +68,13 @@ impl<'a> ZfsNativeManager<'a> {
         let plan = layout::plan_layout(&config.disks)
             .map_err(|e| crate::error::AutoInstallError::ConfigError(e.to_string()))?;
         let sys: Vec<&str> = plan.system_disks().map(|d| d.id.as_str()).collect();
-        let data: Vec<&str> = plan.data_disks().map(|d| d.id.as_str()).collect();
+        let spec: Vec<&str> = plan.special_disks().map(|d| d.id.as_str()).collect();
         // plan_layout guarantees >=2 of each, so these indexes are safe.
+        // bpool + data live on the bootable SATA SSDs (System p2/p3); the special
+        // metadata mirror lives on the Optanes' half-disk p1.
         let bpool_members = format!("{}-part2 {}-part2", sys[0], sys[1]);
-        let special_members = format!("{}-part3 {}-part3", sys[0], sys[1]);
-        let data_members = data.join(" ");
+        let data_members = format!("{}-part3 {}-part3", sys[0], sys[1]);
+        let special_members = format!("{}-part1 {}-part1", spec[0], spec[1]);
 
         self.log_and_execute("Ensure altroot", "mkdir -p /mnt/targetos")
             .await?;
@@ -91,8 +95,8 @@ impl<'a> ZfsNativeManager<'a> {
         Ok(())
     }
 
-    /// bpool: GRUB-compatible mirror across the two Optane `p2`s (feature set
-    /// mirrors `zfs_ops::build_bpool_create_command`).
+    /// bpool: GRUB-compatible mirror across the two System SSD `p2`s (feature
+    /// set mirrors `zfs_ops::build_bpool_create_command`).
     async fn create_bpool(&mut self, members: &str) -> Result<()> {
         let cmd = format!(
             "zpool create -f -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
@@ -101,12 +105,12 @@ impl<'a> ZfsNativeManager<'a> {
              -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
              -m none -R /mnt/targetos bpool mirror {members}"
         );
-        self.log_and_execute("Creating bpool (mirror of Optane p2)", &cmd)
+        self.log_and_execute("Creating bpool (mirror of System SSD p2)", &cmd)
             .await
     }
 
-    /// rpool: data mirror(SSDs) + special metadata mirror(Optane p3), root
-    /// UNENCRYPTED (encryption lives on rpool/ROOT + rpool/USERDATA).
+    /// rpool: data mirror(System SSD p3) + special metadata mirror(Optane p1),
+    /// root UNENCRYPTED (encryption lives on rpool/ROOT + rpool/USERDATA).
     async fn create_rpool(&mut self, data_members: &str, special_members: &str) -> Result<()> {
         let cmd = format!(
             "zpool create -f -o ashift=12 -o autotrim=on \
