@@ -283,6 +283,13 @@ async fn backfill_placed_configs(
 /// dismissed discovered row is skipped. Never regresses an existing row.
 async fn backfill_discovered_named(registry: &dyn Registry, known: &mut HashSet<String>) {
     for row in crate::discovered::DiscoveredStore::default().list() {
+        // Phones/watches/IoT (and randomized-MAC devices) are not install
+        // targets: keep them out of the machine registry entirely, not just the
+        // discovery view. A named Apple device would otherwise be promoted to a
+        // `Seen` machine row here — the exact clutter this feature removes.
+        if row.category == crate::oui::DeviceCategory::NonMachine {
+            continue;
+        }
         let Some(hostname) = row.hostname.filter(|h| !h.is_empty()) else {
             continue; // unidentified noise — never enters the fleet list
         };

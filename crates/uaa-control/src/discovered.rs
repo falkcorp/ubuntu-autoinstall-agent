@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/discovered.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 2f9c7b41-6d8e-4a3f-9b5c-1e7d0a4b8c62
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Discovery inbox — every device that ARPs/DHCPs on the segment, surfaced for
 //! operator triage (`GET /api/discovered` → SPA Discovery page).
@@ -72,6 +72,14 @@ impl DiscoveredStore {
     pub fn list(&self) -> Vec<DiscoveredMacRow> {
         let _guard = FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut rows = read_rows(&self.path);
+        // Enrich on read: vendor + category are pure functions of the MAC, so
+        // they are computed here rather than persisted — keeps the on-disk
+        // shape byte-identical and always reflects the current OUI table.
+        for row in &mut rows {
+            let (vendor, category) = crate::oui::enrich(&row.mac);
+            row.vendor = vendor;
+            row.category = category;
+        }
         rows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.mac.cmp(&b.mac)));
         rows
     }
@@ -110,6 +118,9 @@ impl DiscoveredStore {
                 mac,
                 ip,
                 hostname,
+                // Derived on read (see `list`); never written to disk.
+                vendor: None,
+                category: crate::oui::DeviceCategory::default(),
                 first_seen: now.clone(),
                 last_seen: now,
                 dismissed: false,
