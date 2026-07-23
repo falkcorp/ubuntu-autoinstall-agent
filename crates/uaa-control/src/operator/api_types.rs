@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.5.0
+// version: 1.6.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
@@ -58,6 +58,17 @@ pub struct DiscoveredMacRow {
     /// `None` is an unidentified device (phone/IoT), hidden by default in the SPA.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// IEEE OUI-resolved manufacturer (e.g. `"Apple, Inc."`), or `None` for an
+    /// unknown or randomized prefix. **Derived on read** by
+    /// [`crate::discovered::DiscoveredStore::list`]; never persisted (the
+    /// `skip_serializing_if` keeps it out of the on-disk row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Device class derived from the MAC (see [`crate::oui`]). Lets the SPA
+    /// bucket phones/watches/IoT (`"na"`) out of the machine triage view.
+    /// Also derived on read; `Unknown` is skipped so it never persists.
+    #[serde(default, skip_serializing_if = "crate::oui::DeviceCategory::is_unknown")]
+    pub category: crate::oui::DeviceCategory,
     pub first_seen: String,
     pub last_seen: String,
     pub dismissed: bool,

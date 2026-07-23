@@ -1,7 +1,7 @@
 // file: web/src/api/types.ts
-// version: 1.2.0
+// version: 1.3.0
 // guid: b7bd1fea-0d99-4db5-a81c-6d6b2a8e9100
-// last-edited: 2026-07-18
+// last-edited: 2026-07-23
 
 // Typed DTOs mirroring CT-07's operator API responses. Names are kept
 // identical to CT-07's api_types.rs (MachineRow, EnrollmentRow,
@@ -30,10 +30,22 @@ export interface EnrollmentRow {
 }
 
 /** One row from GET /api/discovered (unknown PXE MACs / discovery inbox). */
+/**
+ * Device class derived server-side from the MAC (see crate `oui`).
+ * `"na"` = phone/watch/tablet/IoT or a randomized MAC — not an install target.
+ * Absent on the wire means `"unknown"` (skipped when unknown to keep the
+ * on-disk row clean).
+ */
+export type DeviceCategory = "machine" | "na" | "unknown";
+
 export interface DiscoveredMacRow {
   mac: string;
   ip?: string | null;
   hostname?: string | null;
+  /** IEEE OUI-resolved manufacturer, or null for an unknown/randomized prefix. */
+  vendor?: string | null;
+  /** Derived device class; treat a missing value as "unknown". */
+  category?: DeviceCategory;
   first_seen: string;
   last_seen: string;
   dismissed: boolean;

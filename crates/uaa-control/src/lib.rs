@@ -22,6 +22,7 @@ pub mod db;
 pub mod discovered; // neighbor-table (ARP/NDP) discovery inbox
 pub mod listeners;
 pub mod machine_plane;
+pub mod oui; // MAC→vendor (OUI) lookup + device classification for discovery
 
 // Follower-owned stub modules (one exclusive filler each — see each file's header).
 pub mod audit; // CT-04
