@@ -1,7 +1,7 @@
 <!-- file: docs/specs/u1-zfs-native-encryption-design.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: e7a1c9d4-2b6f-4e83-9a15-8c4d0f7b3e21 -->
-<!-- last-edited: 2026-07-22 -->
+<!-- last-edited: 2026-07-23 -->
 
 # U1 ZFS Native Encryption + Keystore — Design Spec
 
@@ -29,31 +29,39 @@ Build the pool with **ZFS native encryption** (`encryption=on`,
 `encryption=off`) that holds a LUKS container wrapping `system.key`. The
 keystore LUKS is unlocked at boot by **clevis SSS `t=2`** over
 **{3 Tang (thumbprint-pinned) + 1 TPM2 peer-share}** — no `systemd-tpm2` /
-`systemd-fido2` tokens (they hang the boot). Two small Optanes carry boot +
-the pool's fast **metadata** (a mirrored `special` vdev); two large SSDs carry
-the **bulk** data mirror. Secure Boot is on, using Canonically-signed modules.
-Break-glass is a recovery key at IPMI SOL.
+`systemd-fido2` tokens (they hang the boot). Two large SATA SSDs carry **boot +
+bulk** (ESP + bpool + the rpool data mirror); two small Optanes carry the pool's
+fast **metadata** (a mirrored `special` vdev). Secure Boot is on, using
+Canonically-signed modules. Break-glass is a recovery key at IPMI SOL.
+
+> **Revised 2026-07-23:** an earlier draft put boot (ESP + bpool) on the
+> Optanes. The X10DSC+ firmware **cannot boot from NVMe** — it enumerates the
+> Optanes for the OS but its UEFI boot manager has no NVMe entry (proved with a
+> clean ext4 test install that would not boot off the Optane). Boot therefore
+> lives on the SATA SSDs; the Optanes are reduced to a **half-disk** `special`
+> vdev, with the other half reserved for a future spinning-disk array's special
+> vdev.
 
 ## 2. Topology
 
 ```mermaid
 graph TD
-  subgraph OPT["2× Optane · 16 GB · fast (system + metadata)"]
-    O0["Optane 0<br/>ESP#1 · bpool-0 · special-0"]
-    O1["Optane 1<br/>ESP#2 · bpool-1 · special-1"]
+  subgraph SSD["2× SATA SSD · large · bootable (system + bulk)"]
+    S0["SSD 0<br/>ESP#1 · bpool-0 · data-0"]
+    S1["SSD 1<br/>ESP#2 · bpool-1 · data-1"]
   end
-  subgraph SSD["2× SSD · large (bulk)"]
-    S0["SSD 0<br/>data-0 (whole disk)"]
-    S1["SSD 1<br/>data-1 (whole disk)"]
+  subgraph OPT["2× Optane · 16 GB · fast (metadata only)"]
+    O0["Optane 0<br/>special-0 (half disk)"]
+    O1["Optane 1<br/>special-1 (half disk)"]
   end
-  O0 -. mirror .- O1
   S0 -. mirror .- S1
-  O0 --> BP["bpool (mirror)<br/>plaintext /boot"]
-  O1 --> BP
-  O0 --> SP["rpool special vdev (mirror)<br/>metadata, ~13G"]
-  O1 --> SP
+  O0 -. mirror .- O1
+  S0 --> BP["bpool (mirror)<br/>plaintext /boot"]
+  S1 --> BP
   S0 --> DV["rpool data vdev (mirror)<br/>the bulk"]
   S1 --> DV
+  O0 --> SP["rpool special vdev (mirror)<br/>metadata, ~6G"]
+  O1 --> SP
   SP --> RP["rpool — ZFS native encryption=on"]
   DV --> RP
   RP --> KS["rpool/keystore zvol (encryption=off)<br/>→ LUKS → system.key"]
@@ -61,17 +69,19 @@ graph TD
   KS -. unlocks .-> DS
 ```
 
-Partition scheme (both Optanes symmetric; SSDs whole-disk):
+Partition scheme (both SSDs symmetric; both Optanes symmetric, half-disk):
 
 | Device | p1 | p2 | p3 |
 |---|---|---|---|
-| Optane 0 (16 G) | ESP #1 (~1 G, FAT32, NVRAM) | bpool-0 (~2 G) | special-0 (~13 G) |
-| Optane 1 (16 G) | ESP #2 (~1 G, FAT32, NVRAM) | bpool-1 (~2 G) | special-1 (~13 G) |
-| SSD 0 (large) | — | — | data-0 (whole disk) |
-| SSD 1 (large) | — | — | data-1 (whole disk) |
+| SSD 0 (large, boot) | ESP #1 (~1 G, FAT32, NVRAM) | bpool-0 (~2 G) | data-0 (rest) |
+| SSD 1 (large, boot) | ESP #2 (~1 G, FAT32, NVRAM) | bpool-1 (~2 G) | data-1 (rest) |
+| Optane 0 (16 G) | special-0 (6 G) · rest free | — | — |
+| Optane 1 (16 G) | special-1 (6 G) · rest free | — | — |
 
-- `bpool = mirror(Optane0.p2, Optane1.p2)` — unencrypted `/boot`.
-- `rpool = mirror(SSD0, SSD1) [data] + mirror(Optane0.p3, Optane1.p3) [special]`.
+- `bpool = mirror(SSD0.p2, SSD1.p2)` — unencrypted `/boot` on bootable SATA.
+- `rpool = mirror(SSD0.p3, SSD1.p3) [data] + mirror(Optane0.p1, Optane1.p1) [special]`.
+- The Optane `special` partition is **half the drive**; the other half is left
+  unpartitioned, reserved for a future spinning-disk array's special vdev.
 - Both ESPs registered in NVRAM; **never** mdadm-mirrored (firmware/fwupd write
   behind md's back and a later resync can push a stale ESP over a fresh one).
 
@@ -90,11 +100,17 @@ Partition scheme (both Optanes symmetric; SSDs whole-disk):
    unencrypted parent. `rpool/ROOT`+`rpool/USERDATA` are the *stock* Ubuntu
    encryptionroots, not a custom `rpool/enc`, so the "stock, not custom" intent
    above still holds.)
-2. **4-drive topology with a `special` allocation-class vdev.** Bulk data on
-   the SSD mirror; metadata on the Optane mirror. This is what lets 16 G Optanes
-   accelerate a multi-TB pool without matching its size, and puts "the vast
-   majority of rpool" on the SSDs. `special_small_blocks=0` (metadata only).
-   The special vdev **must** be mirrored — its loss faults the pool.
+2. **4-drive topology with a `special` allocation-class vdev.** Boot + bulk data
+   on the SATA SSD mirror; metadata on the Optane mirror. This is what lets 16 G
+   Optanes accelerate a multi-TB pool without matching its size, and puts "the
+   vast majority of rpool" on the SSDs. `special_small_blocks=0` (metadata only)
+   — the data pool is itself SSD, so there is no small-file latency to offload
+   (offload only pays in front of spinning rust; decision 2026-07-23). The
+   special vdev **must** be mirrored — its loss faults the pool. The Optane
+   `special` partition is **half-disk**; the other half is reserved for a future
+   spinning-disk array's special vdev. **Boot lives on the SATA SSDs, not the
+   Optanes** (2026-07-23): the X10DSC+ firmware cannot boot NVMe, so ESP + bpool
+   moved off the Optane onto the bootable SATA disks.
 3. **Keystore = zvol(`encryption=off`) wrapping a LUKS container.** `encryption=off`
    is at the **ZFS layer only**, so the zvol is readable on `zpool import`
    *without* rpool's key — this breaks the chicken-and-egg (the key lives inside
