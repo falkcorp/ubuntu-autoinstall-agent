@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/mod.rs
-// version: 1.4.0
+// version: 1.4.1
 // guid: a24bb30b-4056-4a4d-9817-673754a41981
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Host-group / per-host profile scaffolding (DS-PRF-01).
 //!
@@ -87,8 +87,9 @@ pub struct InstallationConfigPartial {
     /// Multi-disk roster for NativeKeystore hosts (by-id + role).
     pub disks: Option<Vec<crate::network::ssh_installer::config::DiskSpec>>,
     /// Nested disk-layout authoring block (PS-DISK-01 component, wrapped by
-    /// [`DiskLayoutPartial`] below). No merge/lower logic here — deferred to
-    /// PS-MERGE-13/PS-LOWER-12.
+    /// [`DiskLayoutPartial`] below). Resolved variant-select-by-kind (with a
+    /// same-kind field-partial override) in [`merge`] (PS-MERGE-13) and
+    /// flattened to the wire config in [`lower`] (PS-LOWER-12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_layout: Option<DiskLayoutPartial>,
     /// Nested unlock-policy authoring block (PS-UNLOCK-02 component).
