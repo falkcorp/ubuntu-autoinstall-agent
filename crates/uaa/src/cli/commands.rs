@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.12.1
+// version: 2.12.2
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Command implementations for the CLI
 
@@ -795,6 +795,10 @@ fn create_local_installation_config(
         // native-keystore + multi-disk (U1) is driven from profiles, not here.
         storage_mode: Default::default(),
         disks: Vec::new(),
+        arch: Default::default(),
+        role: Default::default(),
+        firmware_quirks: Vec::new(),
+        hooks: Default::default(),
     })
 }
 

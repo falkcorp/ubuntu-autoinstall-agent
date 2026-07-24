@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.3.0
+// version: 1.3.1
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
 // last-edited: 2026-07-23
 
@@ -408,6 +408,10 @@ mod tests {
             applications: vec![],
             storage_mode: Default::default(),
             disks: Vec::new(),
+            arch: Default::default(),
+            role: Default::default(),
+            firmware_quirks: Vec::new(),
+            hooks: Default::default(),
         }
     }
 
