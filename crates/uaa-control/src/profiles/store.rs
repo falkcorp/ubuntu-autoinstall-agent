@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/store.rs
-// version: 0.5.0
+// version: 0.6.0
 // guid: b0c81b2d-2a46-40e3-855b-408cf3708503
-// last-edited: 2026-07-18
+// last-edited: 2026-07-23
 
 //! `ProfileStore` — per-concern persistence trait for host groups / profiles /
 //! hostname allocations / profile versions (spec `deploy-system-design.md`,
@@ -125,6 +125,53 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+// ── schema_version envelope gate (PS-SCHEMA-20, expand step) ────────────────
+
+/// The highest on-disk envelope `schema_version` (see
+/// [`HostGroupRow::schema_version`][crate::db::HostGroupRow::schema_version])
+/// THIS binary knows how to serve. This is the *expand* half of
+/// expand-then-migrate: every binary in the fleet is first taught to RECOGNIZE
+/// the new component keys and to enforce this version floor, so that a later
+/// migrate step can raise the version on stored blobs without any risk that an
+/// older, still-running binary silently mis-serves a shape it cannot fully
+/// parse. This phase migrates ZERO blobs.
+///
+/// Rows written by this binary carry `schema_version == SCHEMA_VERSION_MAX`
+/// (stamped in `put_group`/`put_profile`); rows written before this field
+/// existed read back as `0` (`#[serde(default)]`) and are served normally
+/// because `0 <= MAX`.
+///
+/// ## Operational rule — NO ROLLBACK BELOW THE FLEET SCHEMA FLOOR
+///
+/// Once ANY row anywhere in the fleet has been written at `schema_version == N`,
+/// you MUST NOT roll the control binary back to a build whose
+/// `SCHEMA_VERSION_MAX < N`. Such a binary will FAIL LOUD (never silently
+/// mis-serve) on every one of those rows via [`ensure_schema_servable`] — both
+/// when serving them ([`convert`][crate::profiles::convert]) and when rolling
+/// them back ([`drift::revert_drift`][crate::profiles::drift::revert_drift]).
+/// The recovery is to roll the DATA forward (or the binary forward again),
+/// never the binary back below the highest `schema_version` any live row
+/// carries. Raising this constant is the ONLY sanctioned way to move the floor.
+pub const SCHEMA_VERSION_MAX: i64 = 1;
+
+/// Fail-CLOSED guard for the schema envelope. Returns an `Err` — WITHOUT ever
+/// touching (deserializing) the row's `defaults`/`overrides` blob — when a row's
+/// `schema_version` exceeds this binary's [`SCHEMA_VERSION_MAX`], so a blob
+/// written by a newer binary can never be served or rolled back by an older one
+/// that cannot recognize its keys. The error message matches the fixed pattern
+/// `schema version {n} exceeds binary max {MAX}` so operators and callers can
+/// key off it. Called at every per-row point-of-use (serve / roll back), never
+/// as a blanket list-level filter — one future-version row must not fail an
+/// entire fleet drift scan or dashboard listing.
+pub fn ensure_schema_servable(schema_version: i64) -> Result<()> {
+    if schema_version > SCHEMA_VERSION_MAX {
+        return Err(anyhow!(
+            "schema version {schema_version} exceeds binary max {SCHEMA_VERSION_MAX}"
+        ));
+    }
+    Ok(())
+}
+
 // ── SnapshotProfileStore — real impl, backed by the StatePaths snapshot ────
 
 /// Real [`ProfileStore`]: reads/writes `SnapshotDoc.host_groups` /
@@ -186,6 +233,10 @@ impl ProfileStore for SnapshotProfileStore {
     async fn put_group(&self, mut row: HostGroupRow, actor: &str) -> Result<()> {
         let body = crate::profiles::drift::group_body(&row);
         row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        // Stamp the envelope version this binary writes (PS-SCHEMA-20 expand
+        // step). Done AFTER group_body/content_hash so it never enters the hash
+        // (group_body excludes it) — the len-serv path stays byte-identical.
+        row.schema_version = SCHEMA_VERSION_MAX;
         let group_id = row.id;
 
         // Write the live row FIRST: capture_version's list_versions() reads
@@ -243,6 +294,8 @@ impl ProfileStore for SnapshotProfileStore {
     async fn put_profile(&self, mut row: HostProfileRow, actor: &str) -> Result<()> {
         let body = crate::profiles::drift::profile_body(&row);
         row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        // Stamp the envelope version — see put_group; excluded from the hash.
+        row.schema_version = SCHEMA_VERSION_MAX;
         let profile_id = row.id;
 
         // Write the live row first — see put_group's comment on why this
@@ -514,6 +567,8 @@ impl ProfileStore for MemProfileStore {
     async fn put_group(&self, mut row: HostGroupRow, actor: &str) -> Result<()> {
         let body = crate::profiles::drift::group_body(&row);
         row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        // Stamp the envelope version this binary writes (PS-SCHEMA-20).
+        row.schema_version = SCHEMA_VERSION_MAX;
 
         // Scope the lock so it is dropped BEFORE the capture_version().await
         // below — capture_version -> put_version re-locks the same
@@ -568,6 +623,8 @@ impl ProfileStore for MemProfileStore {
     async fn put_profile(&self, mut row: HostProfileRow, actor: &str) -> Result<()> {
         let body = crate::profiles::drift::profile_body(&row);
         row.content_hash = crate::profiles::drift::content_hash(&body)?.to_vec();
+        // Stamp the envelope version this binary writes (PS-SCHEMA-20).
+        row.schema_version = SCHEMA_VERSION_MAX;
 
         // See put_group's comment: the lock must be dropped before the
         // capture_version().await below.
@@ -753,6 +810,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![0xab],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
@@ -768,6 +826,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![0x12],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
@@ -1160,5 +1219,78 @@ mod tests {
             "the audit actor must be the caller-supplied login"
         );
         assert_eq!(events[0].action, "registry.rebind");
+    }
+
+    // ── PS-SCHEMA-20: schema_version envelope + version gate ────────────────
+
+    #[test]
+    fn test_missing_schema_version_defaults_to_zero() {
+        // A row serialized before schema_version existed (the key is simply
+        // absent) must read back as 0 — `#[serde(default)]`. This is the
+        // "existing rows are version 0" half of the expand step; it must NOT go
+        // through put_* (which would stamp 1), so deserialize a raw blob.
+        let raw = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "name": "len-serv",
+            "hostname_pattern": "{name}-{index:03}",
+            "is_standalone": false,
+            "defaults": {},
+            "applications": [],
+            "content_hash": "abcd",
+            "version": 1,
+            "created_at": null,
+            "updated_at": null
+        });
+        let row: HostGroupRow = serde_json::from_value(raw).unwrap();
+        assert_eq!(row.schema_version, 0, "a row missing the key must default to 0");
+
+        let raw_profile = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "group_id": Uuid::new_v4(),
+            "identity": "aa:bb:cc:dd:ee:ff",
+            "hostname_override": null,
+            "overrides": {},
+            "applications": [],
+            "content_hash": "12",
+            "version": 1,
+            "created_at": null,
+            "updated_at": null
+        });
+        let prow: HostProfileRow = serde_json::from_value(raw_profile).unwrap();
+        assert_eq!(prow.schema_version, 0);
+    }
+
+    #[tokio::test]
+    async fn test_put_stamps_current_schema_version() {
+        // New rows written this phase carry schema_version == SCHEMA_VERSION_MAX,
+        // regardless of the value the caller constructed the row with (0 here).
+        let dir = tempdir().unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+        let group_id = Uuid::new_v4();
+        store
+            .put_group(sample_group(group_id, "len-serv"), "alice")
+            .await
+            .unwrap();
+
+        let stored = store.get_group("len-serv").await.unwrap().unwrap();
+        assert_eq!(
+            stored.schema_version, SCHEMA_VERSION_MAX,
+            "a freshly written row must carry the binary's schema version, not 0"
+        );
+        assert_eq!(SCHEMA_VERSION_MAX, 1, "expand step pins the floor at 1");
+    }
+
+    #[test]
+    fn test_ensure_schema_servable_gate() {
+        // 0 (legacy) and MAX (this binary) are servable; MAX+1 is refused with
+        // the fixed fail-loud message pattern.
+        assert!(ensure_schema_servable(0).is_ok());
+        assert!(ensure_schema_servable(SCHEMA_VERSION_MAX).is_ok());
+
+        let err = ensure_schema_servable(2).unwrap_err();
+        assert!(
+            err.to_string().contains("schema version 2 exceeds binary max 1"),
+            "unexpected message: {err}"
+        );
     }
 }

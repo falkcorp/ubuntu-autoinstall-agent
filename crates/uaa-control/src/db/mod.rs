@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/mod.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: e43975b3-71de-4377-8ea5-ccd77fe75bc6
-// last-edited: 2026-07-17
+// last-edited: 2026-07-23
 
 //! Registry data-layer root for uaa-control.
 //!
@@ -356,6 +356,19 @@ pub struct HostGroupRow {
     #[serde(with = "serde_bytes_hex")]
     pub content_hash: Vec<u8>,
     pub version: i64,
+    /// On-disk *envelope* schema version (PS-SCHEMA-20 expand step). SEPARATE
+    /// from `version` (a per-object write counter): this tracks the shape of the
+    /// stored `defaults`/`applications` blob, so an older binary can refuse a row
+    /// a newer binary wrote (see [`profiles::store::SCHEMA_VERSION_MAX`] and
+    /// [`profiles::store::ensure_schema_servable`]). `#[serde(default)]` means a
+    /// row written before this field existed reads back as `0`, and `0 <= MAX`
+    /// is served normally. NOT part of `content_hash`/drift (excluded from
+    /// `group_body`), so stamping it on write never perturbs the len-serv path.
+    ///
+    /// [`profiles::store::SCHEMA_VERSION_MAX`]: crate::profiles::store::SCHEMA_VERSION_MAX
+    /// [`profiles::store::ensure_schema_servable`]: crate::profiles::store::ensure_schema_servable
+    #[serde(default)]
+    pub schema_version: i64,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }
@@ -374,6 +387,9 @@ pub struct HostProfileRow {
     #[serde(with = "serde_bytes_hex")]
     pub content_hash: Vec<u8>,
     pub version: i64,
+    /// On-disk envelope schema version — see [`HostGroupRow::schema_version`].
+    #[serde(default)]
+    pub schema_version: i64,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
 }

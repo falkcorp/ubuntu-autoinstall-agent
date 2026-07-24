@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/reify.rs
-// version: 0.1.0
+// version: 0.1.1
 // guid: 5e2a7c94-9d31-4b08-a6f2-3c7e1b95d840
-// last-edited: 2026-07-18
+// last-edited: 2026-07-23
 
 //! Registry reification (DS-OPS-05) — the INVERSE of `resolve_from_registry`.
 //!
@@ -86,6 +86,9 @@ fn group_row(id: Uuid, name: &str, hostname_pattern: &str, is_standalone: bool) 
         applications: json!([]),
         content_hash: vec![],
         version: 1,
+        // Value ignored: `put_group` stamps the current SCHEMA_VERSION_MAX
+        // (like it recomputes content_hash). See profiles::store.
+        schema_version: 0,
         created_at: None,
         updated_at: None,
     }
@@ -120,6 +123,8 @@ fn profile_row_from_cfg(
         applications,
         content_hash: vec![],
         version: 1,
+        // Value ignored: `put_profile` stamps SCHEMA_VERSION_MAX on write.
+        schema_version: 0,
         created_at: None,
         updated_at: None,
     })

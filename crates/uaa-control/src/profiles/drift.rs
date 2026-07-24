@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/drift.rs
-// version: 0.3.0
+// version: 0.4.0
 // guid: df5d991e-bb89-4610-ab80-458157db4e41
-// last-edited: 2026-07-18
+// last-edited: 2026-07-23
 
 //! `content_hash` (explicit canonicalization) + `profile_versions` write capture
 //! (spec `deploy-system-design.md` § Data model, Decisions 10/11, DS-REG-04),
@@ -109,7 +109,7 @@ use uuid::Uuid;
 
 use crate::audit::{AuditStore, NewAuditEvent};
 use crate::db::{HostGroupRow, HostProfileRow, ProfileVersionRow};
-use crate::profiles::store::ProfileStore;
+use crate::profiles::store::{ensure_schema_servable, ProfileStore};
 
 // ── Canonicalization ────────────────────────────────────────────────────────
 
@@ -436,6 +436,15 @@ impl ReviewTarget {
         }
     }
 
+    /// The live row's on-disk envelope `schema_version` — the [`revert_drift`]
+    /// gate checks this before rolling anything back (PS-SCHEMA-20).
+    fn schema_version(&self) -> i64 {
+        match self {
+            ReviewTarget::Group(g) => g.schema_version,
+            ReviewTarget::Profile(p) => p.schema_version,
+        }
+    }
+
     /// The live body, reconstructed with the SAME field selection the hash was
     /// computed over ([`group_body`] / [`profile_body`]).
     fn body(&self) -> serde_json::Value {
@@ -574,6 +583,12 @@ pub async fn revert_drift(
     actor: &str,
 ) -> Result<ProfileVersionRow> {
     let target = find_review_target(store, object_id).await?;
+    // Envelope version gate (PS-SCHEMA-20): refuse to roll back a row written by
+    // a newer binary rather than restore a body against a shape this binary
+    // cannot fully recognize. Fail-loud, keyed off schema_version alone — no
+    // blob deserialization. Symmetric with the serve gate in `convert`.
+    ensure_schema_servable(target.schema_version())
+        .map_err(|e| anyhow!("cannot revert {} {object_id}: {e}", target.object_kind()))?;
     let drifted_body = target.body();
     if !is_drifted(target.stored_hash(), &drifted_body)? {
         return Err(anyhow!(
@@ -692,6 +707,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         };
@@ -779,6 +795,7 @@ mod tests {
             applications: apps,
             content_hash: stored_hash,
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
@@ -794,6 +811,7 @@ mod tests {
             applications: apps,
             content_hash: stored_hash,
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
@@ -952,6 +970,25 @@ mod tests {
         assert!(
             revert_drift(&store, &audit, id, "operator").await.is_err(),
             "revert must Err when no version is self-consistent — never pick a least-bad one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_revert_refuses_future_schema_version() {
+        // PS-SCHEMA-20 roll-back gate: a live row whose schema_version exceeds
+        // this binary's max must be refused fail-loud, BEFORE any body work —
+        // symmetric with the serve-path gate in `convert`.
+        let store = MemProfileStore::new();
+        let audit = MemAuditStore::new();
+        let id = Uuid::new_v4();
+        let mut row = group_row(id, serde_json::json!(["future"]), vec![0x01]);
+        row.schema_version = 2;
+        store.inject_group_raw(row);
+
+        let err = revert_drift(&store, &audit, id, "op").await.unwrap_err();
+        assert!(
+            err.to_string().contains("schema version 2 exceeds binary max 1"),
+            "expected the version-gate message, got: {err}"
         );
     }
 

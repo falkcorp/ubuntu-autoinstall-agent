@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/alloc.rs
-// version: 0.2.0
+// version: 0.2.1
 // guid: 04fc940a-9b96-44dc-a724-55b6c8069818
-// last-edited: 2026-07-17
+// last-edited: 2026-07-23
 
 //! Pure allocation arithmetic for DS-REG-03 — the testable half of
 //! `allocate_index`/`rebind`, split out so it can be exercised over plain
@@ -193,6 +193,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         });

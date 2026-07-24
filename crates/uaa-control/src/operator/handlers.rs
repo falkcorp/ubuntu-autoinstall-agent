@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.10.0
+// version: 1.10.1
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -1140,6 +1140,8 @@ async fn handle_create_group(
         applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
         content_hash: content_hash(&(&body.defaults, &body.applications)),
         version: 1,
+        // Envelope version is (re)stamped by put_group on write (PS-SCHEMA-20).
+        schema_version: 0,
         created_at: Some(now.clone()),
         updated_at: Some(now),
     };
@@ -1196,6 +1198,9 @@ async fn handle_update_group(
         applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
         content_hash: content_hash(&(&body.defaults, &body.applications)),
         version: existing.version + 1,
+        // Re-stamped to the current envelope version by put_group (PS-SCHEMA-20);
+        // this binary only writes shapes it understands.
+        schema_version: existing.schema_version,
         created_at: existing.created_at.clone(),
         updated_at: Some(now_rfc3339()),
     };
@@ -1268,6 +1273,8 @@ async fn handle_create_group_profile(
         applications: serde_json::to_value(&body.applications).unwrap_or(serde_json::Value::Null),
         content_hash: content_hash(&(&body.overrides, &body.applications)),
         version: 1,
+        // Envelope version is stamped by put_profile on write (PS-SCHEMA-20).
+        schema_version: 0,
         created_at: Some(now.clone()),
         updated_at: Some(now),
     };
@@ -2254,6 +2261,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
