@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/resolve.rs
-// version: 0.1.0
+// version: 0.2.0
 // guid: 3f9c2b18-6d54-4a7e-b0c2-1e8d9a4f6572
-// last-edited: 2026-07-18
+// last-edited: 2026-07-23
 
 //! Registry resolution for `uaa config place --from-registry` (DS-OPS-03).
 //!
@@ -132,6 +132,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         }
