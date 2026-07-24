@@ -1,0 +1,65 @@
+# file: crates/uaa-core/tests/fixtures/components/vm-test.yaml
+# version: 1.0.0
+# guid: 8f2b4b2e-7d0e-4c1a-9d3e-1a2b3c4d5e05
+# last-edited: 2026-07-24
+#
+# PS-GATE-15 merge-blocking equality gate fixture for vm-test (the QEMU+swtpm
+# gate host). Hand-authored `HostGroupProfile` defaults + `HostProfile`
+# overrides that must resolve, through `uaa_core::profile::merge::merge`, to
+# the SAME `InstallationConfig` as the committed
+# `examples/configs/install/vm-test.yaml` (canonical-serialization equality
+# — see `component_equality_gate.rs`).
+#
+# THROWAWAY VM-ONLY TEST SECRETS — NOT REAL, same values as the committed
+# file (see that file's header for why they are safe to commit).
+#
+# vm-test is a standalone group, so every value lives in the host overrides,
+# exactly as the committed file authors them flat. The single `cockroach`
+# application is authored via `HostProfile::applications` (the top-level
+# typed-application list `merge()` unions — NOT
+# `InstallationConfigPartial::applications`, which this merge path never
+# reads).
+#
+# Geometry/`reset_enabled` byte-identity is NOT asserted here — see the test
+# file's module doc for why.
+
+group:
+  name: vm-test
+  hostname_pattern: vm-test
+  is_standalone: true
+  defaults: {}
+  applications: []
+
+host:
+  group_name: vm-test
+  identity: "52:54:00:aa:bb:cc"
+  hostname_override: vm-test
+  overrides:
+    disk_device: /dev/vda
+    timezone: America/New_York
+    luks_key: vm-test-throwaway-luks-key-NOT-A-REAL-SECRET
+    root_password: vm-test-throwaway-root-pw-NOT-A-REAL-SECRET
+    install_ca_cert: |
+      -----BEGIN CERTIFICATE-----
+      VMTESTFAKECERTNOTAREALSECRET
+      -----END CERTIFICATE-----
+    network_interface: enp0s3
+    network_address: 10.0.2.15/24
+    network_gateway: 10.0.2.2
+    network_search: vm.local
+    network_nameservers:
+      - 10.0.2.3
+    debootstrap_release: resolute
+    debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
+    initramfs_type: dracut
+    tang_servers: []
+    ssh_authorized_keys:
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDmLM5QkF0hQiebBV/P7ogMXatVKfywwNNpVE5/XRgpm8ipjMpYn8cUBMnAelPyljezUDX4PsXlNobsWZH87lMsXT7X1RVdFP2IXMUbgCJ1nPIGnWzldRSq7NX0wQOkwPXa8crXdgyTuHeDlJzBQ45GurMzh17BuN93WnssrqXAlCIfjszwhN1/BTzOdy/wIBXaSwkSt75dxdgHGz3Yw5qOg8gPUdtvL1vP3hOkNkOFI52NEVg65deJil8+DgH9kIitiPF83+IQ75dGpk6yHgXX7uf4a8ExeJ8agZ1mwr28bdEGtSpfqYOaHM2FOCh6ZOU868tQMVQuItSXCfAmy4jT johnathan.falk@gmail.com"
+    enroll_tpm2: true
+    tpm2_pin: "123456"
+    tpm2_pcr_ids: "7"
+    expect_fido2: false
+  applications:
+    - kind: cockroach
+      seed_ip: 10.0.2.15
+      locality: region=vm,cluster-unit=qemu

@@ -1,0 +1,60 @@
+# file: crates/uaa-core/tests/fixtures/components/len-serv-002.yaml
+# version: 1.0.0
+# guid: 8f2b4b2e-7d0e-4c1a-9d3e-1a2b3c4d5e02
+# last-edited: 2026-07-24
+#
+# PS-GATE-15 merge-blocking equality gate fixture for len-serv-002.
+# Hand-authored `HostGroupProfile` defaults + `HostProfile` overrides that
+# must resolve, through `uaa_core::profile::merge::merge`, to the SAME
+# `InstallationConfig` as the committed
+# `examples/configs/install/len-serv-002.yaml` (canonical-serialization
+# equality — see `component_equality_gate.rs`). Every value below is copied
+# verbatim from that committed file; group defaults hold the fields shared by
+# every len-serv sibling, host overrides hold only what differs
+# (`network_address`) plus the pinned hostname.
+#
+# Geometry/`reset_enabled` byte-identity is NOT asserted here — see the test
+# file's module doc for why.
+
+group:
+  name: len-serv
+  hostname_pattern: "{name}-{index:03}"
+  is_standalone: false
+  defaults:
+    disk_device: /dev/nvme0n1
+    timezone: America/New_York
+    luks_key: REPLACE_AT_PLACE_TIME
+    root_password: REPLACE_AT_PLACE_TIME
+    install_ca_cert: REPLACE_AT_PLACE_TIME
+    network_interface: enp1s0f0
+    network_gateway: 172.16.2.1
+    network_search: jf.local
+    network_nameservers:
+      - 172.16.2.1
+      - 1.1.1.1
+      - 8.8.8.8
+    debootstrap_release: resolute
+    debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
+    initramfs_type: dracut
+    tang_servers:
+      - url: http://172.16.2.45
+      - url: http://172.16.2.46
+      - url: http://172.16.2.47
+    tang_threshold: 2
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan"
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local"
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820"
+    enroll_tpm2: true
+    tpm2_pin: REPLACE_AT_PLACE_TIME
+    tpm2_pcr_ids: "7"
+    expect_fido2: true
+  applications: []
+
+host:
+  group_name: len-serv
+  identity: "6c:4b:90:bc:f8:a3"
+  hostname_override: len-serv-002
+  overrides:
+    network_address: 172.16.3.94/23
+  applications: []
