@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/mod.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: a24bb30b-4056-4a4d-9817-673754a41981
 // last-edited: 2026-07-23
 
@@ -22,7 +22,15 @@ pub mod components;
 pub mod merge;
 pub mod validate;
 
-use crate::network::ssh_installer::config::ApplicationSpec;
+use crate::network::ssh_installer::components::disk_layout::{
+    NativeKeystoreSpecPartial, SingleLuksSpecPartial,
+};
+use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
+use crate::network::ssh_installer::components::hooks::Hooks;
+use crate::network::ssh_installer::config::{Arch, ApplicationSpec, HostRole};
+use components::base_image::BaseImagePartial;
+use components::network::NetworkConfigPartial;
+use components::unlock_policy::UnlockPolicyPartial;
 use serde::{Deserialize, Serialize};
 
 /// Every [`InstallationConfig`](crate::network::ssh_installer::config::InstallationConfig)
@@ -77,6 +85,44 @@ pub struct InstallationConfigPartial {
     pub storage_mode: Option<crate::network::ssh_installer::config::StorageMode>,
     /// Multi-disk roster for NativeKeystore hosts (by-id + role).
     pub disks: Option<Vec<crate::network::ssh_installer::config::DiskSpec>>,
+    /// Nested disk-layout authoring block (PS-DISK-01 component, wrapped by
+    /// [`DiskLayoutPartial`] below). No merge/lower logic here — deferred to
+    /// PS-MERGE-13/PS-LOWER-12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_layout: Option<DiskLayoutPartial>,
+    /// Nested unlock-policy authoring block (PS-UNLOCK-02 component).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_policy: Option<UnlockPolicyPartial>,
+    /// Nested network authoring block (PS-NET-03 component).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NetworkConfigPartial>,
+    /// Nested base-image authoring block (PS-IMG-04 component).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<BaseImagePartial>,
+    /// Target architecture (PS-ARCH-07 component).
+    pub arch: Option<Arch>,
+    /// Host role: install target vs. external Tang server (PS-ROLE-08 component).
+    pub role: Option<HostRole>,
+    /// Per-board firmware workarounds (PS-QUIRK-05 component).
+    pub firmware_quirks: Option<Vec<FirmwareQuirk>>,
+    /// Named-phase host-specific commands (PS-HOOK-06 component).
+    pub hooks: Option<Hooks>,
+}
+
+/// Authoring-time disk-layout selector, wrapping the per-variant partials
+/// shipped by PS-DISK-01
+/// ([`SingleLuksSpecPartial`]/[`NativeKeystoreSpecPartial`] in
+/// `network::ssh_installer::components::disk_layout`). PS-DISK-01 shipped
+/// only the per-variant partials, not this tagged-select wrapper; per that
+/// brief's coordination note, this brief (PS-WIRE-PARTIAL-11) defines it.
+/// Mirrors the `DiskLayout` tagging (`kind`, kebab-case, closed) so an
+/// unknown `kind` is a hard parse error rather than a silently-dropped
+/// layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DiskLayoutPartial {
+    SingleLuks(SingleLuksSpecPartial),
+    ZfsNativeKeystore(NativeKeystoreSpecPartial),
 }
 
 /// Deserializes a "double option" field (`Option<Option<T>>`) so that a
@@ -135,6 +181,14 @@ impl PartialEq for InstallationConfigPartial {
             && self.applications == other.applications
             && self.storage_mode == other.storage_mode
             && self.disks == other.disks
+            && self.disk_layout == other.disk_layout
+            && self.unlock_policy == other.unlock_policy
+            && self.network == other.network
+            && self.base_image == other.base_image
+            && self.arch == other.arch
+            && self.role == other.role
+            && self.firmware_quirks == other.firmware_quirks
+            && self.hooks == other.hooks
     }
 }
 
@@ -231,6 +285,14 @@ mod tests {
             applications: None,
             storage_mode: None,
             disks: None,
+            disk_layout: None,
+            unlock_policy: None,
+            network: None,
+            base_image: None,
+            arch: None,
+            role: None,
+            firmware_quirks: None,
+            hooks: None,
         });
     }
 
@@ -283,5 +345,80 @@ mod tests {
         let json = serde_json::to_string(&partial).unwrap();
         let roundtripped: InstallationConfigPartial = serde_json::from_str(&json).unwrap();
         assert_eq!(partial, roundtripped);
+    }
+
+    #[test]
+    fn test_partial_deserializes_nested_component_blocks() {
+        let yaml = r#"
+disk_layout:
+  kind: single-luks
+  esp_size: 1G
+unlock_policy:
+  tang:
+    servers:
+      - url: http://tang1.example.internal
+    threshold: 1
+network:
+  interface: eth0
+  addressing:
+    type: dhcp
+base_image:
+  release: jammy
+arch: amd64
+role: install-target
+firmware_quirks:
+  - kind: grub-removable-fallback
+hooks:
+  pre_phase: {}
+  post_phase: {}
+"#;
+        let partial: InstallationConfigPartial = serde_yaml::from_str(yaml).unwrap();
+
+        match partial.disk_layout {
+            Some(DiskLayoutPartial::SingleLuks(ref spec)) => {
+                assert_eq!(spec.esp_size, Some("1G".to_string()));
+            }
+            other => panic!("expected DiskLayoutPartial::SingleLuks, got {other:?}"),
+        }
+        assert_eq!(
+            partial
+                .unlock_policy
+                .as_ref()
+                .and_then(|u| u.tang.as_ref())
+                .and_then(|t| t.threshold),
+            Some(1)
+        );
+        assert_eq!(
+            partial.network.as_ref().and_then(|n| n.interface.clone()),
+            Some("eth0".to_string())
+        );
+        assert_eq!(
+            partial.base_image.as_ref().and_then(|b| b.release.clone()),
+            Some(Some("jammy".to_string()))
+        );
+        assert_eq!(partial.arch, Some(Arch::Amd64));
+        assert_eq!(partial.role, Some(HostRole::InstallTarget));
+        assert_eq!(
+            partial.firmware_quirks,
+            Some(vec![FirmwareQuirk::GrubRemovableFallback])
+        );
+        assert!(partial.hooks.is_some());
+    }
+
+    #[test]
+    fn test_partial_eq_detects_differing_unlock_policy() {
+        let base = InstallationConfigPartial::default();
+        let with_unlock_policy = InstallationConfigPartial {
+            unlock_policy: Some(components::unlock_policy::UnlockPolicyPartial {
+                fido2_expected: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            base, with_unlock_policy,
+            "a differing unlock_policy must make two partials unequal"
+        );
     }
 }
