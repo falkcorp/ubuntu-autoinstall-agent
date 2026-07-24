@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/profiles/reify.rs
-// version: 0.1.1
+// version: 0.2.0
 // guid: 5e2a7c94-9d31-4b08-a6f2-3c7e1b95d840
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Registry reification (DS-OPS-05) — the INVERSE of `resolve_from_registry`.
 //!
@@ -305,6 +305,54 @@ mod tests {
                 "reify→resolve must round-trip {host} exactly"
             );
         }
+    }
+
+    /// PS-MIG-U1-23 deliverable (b): "mark its stored row schema_version=1".
+    /// The stamping itself is generic — every `put_group`/`put_profile` call
+    /// stamps `SCHEMA_VERSION_MAX` (see `profiles::store`'s
+    /// `test_put_stamps_current_schema_version`), not something reify or any
+    /// per-host code path opts into — but that generic guarantee has never
+    /// been exercised specifically for a reified unimatrixone row before.
+    /// This closes that gap directly, rather than leaving the acceptance
+    /// checkbox satisfied only by inference from an unrelated host's test.
+    #[tokio::test]
+    async fn test_reify_unimatrixone_stores_schema_version_1() {
+        use crate::profiles::store::SCHEMA_VERSION_MAX;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+
+        register_from_config(
+            &store,
+            "unimatrixone",
+            "unimatrixone",
+            true,
+            "ac:1f:6b:40:fc:e2",
+            Some("unimatrixone"),
+            &cfg_for("unimatrixone"),
+            "op",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(SCHEMA_VERSION_MAX, 1, "PS-SCHEMA-20 expand-step floor");
+
+        let group = store
+            .get_group("unimatrixone")
+            .await
+            .unwrap()
+            .expect("unimatrixone group must exist after reify");
+        assert_eq!(
+            group.schema_version, SCHEMA_VERSION_MAX,
+            "reified unimatrixone group row must carry schema_version=1"
+        );
+
+        let profiles = store.list_profiles(group.id).await.unwrap();
+        assert_eq!(profiles.len(), 1, "unimatrixone is standalone: exactly one profile");
+        assert_eq!(
+            profiles[0].schema_version, SCHEMA_VERSION_MAX,
+            "reified unimatrixone profile row must carry schema_version=1"
+        );
     }
 
     #[tokio::test]

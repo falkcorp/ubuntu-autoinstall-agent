@@ -1,7 +1,7 @@
 # file: examples/configs/install/unimatrixone.yaml
-# version: 3.1.0
+# version: 4.0.0
 # guid: a1b2c3d4-0004-4a4b-8c2d-1e2f3a4b5c64
-# last-edited: 2026-07-23
+# last-edited: 2026-07-24
 #
 # NativeKeystore (ZFS native-encryption) install TEMPLATE — the future standard
 # "server profile". This is a SANITIZED schema example: every host-unique
@@ -11,7 +11,20 @@
 # committed to git (no fleet topology / MAC exposure). See
 # docs/specs/u1-zfs-native-encryption-{design,plan}.md.
 #
-# Deserializes into `InstallationConfig` (crates/uaa-core/.../config.rs).
+# Deserializes into `InstallationConfig` (crates/uaa-core/.../config.rs). This
+# file stays the FLAT wire form on purpose — it is what the installer and
+# `scripts/vm-validate.sh` consume directly. As of PS-MIG-U1-23 (v4.0.0) the
+# CANONICAL AUTHORING source is the component-shaped fixture at
+# `crates/uaa-core/tests/fixtures/components/unimatrixone.yaml` (a
+# `HostGroupProfile` defaults blob + `HostProfile` overrides, proven to
+# `merge()`+`lower()` to byte-identical THIS file by
+# `crates/uaa-core/tests/component_equality_gate.rs`). unimatrixone is a
+# standalone single-host group, so that fixture's "group defaults +
+# single-host override, both flat except the authoring-only
+# `unlock_policy.tpm2_clevis_peer` nested leaf" shape is the REFERENCE PATTERN
+# the PS-MIG-LEN-* briefs reuse for the indexed len-serv group. This file is
+# regenerated conceptually FROM that fixture (major version bump — no field
+# content changed, only this header), not the other way around.
 #
 # Topology (4 drives, all by-id — never sdX/nvmeXnY). REVISED 2026-07-23: the
 # X10DSC+ firmware cannot boot from NVMe, so the ESP + bpool moved onto the

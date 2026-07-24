@@ -1,5 +1,5 @@
 // file: crates/uaa-core/tests/component_equality_gate.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 3c9e2f1a-6b4d-4e0a-9f2b-7d1c5a8e6b02
 // last-edited: 2026-07-24
 
@@ -46,6 +46,7 @@
 
 use uaa_core::network::InstallationConfig;
 use uaa_core::profile::merge::merge;
+use uaa_core::profile::validate::validate_resolved;
 use uaa_core::profile::{HostGroupProfile, HostProfile};
 
 /// The whole fixture file: a `HostGroupProfile` defaults blob plus a
@@ -155,4 +156,19 @@ fn test_unimatrixone_tpm2_clevis_peer_is_authored_but_never_lowered() {
         !json.as_object().unwrap().contains_key("tpm2_clevis_peer"),
         "tpm2_clevis_peer must never appear in the lowered wire config"
     );
+}
+
+/// PS-MIG-U1-23 gate 2: `validate_resolved` must accept unimatrixone's
+/// component-fixture merge output. The existing
+/// `test_component_authored_fixture_resolves_through_registry`
+/// (`crates/uaa-control/src/profiles/resolve.rs`) only exercises a synthetic
+/// `comp-grp` fixture through `validate_resolved` — this is the first
+/// assertion that the REAL unimatrixone fixture (NativeKeystore, D2-B) is
+/// itself validate-clean, not just struct-equal to the committed file.
+#[test]
+fn test_unimatrixone_merge_output_passes_validate_resolved() {
+    let fixture = load_fixture("unimatrixone");
+    let (resolved, _provenance) =
+        merge(&fixture.group, &fixture.host).expect("unimatrixone fixture must merge");
+    validate_resolved(&resolved).expect("unimatrixone merge()+lower() output must be validate-clean");
 }
