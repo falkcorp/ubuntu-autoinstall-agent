@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/place.rs
-// version: 1.1.0
+// version: 1.1.1
 // guid: d3e4f5a6-b7c8-9d0e-1f2a-3b4c5d6e7f8a
-// last-edited: 2026-07-10
+// last-edited: 2026-07-24
 
 //! Placement & drive: write the rendered seed into the server's iPXE netboot
 //! tree, optionally flip the boot target to `custom-autoinstall`, and optionally
@@ -392,6 +392,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    /// The live Lenovo fleet's member IPs. `for_lenserv` previously defaulted
+    /// this internally via a hardcoded module-level constant; tests now pass
+    /// it in explicitly (PS-COCKROACH-16).
+    const TEST_LENSERV_MEMBERS: &[&str] = &["172.16.3.92", "172.16.3.94", "172.16.3.96"];
+
     // ── Recording mock executor ───────────────────────────────────────────────
 
     #[derive(Clone, Default)]
@@ -473,7 +478,7 @@ mod tests {
 
     #[test]
     fn meta_data_contains_hostname() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let md = render_meta_data(&spec);
         assert!(md.contains("instance-id: len-serv-003"));
         assert!(md.contains("local-hostname: len-serv-003"));
@@ -481,7 +486,7 @@ mod tests {
 
     #[test]
     fn meta_data_ends_with_newline() {
-        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23");
+        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23", TEST_LENSERV_MEMBERS);
         assert!(render_meta_data(&spec).ends_with('\n'));
     }
 
@@ -551,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_and_drive_dry_run_does_not_upload() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let mut server = RecordingMock::with_responses(&[(
             "readlink /var/www/html/cloud-init/len-serv-003",
             "6c4b90bcf7f4\n",
@@ -581,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_and_drive_writes_and_does_not_flip_without_flag() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let mut server = RecordingMock::with_responses(&[(
             "readlink /var/www/html/cloud-init/len-serv-003",
             "6c4b90bcf7f4\n",
@@ -610,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_and_drive_triggers_reboot_on_target() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let mut server = RecordingMock::with_responses(&[(
             "readlink /var/www/html/cloud-init/len-serv-003",
             "6c4b90bcf7f4\n",
@@ -641,7 +646,7 @@ mod tests {
 
     #[tokio::test]
     async fn place_and_drive_errors_when_hexmac_missing() {
-        let spec = HostSpec::for_lenserv("not-registered", "10.0.0.1/24");
+        let spec = HostSpec::for_lenserv("not-registered", "10.0.0.1/24", TEST_LENSERV_MEMBERS);
         let mut server = RecordingMock::default(); // no symlink response → empty string
 
         let opts = PlaceOpts {

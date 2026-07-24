@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/host_spec.rs
-// version: 1.0.1
+// version: 1.1.0
 // guid: b1c2d3e4-f5a6-7b8c-9d0e-1f2a3b4c5d6e
-// last-edited: 2026-07-10
+// last-edited: 2026-07-24
 
 //! Per-host inputs for rendering an autoinstall `user-data`.
 //!
@@ -14,9 +14,6 @@ pub const COCKROACH_PORT: u16 = 36357;
 
 /// The cluster's seed/server IP, always listed first in the join string.
 pub const COCKROACH_SERVER_IP: &str = "172.16.2.30";
-
-/// The Lenovo cluster member IPs, in canonical (ascending) order.
-pub const LENSERV_MEMBER_IPS: &[&str] = &["172.16.3.92", "172.16.3.94", "172.16.3.96"];
 
 /// The values that vary per host. Each maps to one template placeholder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,16 +51,21 @@ impl HostSpec {
             .join(",")
     }
 
-    /// Construct a spec for a Lenovo fleet host using the canonical server,
-    /// member set, and port. `network_address` carries the CIDR (e.g.
-    /// `172.16.3.96/23`); the bare IP is derived from it.
-    pub fn for_lenserv(hostname: impl Into<String>, network_address: impl Into<String>) -> Self {
+    /// Construct a spec for a Lenovo fleet host using the canonical server
+    /// and port. `network_address` carries the CIDR (e.g. `172.16.3.96/23`);
+    /// the bare IP is derived from it. `members` is the group roster (bare
+    /// IPs, no CIDR) — previously a module-level hardcoded constant, now
+    /// supplied explicitly by every caller (PS-COCKROACH-16).
+    pub fn for_lenserv(
+        hostname: impl Into<String>,
+        network_address: impl Into<String>,
+        members: &[&str],
+    ) -> Self {
         let hostname = hostname.into();
         let network_address = network_address.into();
         let ip = Self::ip_without_cidr(&network_address).to_string();
         let cockroach_advertise = Self::compute_advertise(&ip, COCKROACH_PORT);
-        let cockroach_join =
-            Self::compute_join(COCKROACH_SERVER_IP, LENSERV_MEMBER_IPS, &ip, COCKROACH_PORT);
+        let cockroach_join = Self::compute_join(COCKROACH_SERVER_IP, members, &ip, COCKROACH_PORT);
         Self {
             hostname,
             network_address,
@@ -77,6 +79,12 @@ impl HostSpec {
 mod tests {
     use super::*;
 
+    /// The live Lenovo fleet's member IPs, in canonical (ascending) order.
+    /// Previously a module-level hardcoded constant, retired in favor of an
+    /// explicit `members` argument (PS-COCKROACH-16); tests build this
+    /// locally and pass it in.
+    const TEST_LENSERV_MEMBERS: &[&str] = &["172.16.3.92", "172.16.3.94", "172.16.3.96"];
+
     #[test]
     fn ip_without_cidr_strips_suffix() {
         assert_eq!(HostSpec::ip_without_cidr("172.16.3.96/23"), "172.16.3.96");
@@ -88,7 +96,7 @@ mod tests {
         // 003 = .96 → server, .92, .94
         let join = HostSpec::compute_join(
             COCKROACH_SERVER_IP,
-            LENSERV_MEMBER_IPS,
+            TEST_LENSERV_MEMBERS,
             "172.16.3.96",
             COCKROACH_PORT,
         );
@@ -101,20 +109,20 @@ mod tests {
     #[test]
     fn for_lenserv_matches_known_hosts() {
         // These are the exact strings verified against the live deployment.
-        let s1 = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23");
+        let s1 = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23", TEST_LENSERV_MEMBERS);
         assert_eq!(s1.cockroach_advertise, "172.16.3.92:36357");
         assert_eq!(
             s1.cockroach_join,
             "172.16.2.30:36357,172.16.3.94:36357,172.16.3.96:36357"
         );
 
-        let s2 = HostSpec::for_lenserv("len-serv-002", "172.16.3.94/23");
+        let s2 = HostSpec::for_lenserv("len-serv-002", "172.16.3.94/23", TEST_LENSERV_MEMBERS);
         assert_eq!(
             s2.cockroach_join,
             "172.16.2.30:36357,172.16.3.92:36357,172.16.3.96:36357"
         );
 
-        let s3 = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let s3 = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         assert_eq!(
             s3.cockroach_join,
             "172.16.2.30:36357,172.16.3.92:36357,172.16.3.94:36357"

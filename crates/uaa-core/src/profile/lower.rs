@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/lower.rs
-// version: 1.0.0
+// version: 1.0.1
 // guid: 74997d1d-8349-4aaf-ac8a-b6ec886492a1
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Pure authoring->flat-wire bridge (PS-LOWER-12).
 //!
@@ -108,6 +108,10 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
             .clone()
             .unwrap_or_else(|| defaults.install_ca_cert.clone()),
         applications: resolved.applications.clone().unwrap_or_default(),
+        // Never authored in the partial — injected post-merge by
+        // `uaa-control`'s `resolve_from_registry` from the active group
+        // allocation (PS-COCKROACH-16). Always empty here.
+        cockroach_members: Vec::new(),
         storage_mode,
         disks,
         arch: resolved.arch.unwrap_or_default(),

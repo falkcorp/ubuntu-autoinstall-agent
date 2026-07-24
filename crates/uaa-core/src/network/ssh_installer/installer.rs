@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.14.1
+// version: 2.14.2
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -1059,6 +1059,7 @@ mod tests {
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
+            cockroach_members: Vec::new(),
             storage_mode: Default::default(),
             disks: Vec::new(),
             arch: Default::default(),

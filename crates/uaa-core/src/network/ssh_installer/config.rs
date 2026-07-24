@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.13.0
+// version: 2.14.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Configuration structures for SSH/local installation
 
@@ -191,6 +191,18 @@ pub struct InstallationConfig {
     /// fail-closed parse on every PXE after a rollback (DS-OPS-03).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applications: Vec<ApplicationSpec>,
+    /// The Cockroach group roster for THIS host's cluster: sibling member
+    /// IPs (bare, no CIDR) that `applications.rs::derive_cockroach_endpoints`
+    /// consumes to build the advertise/join strings. Populated by
+    /// `uaa-control`'s `resolve_from_registry` from the active group
+    /// allocation (PS-COCKROACH-16) — never hand-authored. Empty for every
+    /// host without a Cockroach application (today's entire committed fleet).
+    ///
+    /// `skip_serializing_if` omits the key for a Cockroach-free host, so a
+    /// registry-resolved config serializes exactly as before this field
+    /// existed — same cross-version-rollback rationale as `applications`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cockroach_members: Vec<String>,
     /// Storage layout the installer builds for this host. Defaults to
     /// [`StorageMode::PlainLuks`] — the single-disk ZFS-on-LUKS path every
     /// Lenovo (`len-serv-*`) uses today — so a config that omits the key is
@@ -411,6 +423,7 @@ impl InstallationConfig {
             expect_fido2: true,
             install_ca_cert: default_install_ca_cert(),
             applications: Vec::new(),
+            cockroach_members: Vec::new(),
             storage_mode: StorageMode::PlainLuks,
             disks: Vec::new(),
             arch: Arch::Amd64,
@@ -667,6 +680,49 @@ network_nameservers: ["10.0.0.1"]
             !yaml.contains("applications"),
             "an app-free host must omit the applications key entirely, got:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn test_cockroach_free_host_omits_cockroach_members_key() {
+        // Same cross-version-rollback discipline as
+        // test_app_free_host_omits_applications_key (DS-OPS-03): a host with
+        // no Cockroach application (every committed host today) must
+        // serialize WITHOUT a `cockroach_members:` key at all.
+        let cfg = InstallationConfig::for_len_serv_003();
+        assert!(cfg.cockroach_members.is_empty(), "fixture must be cockroach-free");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(
+            !yaml.contains("cockroach_members"),
+            "a cockroach-free host must omit the cockroach_members key entirely, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn test_cockroach_members_defaults_to_empty_when_absent() {
+        let yaml = r#"
+hostname: test
+disk_device: /dev/sda
+timezone: UTC
+luks_key: k
+root_password: p
+network_interface: eth0
+network_address: 10.0.0.2/24
+network_gateway: 10.0.0.1
+network_search: local
+network_nameservers: ["10.0.0.1"]
+"#;
+        let cfg: InstallationConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.cockroach_members.is_empty());
+    }
+
+    #[test]
+    fn test_cockroach_members_round_trips_when_present() {
+        let mut cfg = InstallationConfig::for_len_serv_003();
+        cfg.cockroach_members = vec!["172.16.3.92".to_string(), "172.16.3.94".to_string()];
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains("cockroach_members"), "non-empty cockroach_members must serialize, got:\n{yaml}");
+        let back: InstallationConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.cockroach_members, cfg.cockroach_members);
     }
 
     #[test]

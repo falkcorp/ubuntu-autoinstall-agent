@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Validation logic for `HostGroupProfile` / `HostProfile` (DS-PRF-03).
 //!
@@ -605,6 +605,7 @@ mod tests {
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
+            cockroach_members: Vec::new(),
             storage_mode: StorageMode::PlainLuks,
             disks: Vec::new(),
             arch: Arch::Amd64,
