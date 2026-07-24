@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.11.0
+// version: 2.12.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -28,6 +28,29 @@ impl InitramfsType {
             Self::Dracut => "dracut --regenerate-all --force",
             Self::InitramfsTools => "update-initramfs -u -k all",
         }
+    }
+}
+
+/// Classifies the role of a host: installation target or external Tang server.
+///
+/// This distinguishes between machines that will receive the autoinstall
+/// (InstallTarget) and external Tang servers that provide network encryption
+/// unlock. Note: HostRole::TangServer is the enum variant, distinct from the
+/// TangServer struct below that describes a Tang server's connection details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostRole {
+    /// The default: this host is an installation target.
+    #[default]
+    InstallTarget,
+    /// This host is an external Tang server providing Clevis unlock.
+    TangServer,
+}
+
+impl HostRole {
+    /// Returns true if this role is the installation target (the default).
+    pub fn is_install_target(&self) -> bool {
+        matches!(self, HostRole::InstallTarget)
     }
 }
 
@@ -658,5 +681,32 @@ typo_field: oops
             err.to_string().contains("typo_field"),
             "error must name the unknown field: {err}"
         );
+    }
+
+    #[test]
+    fn test_host_role_default_is_install_target() {
+        assert_eq!(HostRole::default(), HostRole::InstallTarget);
+    }
+
+    #[test]
+    fn test_host_role_is_install_target() {
+        assert!(HostRole::InstallTarget.is_install_target());
+        assert!(!HostRole::TangServer.is_install_target());
+    }
+
+    #[test]
+    fn test_host_role_serde_round_trip() {
+        // Verify wire strings match kebab-case naming.
+        let install_target_yaml = "install-target";
+        let deserialized: HostRole = serde_yaml::from_str(install_target_yaml).unwrap();
+        assert_eq!(deserialized, HostRole::InstallTarget);
+        let serialized = serde_yaml::to_string(&deserialized).unwrap();
+        assert!(serialized.contains("install-target"), "serialized should contain 'install-target', got: {serialized}");
+
+        let tang_server_yaml = "tang-server";
+        let deserialized: HostRole = serde_yaml::from_str(tang_server_yaml).unwrap();
+        assert_eq!(deserialized, HostRole::TangServer);
+        let serialized = serde_yaml::to_string(&deserialized).unwrap();
+        assert!(serialized.contains("tang-server"), "serialized should contain 'tang-server', got: {serialized}");
     }
 }
