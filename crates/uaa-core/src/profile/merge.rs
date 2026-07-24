@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.2.1
+// version: 1.3.0
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Merge logic for `InstallationConfigPartial` -> `InstallationConfig` (DS-PRF-02).
 //!
@@ -10,6 +10,22 @@
 //! concrete [`InstallationConfig`], recording per-field
 //! [`Provenance`](super::Provenance) so "why does this host have this
 //! value?" is answerable without recomputing two blobs by hand.
+//!
+//! **Seam (PS-MERGE-13):** `merge` keeps its
+//! `(InstallationConfig, Provenance)` signature but no longer constructs the
+//! flat config by hand. It resolves both tiers into a single RESOLVED
+//! [`InstallationConfigPartial`](super::InstallationConfigPartial) — flat
+//! fields PLUS the nested components (`disk_layout`, `unlock_policy`,
+//! `network`, `base_image`, `firmware_quirks`) — then flattens it through the
+//! pure [`lower`](super::lower::lower) (PS-LOWER-12), so the authoring->wire
+//! mapping lives in exactly one place. Component resolution is ADDITIVE: a
+//! host authoring no component keys resolves to today's output byte-for-byte,
+//! and the flat provenance keys are unchanged — component-path keys (e.g.
+//! `"unlock-policy.tang.threshold"`, `"disk-layout"`) are recorded ALONGSIDE
+//! them. Variant-select components (`disk_layout`, `applications`,
+//! `firmware_quirks`) whole-replace by kind (same-kind `disk_layout` allows a
+//! field-partial override); field-components (`unlock_policy`, `network`,
+//! `base_image`) merge each leaf independently, host winning per leaf.
 //!
 //! **Precedence, per scalar field:** `host.overrides.<f>` if `Some` wins
 //! ([`Source::Host`](super::Source::Host)); else `group.defaults.<f>` if
@@ -47,10 +63,21 @@
 //! fully-resolved `HostProfile::applications` entry.
 
 use crate::error::{AutoInstallError, Result};
+use crate::network::ssh_installer::components::disk_layout::{
+    NativeKeystoreSpecPartial, SingleLuksSpecPartial,
+};
+use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
 use crate::network::ssh_installer::config::{ApplicationSpec, CockroachSpec, InstallationConfig};
 use std::collections::BTreeMap;
 
-use super::{CockroachSpecPartial, HostGroupProfile, HostProfile, Provenance, Source};
+use super::components::base_image::BaseImagePartial;
+use super::components::network::NetworkConfigPartial;
+use super::components::unlock_policy::{TangSssPartial, Tpm2PinPartial, UnlockPolicyPartial};
+use super::lower::lower;
+use super::{
+    CockroachSpecPartial, DiskLayoutPartial, HostGroupProfile, HostProfile,
+    InstallationConfigPartial, Provenance, Source,
+};
 
 /// Resolves a required field (no serde default): `host` wins over `group`;
 /// if neither supplies a value, records `name` in `missing` and returns
@@ -220,6 +247,294 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .clone()
             .unwrap_or_else(|| base.locality.clone()),
     }
+}
+
+/// Resolves one optional nested-component leaf: `host` being `Some` wins,
+/// else `group` being `Some`, else `None`. Records `name` -> [`Source`] on
+/// `provenance` (an ADDITIVE component-path key such as
+/// `"unlock-policy.tang.threshold"`) only when a tier actually supplied the
+/// leaf. Unlike [`resolve_required`]/[`resolve_defaulted`] it never errors
+/// and never injects a default — an absent leaf stays `None` so [`lower`]'s
+/// flat-field fallback still governs it, keeping a flat-authored host
+/// byte-identical. Works for double-`Option` leaves too (`T = Option<String>`):
+/// a host `Some(None)` ("explicitly no value") is a present leaf and wins.
+fn resolve_component_leaf<T: Clone>(
+    host: &Option<T>,
+    group: &Option<T>,
+    name: &str,
+    provenance: &mut Provenance,
+) -> Option<T> {
+    if let Some(v) = host {
+        provenance.0.insert(name.to_string(), Source::Host);
+        return Some(v.clone());
+    }
+    if let Some(v) = group {
+        provenance.0.insert(name.to_string(), Source::Group);
+        return Some(v.clone());
+    }
+    None
+}
+
+/// Field-partial merge of two same-kind `SingleLuks` disk-layout specs: each
+/// `Some` on `host` wins, each `None` falls through to `group` (the
+/// [`merge_cockroach`] precedent, generalized to the disk-layout spec).
+fn merge_single_luks(
+    host: &SingleLuksSpecPartial,
+    group: &SingleLuksSpecPartial,
+) -> SingleLuksSpecPartial {
+    SingleLuksSpecPartial {
+        esp_size: host.esp_size.clone().or_else(|| group.esp_size.clone()),
+        reset_size: host.reset_size.clone().or_else(|| group.reset_size.clone()),
+        bpool_size: host.bpool_size.clone().or_else(|| group.bpool_size.clone()),
+        disk_device: host.disk_device.clone().or_else(|| group.disk_device.clone()),
+        reset_enabled: host.reset_enabled.or(group.reset_enabled),
+    }
+}
+
+/// Field-partial merge of two same-kind `ZfsNativeKeystore` disk-layout specs.
+fn merge_native_keystore(
+    host: &NativeKeystoreSpecPartial,
+    group: &NativeKeystoreSpecPartial,
+) -> NativeKeystoreSpecPartial {
+    NativeKeystoreSpecPartial {
+        disks: host.disks.clone().or_else(|| group.disks.clone()),
+    }
+}
+
+/// Resolves the `disk_layout` variant-select component. Whole-replace-by-kind
+/// (the [`union_applications`] precedent): if the host authors a layout of a
+/// DIFFERENT kind than the group's, the host's variant wholly replaces it;
+/// within the SAME kind the host may override a single spec field
+/// (field-partial, host wins per field) while the rest inherit from the group.
+/// Returns `None` when neither tier authors a layout, so [`lower`] falls back
+/// to the flat `storage_mode`/`disk_device`/`disks` fields (the byte-identical
+/// path for every flat-authored host). Records the additive `"disk-layout"`
+/// provenance key.
+fn resolve_disk_layout(
+    host: Option<&DiskLayoutPartial>,
+    group: Option<&DiskLayoutPartial>,
+    provenance: &mut Provenance,
+) -> Option<DiskLayoutPartial> {
+    match (host, group) {
+        (None, None) => None,
+        (Some(h), None) => {
+            provenance.0.insert("disk-layout".to_string(), Source::Host);
+            Some(h.clone())
+        }
+        (None, Some(g)) => {
+            provenance.0.insert("disk-layout".to_string(), Source::Group);
+            Some(g.clone())
+        }
+        (Some(h), Some(g)) => {
+            let merged = match (h, g) {
+                (DiskLayoutPartial::SingleLuks(hs), DiskLayoutPartial::SingleLuks(gs)) => {
+                    DiskLayoutPartial::SingleLuks(merge_single_luks(hs, gs))
+                }
+                (
+                    DiskLayoutPartial::ZfsNativeKeystore(hs),
+                    DiskLayoutPartial::ZfsNativeKeystore(gs),
+                ) => DiskLayoutPartial::ZfsNativeKeystore(merge_native_keystore(hs, gs)),
+                // Different kind: the host's variant wholly replaces the group's.
+                (h_other, _) => h_other.clone(),
+            };
+            provenance.0.insert("disk-layout".to_string(), Source::Host);
+            Some(merged)
+        }
+    }
+}
+
+/// Resolves the `unlock_policy` field-component leaf-by-leaf (host wins per
+/// leaf). `None` when neither tier authors it, so [`lower`] falls back to the
+/// flat unlock fields. Records additive `"unlock-policy.*"` provenance keys.
+fn resolve_unlock_policy(
+    host: Option<&UnlockPolicyPartial>,
+    group: Option<&UnlockPolicyPartial>,
+    provenance: &mut Provenance,
+) -> Option<UnlockPolicyPartial> {
+    if host.is_none() && group.is_none() {
+        return None;
+    }
+    let h = host.cloned().unwrap_or_default();
+    let g = group.cloned().unwrap_or_default();
+
+    let tang = if h.tang.is_none() && g.tang.is_none() {
+        None
+    } else {
+        let ht = h.tang.clone().unwrap_or_default();
+        let gt = g.tang.clone().unwrap_or_default();
+        Some(TangSssPartial {
+            servers: resolve_component_leaf(
+                &ht.servers,
+                &gt.servers,
+                "unlock-policy.tang.servers",
+                provenance,
+            ),
+            threshold: resolve_component_leaf(
+                &ht.threshold,
+                &gt.threshold,
+                "unlock-policy.tang.threshold",
+                provenance,
+            ),
+        })
+    };
+
+    let tpm2_pin = if h.tpm2_pin.is_none() && g.tpm2_pin.is_none() {
+        None
+    } else {
+        let hp = h.tpm2_pin.clone().unwrap_or_default();
+        let gp = g.tpm2_pin.clone().unwrap_or_default();
+        Some(Tpm2PinPartial {
+            pin: resolve_component_leaf(&hp.pin, &gp.pin, "unlock-policy.tpm2-pin.pin", provenance),
+            pcr_ids: resolve_component_leaf(
+                &hp.pcr_ids,
+                &gp.pcr_ids,
+                "unlock-policy.tpm2-pin.pcr-ids",
+                provenance,
+            ),
+            enroll: resolve_component_leaf(
+                &hp.enroll,
+                &gp.enroll,
+                "unlock-policy.tpm2-pin.enroll",
+                provenance,
+            ),
+        })
+    };
+
+    Some(UnlockPolicyPartial {
+        tang,
+        tpm2_pin,
+        tpm2_clevis_peer: resolve_component_leaf(
+            &h.tpm2_clevis_peer,
+            &g.tpm2_clevis_peer,
+            "unlock-policy.tpm2-clevis-peer",
+            provenance,
+        ),
+        fido2_expected: resolve_component_leaf(
+            &h.fido2_expected,
+            &g.fido2_expected,
+            "unlock-policy.fido2-expected",
+            provenance,
+        ),
+    })
+}
+
+/// Resolves the `network` field-component leaf-by-leaf (host wins per leaf).
+/// `None` when neither tier authors it, so [`lower`] falls back to the flat
+/// `network_*` fields. Records additive `"network.*"` provenance keys.
+fn resolve_network(
+    host: Option<&NetworkConfigPartial>,
+    group: Option<&NetworkConfigPartial>,
+    provenance: &mut Provenance,
+) -> Option<NetworkConfigPartial> {
+    if host.is_none() && group.is_none() {
+        return None;
+    }
+    let h = host.cloned().unwrap_or_default();
+    let g = group.cloned().unwrap_or_default();
+    Some(NetworkConfigPartial {
+        interface: resolve_component_leaf(
+            &h.interface,
+            &g.interface,
+            "network.interface",
+            provenance,
+        ),
+        addressing: resolve_component_leaf(
+            &h.addressing,
+            &g.addressing,
+            "network.addressing",
+            provenance,
+        ),
+        search: resolve_component_leaf(&h.search, &g.search, "network.search", provenance),
+        nameservers: resolve_component_leaf(
+            &h.nameservers,
+            &g.nameservers,
+            "network.nameservers",
+            provenance,
+        ),
+        renderer: resolve_component_leaf(&h.renderer, &g.renderer, "network.renderer", provenance),
+    })
+}
+
+/// Resolves the `base_image` field-component leaf-by-leaf (host wins per
+/// leaf). `None` when neither tier authors it, so [`lower`] falls back to the
+/// flat `debootstrap_*`/`initramfs_type` fields. The double-`Option`
+/// `release`/`mirror` leaves preserve the inherit-vs-explicit-none
+/// distinction. Records additive `"base-image.*"` provenance keys.
+fn resolve_base_image(
+    host: Option<&BaseImagePartial>,
+    group: Option<&BaseImagePartial>,
+    provenance: &mut Provenance,
+) -> Option<BaseImagePartial> {
+    if host.is_none() && group.is_none() {
+        return None;
+    }
+    let h = host.cloned().unwrap_or_default();
+    let g = group.cloned().unwrap_or_default();
+    Some(BaseImagePartial {
+        release: resolve_component_leaf(&h.release, &g.release, "base-image.release", provenance),
+        mirror: resolve_component_leaf(&h.mirror, &g.mirror, "base-image.mirror", provenance),
+        initramfs: resolve_component_leaf(
+            &h.initramfs,
+            &g.initramfs,
+            "base-image.initramfs",
+            provenance,
+        ),
+        fallback_mirror: resolve_component_leaf(
+            &h.fallback_mirror,
+            &g.fallback_mirror,
+            "base-image.fallback-mirror",
+            provenance,
+        ),
+    })
+}
+
+/// The variant tag used to key the firmware-quirk union — mirrors
+/// `FirmwareQuirk`'s `#[serde(tag = "kind", rename_all = "kebab-case")]`.
+fn firmware_quirk_kind(quirk: &FirmwareQuirk) -> &'static str {
+    match quirk {
+        FirmwareQuirk::GrubRemovableFallback => "grub-removable-fallback",
+        FirmwareQuirk::ForceNicDriver { .. } => "force-nic-driver",
+        FirmwareQuirk::WatchdogStaggered { .. } => "watchdog-staggered",
+    }
+}
+
+/// Resolves the `firmware_quirks` variant-select component by kind — the
+/// [`union_applications`] precedent generalized: a kind present in only one
+/// tier is taken as-is, a kind present in both takes the host's whole entry.
+/// `None` when neither tier authors quirks (so [`lower`] defaults to an empty
+/// list, byte-identical for every flat-authored host). Records the additive
+/// `"firmware-quirks"` provenance key.
+fn resolve_firmware_quirks(
+    host: &Option<Vec<FirmwareQuirk>>,
+    group: &Option<Vec<FirmwareQuirk>>,
+    provenance: &mut Provenance,
+) -> Option<Vec<FirmwareQuirk>> {
+    if host.is_none() && group.is_none() {
+        return None;
+    }
+    let group_q = group.clone().unwrap_or_default();
+    let host_q = host.clone().unwrap_or_default();
+
+    let mut by_kind: BTreeMap<&'static str, FirmwareQuirk> = BTreeMap::new();
+    for quirk in &group_q {
+        by_kind.insert(firmware_quirk_kind(quirk), quirk.clone());
+    }
+    for quirk in &host_q {
+        by_kind.insert(firmware_quirk_kind(quirk), quirk.clone());
+    }
+
+    let source = if !host_q.is_empty() {
+        Source::Host
+    } else if !group_q.is_empty() {
+        Source::Group
+    } else {
+        Source::Default
+    };
+    provenance
+        .0
+        .insert("firmware-quirks".to_string(), source);
+
+    Some(by_kind.into_values().collect())
 }
 
 /// Resolves a `HostGroupProfile`'s defaults and a `HostProfile`'s overrides
@@ -424,46 +739,87 @@ pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(Installati
         .or_else(|| group.defaults.disks.clone())
         .unwrap_or_default();
 
+    // Component resolvers (ADDITIVE). Each returns `None` when neither tier
+    // authors the component, so `lower()` falls back to the flat fields
+    // resolved above — the byte-identical path for every flat-authored host.
+    // Each records its own component-path provenance keys alongside (not
+    // replacing) the flat keys already inserted.
+    let disk_layout = resolve_disk_layout(
+        host.overrides.disk_layout.as_ref(),
+        group.defaults.disk_layout.as_ref(),
+        &mut provenance,
+    );
+    let unlock_policy = resolve_unlock_policy(
+        host.overrides.unlock_policy.as_ref(),
+        group.defaults.unlock_policy.as_ref(),
+        &mut provenance,
+    );
+    let network = resolve_network(
+        host.overrides.network.as_ref(),
+        group.defaults.network.as_ref(),
+        &mut provenance,
+    );
+    let base_image = resolve_base_image(
+        host.overrides.base_image.as_ref(),
+        group.defaults.base_image.as_ref(),
+        &mut provenance,
+    );
+    let firmware_quirks = resolve_firmware_quirks(
+        &host.overrides.firmware_quirks,
+        &group.defaults.firmware_quirks,
+        &mut provenance,
+    );
+
     // Every `resolve_required` call above either populated `missing` (and we
     // already returned on that) or returned `Some`; these `expect`s just
-    // spell that invariant out for the compiler.
-    let config = InstallationConfig {
-        hostname: hostname.expect("checked non-missing above"),
-        disk_device: disk_device.expect("checked non-missing above"),
-        timezone: timezone.expect("checked non-missing above"),
-        luks_key: luks_key.expect("checked non-missing above"),
-        root_password: root_password.expect("checked non-missing above"),
-        network_interface: network_interface.expect("checked non-missing above"),
-        network_address: network_address.expect("checked non-missing above"),
-        network_gateway: network_gateway.expect("checked non-missing above"),
-        network_search: network_search.expect("checked non-missing above"),
-        network_nameservers: network_nameservers.expect("checked non-missing above"),
-        network_renderer,
-        debootstrap_release,
-        debootstrap_mirror,
-        initramfs_type,
-        tang_servers,
-        tang_threshold,
-        ssh_authorized_keys,
-        enroll_tpm2,
-        tpm2_pin,
-        tpm2_pcr_ids,
-        expect_fido2,
-        install_ca_cert,
-        applications,
-        storage_mode,
-        disks,
-        // Not yet resolvable from group/host overrides — `InstallationConfigPartial`
-        // carries no arch/role/firmware_quirks/hooks fields (PS-WIRE-AXES-10 wires
-        // them onto `InstallationConfig` only; profile-tier resolution is a later,
-        // per-axis task). Every resolved config gets the byte-identical default.
-        arch: Default::default(),
-        role: Default::default(),
-        firmware_quirks: Vec::new(),
-        hooks: Default::default(),
+    // spell that invariant out for the compiler. Assemble one RESOLVED
+    // `InstallationConfigPartial` (flat fields + components) and flatten it
+    // through the already-merged pure `lower()` rather than duplicating the
+    // authoring->wire mapping here. Double-`Option` flat fields are wrapped in
+    // an outer `Some(_)` so `lower`'s `.flatten()` reproduces the resolved
+    // value exactly.
+    let resolved = InstallationConfigPartial {
+        hostname: Some(hostname.expect("checked non-missing above")),
+        disk_device: Some(disk_device.expect("checked non-missing above")),
+        timezone: Some(timezone.expect("checked non-missing above")),
+        luks_key: Some(luks_key.expect("checked non-missing above")),
+        root_password: Some(root_password.expect("checked non-missing above")),
+        network_interface: Some(network_interface.expect("checked non-missing above")),
+        network_address: Some(network_address.expect("checked non-missing above")),
+        network_gateway: Some(network_gateway.expect("checked non-missing above")),
+        network_search: Some(network_search.expect("checked non-missing above")),
+        network_nameservers: Some(network_nameservers.expect("checked non-missing above")),
+        network_renderer: Some(network_renderer),
+        debootstrap_release: Some(debootstrap_release),
+        debootstrap_mirror: Some(debootstrap_mirror),
+        initramfs_type: Some(initramfs_type),
+        tang_servers: Some(tang_servers),
+        tang_threshold: Some(tang_threshold),
+        ssh_authorized_keys: Some(ssh_authorized_keys),
+        enroll_tpm2: Some(enroll_tpm2),
+        tpm2_pin: Some(tpm2_pin),
+        tpm2_pcr_ids: Some(tpm2_pcr_ids),
+        expect_fido2: Some(expect_fido2),
+        install_ca_cert: Some(install_ca_cert),
+        applications: Some(applications),
+        storage_mode: Some(storage_mode),
+        disks: Some(disks),
+        disk_layout,
+        unlock_policy,
+        network,
+        base_image,
+        firmware_quirks,
+        // arch/role/hooks are NOT resolved here — no committed host authors
+        // them, and their profile-tier resolution belongs to the per-axis
+        // briefs (PS-ARCH-07/PS-ROLE-08/PS-HOOK-06). Left `None`, `lower()`
+        // gives every resolved config the byte-identical default, exactly as
+        // the previous direct construction hardcoded.
+        arch: None,
+        role: None,
+        hooks: None,
     };
 
-    Ok((config, provenance))
+    Ok((lower(&resolved), provenance))
 }
 
 #[cfg(test)]
@@ -655,5 +1011,113 @@ mod tests {
         let (config, _provenance) = merge(&group, &host).expect("merge should succeed");
 
         assert_eq!(config.luks_key, "REPLACE_AT_PLACE_TIME");
+    }
+
+    #[test]
+    fn test_host_disk_layout_replaces_group_by_kind() {
+        // Group authors a SingleLuks layout; the host authors a
+        // ZfsNativeKeystore layout of a DIFFERENT kind — the host's variant
+        // wholly replaces the group's (variant-select whole-replace-by-kind).
+        use crate::network::ssh_installer::config::{DiskRole, DiskSpec, StorageMode};
+
+        let mut group = base_group();
+        group.defaults.disk_layout = Some(DiskLayoutPartial::SingleLuks(SingleLuksSpecPartial {
+            disk_device: Some("/dev/nvme0n1".to_string()),
+            ..Default::default()
+        }));
+        let mut host = base_host();
+        host.overrides.disk_layout = Some(DiskLayoutPartial::ZfsNativeKeystore(
+            NativeKeystoreSpecPartial {
+                disks: Some(vec![DiskSpec {
+                    id: "/dev/disk/by-id/nvme-eui.001".to_string(),
+                    role: DiskRole::System,
+                }]),
+            },
+        ));
+
+        let (config, provenance) = merge(&group, &host).expect("merge should succeed");
+
+        assert_eq!(config.storage_mode, StorageMode::NativeKeystore);
+        assert_eq!(config.disks.len(), 1);
+        assert_eq!(config.disks[0].id, "/dev/disk/by-id/nvme-eui.001");
+        assert_eq!(provenance.0.get("disk-layout"), Some(&Source::Host));
+    }
+
+    #[test]
+    fn test_disk_layout_same_kind_field_partial() {
+        // Same-kind SingleLuks: the host overrides exactly one spec field
+        // (`disk_device`); every other field inherits from the group.
+        let group_layout = DiskLayoutPartial::SingleLuks(SingleLuksSpecPartial {
+            esp_size: Some("1G".to_string()),
+            disk_device: Some("/dev/nvme0n1".to_string()),
+            ..Default::default()
+        });
+        let host_layout = DiskLayoutPartial::SingleLuks(SingleLuksSpecPartial {
+            disk_device: Some("/dev/sda".to_string()),
+            ..Default::default()
+        });
+
+        // Resolver-level: `esp_size` is dropped by `lower` and thus
+        // unobservable through `merge`'s output, so assert the field-partial
+        // inheritance directly on the merged layout.
+        let mut prov = Provenance::default();
+        let merged = resolve_disk_layout(Some(&host_layout), Some(&group_layout), &mut prov)
+            .expect("both tiers authored a layout");
+        match merged {
+            DiskLayoutPartial::SingleLuks(spec) => {
+                assert_eq!(
+                    spec.esp_size,
+                    Some("1G".to_string()),
+                    "esp_size inherits from the group"
+                );
+                assert_eq!(
+                    spec.disk_device,
+                    Some("/dev/sda".to_string()),
+                    "disk_device is the host's override"
+                );
+            }
+            other => panic!("expected SingleLuks, got {other:?}"),
+        }
+
+        // Merge-level: the single overridden spec field reaches the wire
+        // config's `disk_device`.
+        let mut group = base_group();
+        group.defaults.disk_layout = Some(group_layout);
+        let mut host = base_host();
+        host.overrides.disk_layout = Some(host_layout);
+        let (config, _prov) = merge(&group, &host).expect("merge should succeed");
+        assert_eq!(config.disk_device, "/dev/sda");
+    }
+
+    #[test]
+    fn test_provenance_has_both_flat_and_component_path_keys() {
+        // A host that authors components keeps the existing FLAT provenance
+        // keys unchanged AND gains additive component-path keys alongside them.
+        let group = base_group();
+        let mut host = base_host();
+        host.overrides.disk_device = Some("/dev/sda".to_string());
+        host.overrides.unlock_policy = Some(UnlockPolicyPartial {
+            tang: Some(TangSssPartial {
+                threshold: Some(1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        host.overrides.disk_layout = Some(DiskLayoutPartial::SingleLuks(SingleLuksSpecPartial {
+            disk_device: Some("/dev/sda".to_string()),
+            ..Default::default()
+        }));
+
+        let (_config, provenance) = merge(&group, &host).expect("merge should succeed");
+
+        // Existing flat keys, unchanged.
+        assert_eq!(provenance.0.get("disk_device"), Some(&Source::Host));
+        assert_eq!(provenance.0.get("network_renderer"), Some(&Source::Default));
+        // New additive component-path keys.
+        assert_eq!(
+            provenance.0.get("unlock-policy.tang.threshold"),
+            Some(&Source::Host)
+        );
+        assert_eq!(provenance.0.get("disk-layout"), Some(&Source::Host));
     }
 }
