@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.11.0
+// version: 2.12.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -32,7 +32,7 @@ impl InitramfsType {
 }
 
 /// Tang server entry for Clevis SSS binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TangServer {
     pub url: String,
 }
