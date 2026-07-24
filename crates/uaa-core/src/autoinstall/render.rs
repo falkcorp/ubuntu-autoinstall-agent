@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/render.rs
-// version: 1.0.1
+// version: 1.0.2
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-07-10
+// last-edited: 2026-07-24
 
 //! Render a subiquity autoinstall `user-data` from a template + [`HostSpec`].
 //!
@@ -73,23 +73,28 @@ mod tests {
     const GOLDEN_002: &str = include_str!("../../tests/fixtures/golden/len-serv-002.user-data");
     const GOLDEN_003: &str = include_str!("../../tests/fixtures/golden/len-serv-003.user-data");
 
+    /// The live Lenovo fleet's member IPs. `for_lenserv` previously defaulted
+    /// this internally via a hardcoded module-level constant; tests now pass
+    /// it in explicitly (PS-COCKROACH-16).
+    const TEST_LENSERV_MEMBERS: &[&str] = &["172.16.3.92", "172.16.3.94", "172.16.3.96"];
+
     #[test]
     fn renders_003_byte_for_byte() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let out = render_user_data(default_template(), &spec).unwrap();
         assert_eq!(out, GOLDEN_003);
     }
 
     #[test]
     fn renders_001_byte_for_byte() {
-        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23");
+        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23", TEST_LENSERV_MEMBERS);
         let out = render_user_data(default_template(), &spec).unwrap();
         assert_eq!(out, GOLDEN_001);
     }
 
     #[test]
     fn renders_002_byte_for_byte() {
-        let spec = HostSpec::for_lenserv("len-serv-002", "172.16.3.94/23");
+        let spec = HostSpec::for_lenserv("len-serv-002", "172.16.3.94/23", TEST_LENSERV_MEMBERS);
         let out = render_user_data(default_template(), &spec).unwrap();
         assert_eq!(out, GOLDEN_002);
     }
@@ -107,7 +112,7 @@ mod tests {
             ("len-serv-002", "172.16.3.94/23"),
             ("len-serv-003", "172.16.3.96/23"),
         ] {
-            let spec = HostSpec::for_lenserv(hostname, addr);
+            let spec = HostSpec::for_lenserv(hostname, addr, TEST_LENSERV_MEMBERS);
             let out = render_user_data(default_template(), &spec).unwrap();
             let path = golden_dir.join(format!("{hostname}.user-data"));
             std::fs::write(&path, &out).unwrap();
@@ -118,7 +123,7 @@ mod tests {
     #[test]
     fn unfilled_placeholder_is_an_error() {
         let custom = "hostname: {{HOSTNAME}}\nmystery: {{NOT_A_REAL_FIELD}}\n";
-        let spec = HostSpec::for_lenserv("x", "10.0.0.1/24");
+        let spec = HostSpec::for_lenserv("x", "10.0.0.1/24", TEST_LENSERV_MEMBERS);
         let err = render_user_data(custom, &spec).unwrap_err();
         assert!(
             err.to_string().contains("{{NOT_A_REAL_FIELD}}"),
@@ -128,7 +133,7 @@ mod tests {
 
     #[test]
     fn default_template_has_no_residual_after_full_render() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let out = render_user_data(default_template(), &spec).unwrap();
         assert!(find_placeholder(&out).is_none());
     }

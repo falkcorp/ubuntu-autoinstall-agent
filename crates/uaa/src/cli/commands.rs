@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.12.2
+// version: 2.13.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! Command implementations for the CLI
 
@@ -791,6 +791,7 @@ fn create_local_installation_config(
         // refuse to trust it until the CA is delivered by hand.
         install_ca_cert: uaa_core::network::ssh_installer::config::default_install_ca_cert(),
         applications: Vec::new(),
+        cockroach_members: Vec::new(),
         // Interactive live-install path stays on the stock plain-LUKS layout;
         // native-keystore + multi-disk (U1) is driven from profiles, not here.
         storage_mode: Default::default(),
@@ -1034,6 +1035,18 @@ fn prompt_for_root_password() -> Result<String> {
     Ok(password.trim().to_string())
 }
 
+/// The live Lenovo (`len-serv-*`) fleet's CockroachDB member IPs, in
+/// canonical (ascending) order. `place`/`verify`/`render-user-data` are
+/// standalone CLI utilities that build a [`HostSpec`] directly (no
+/// registry/profile resolution), so unlike `uaa install` (which sources
+/// `InstallationConfig::cockroach_members` from `uaa-control`'s
+/// `resolve_from_registry`) these three commands still need a literal
+/// roster. `uaa-core`'s `HostSpec::for_lenserv` used to default this
+/// internally via a shared hardcoded constant; that default is gone
+/// (PS-COCKROACH-16), so this crate now owns its own copy, scoped to these
+/// fleet-specific commands rather than a cross-crate hardcoded default.
+const LEN_SERV_FLEET_MEMBERS: [&str; 3] = ["172.16.3.92", "172.16.3.94", "172.16.3.96"];
+
 /// Write the rendered seed into the netboot server's cloud-init tree, then
 /// optionally flip the boot target and/or reboot the target host.
 #[allow(clippy::too_many_arguments)]
@@ -1054,7 +1067,7 @@ pub async fn place_command(
     };
     use uaa_core::network::SshClient;
 
-    let spec = HostSpec::for_lenserv(hostname, address);
+    let spec = HostSpec::for_lenserv(hostname, address, &LEN_SERV_FLEET_MEMBERS);
 
     // Connect to netboot server (always needed, even for dry-run, to resolve hexmac)
     let mut server_conn = SshClient::new();
@@ -1111,7 +1124,7 @@ pub async fn verify_command(
     use uaa_core::autoinstall::{verify::verify_host, HostSpec};
     use uaa_core::network::SshClient;
 
-    let spec = HostSpec::for_lenserv(hostname, address);
+    let spec = HostSpec::for_lenserv(hostname, address, &LEN_SERV_FLEET_MEMBERS);
 
     let mut client = SshClient::new();
     client.connect(host, username).await?;
@@ -1147,7 +1160,7 @@ pub async fn render_user_data_command(
         None => default_template().to_string(),
     };
 
-    let spec = HostSpec::for_lenserv(hostname, address);
+    let spec = HostSpec::for_lenserv(hostname, address, &LEN_SERV_FLEET_MEMBERS);
     let rendered = render_user_data(&template, &spec)?;
 
     match output_path {

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.3.1
+// version: 1.4.0
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-23
+// last-edited: 2026-07-24
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -23,7 +23,7 @@
 //! is byte-identical to before this module existed.
 
 use super::config::{ApplicationSpec, CockroachSpec, InstallationConfig, TangServerSpec};
-use crate::autoinstall::host_spec::{HostSpec, LENSERV_MEMBER_IPS};
+use crate::autoinstall::host_spec::HostSpec;
 use crate::error::AutoInstallError;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -201,15 +201,12 @@ impl<'a> ApplicationInstaller<'a> {
         self.chroot_exec("chmod 600 /var/lib/cockroach/certs/node.key")
             .await?;
 
-        // 4. Derive advertise/join. Members are sourced from the fleet's
-        // canonical LENSERV_MEMBER_IPS (host_spec.rs) — InstallationConfig
-        // has no per-host group/sibling field yet (that lands with
-        // TASK-04/profiles); this is the only source of truth today, and
-        // matches for_lenserv()'s own derivation exactly (see
-        // test_cockroach_join_matches_host_spec).
-        let members: Vec<String> = LENSERV_MEMBER_IPS.iter().map(|ip| ip.to_string()).collect();
+        // 4. Derive advertise/join. Members are sourced from
+        // `config.cockroach_members` — populated by uaa-control's
+        // `resolve_from_registry` from the active group allocation
+        // (PS-COCKROACH-16), never a hardcoded constant.
         let (advertise, join) =
-            derive_cockroach_endpoints(&config.network_address, &members, spec);
+            derive_cockroach_endpoints(&config.network_address, &config.cockroach_members, spec);
         let sql_addr = format!("{self_ip}:{}", spec.sql_port);
 
         // 5. Write the systemd unit directly at its host-visible path
@@ -406,6 +403,7 @@ mod tests {
             expect_fido2: true,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
+            cockroach_members: Vec::new(),
             storage_mode: Default::default(),
             disks: Vec::new(),
             arch: Default::default(),
@@ -525,27 +523,39 @@ mod tests {
 
     // --- derive_cockroach_endpoints: pure-function tests, no executor ---
 
+    /// The GATE for PS-COCKROACH-16 (retiring the hardcoded fleet-member-IPs
+    /// constant this module used to import from `host_spec`): the
+    /// roster-derived (advertise, join) for each of the 3 len-serv nodes must
+    /// equal the exact literal strings the retired constant produced —
+    /// asserted here as bare literals (not re-derived from a second call into
+    /// `HostSpec::compute_join`), so a regression in either
+    /// `derive_cockroach_endpoints` or the group roster this task wires in
+    /// cannot silently change the fleet's live join strings. These are the
+    /// same values `host_spec.rs`'s `for_lenserv_matches_known_hosts`
+    /// asserts for `HostSpec::for_lenserv`.
     #[test]
-    fn test_cockroach_join_matches_host_spec() {
+    fn test_cockroach_join_matches_former_lenserv_member_ips_constant() {
         use crate::autoinstall::host_spec::{COCKROACH_PORT, COCKROACH_SERVER_IP};
 
-        // len-serv-001 (172.16.3.92) against the real fleet member set.
-        let self_addr = "172.16.3.92/23";
-        let members: Vec<String> = LENSERV_MEMBER_IPS
+        let members: Vec<String> = ["172.16.3.92", "172.16.3.94", "172.16.3.96"]
             .iter()
-            .map(|ip| format!("{ip}/23"))
+            .map(|ip| ip.to_string())
             .collect();
         let mut spec = sample_cockroach_spec();
         spec.seed_ip = COCKROACH_SERVER_IP.to_string();
         spec.port = COCKROACH_PORT;
 
-        let (_, join) = derive_cockroach_endpoints(self_addr, &members, &spec);
+        let (advertise_1, join_1) = derive_cockroach_endpoints("172.16.3.92/23", &members, &spec);
+        assert_eq!(advertise_1, "172.16.3.92:36357");
+        assert_eq!(join_1, "172.16.2.30:36357,172.16.3.94:36357,172.16.3.96:36357");
 
-        // Computed directly against HostSpec::compute_join — proves there
-        // is no second, divergent join implementation.
-        let expected =
-            HostSpec::compute_join(COCKROACH_SERVER_IP, LENSERV_MEMBER_IPS, "172.16.3.92", COCKROACH_PORT);
-        assert_eq!(join, expected);
+        let (advertise_2, join_2) = derive_cockroach_endpoints("172.16.3.94/23", &members, &spec);
+        assert_eq!(advertise_2, "172.16.3.94:36357");
+        assert_eq!(join_2, "172.16.2.30:36357,172.16.3.92:36357,172.16.3.96:36357");
+
+        let (advertise_3, join_3) = derive_cockroach_endpoints("172.16.3.96/23", &members, &spec);
+        assert_eq!(advertise_3, "172.16.3.96:36357");
+        assert_eq!(join_3, "172.16.2.30:36357,172.16.3.92:36357,172.16.3.94:36357");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/verify.rs
-// version: 1.3.0
+// version: 1.3.1
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-07-10
+// last-edited: 2026-07-24
 
 //! Post-install verification for Lenovo fleet hosts.
 //!
@@ -22,7 +22,11 @@
 //! # async fn run() -> uaa_core::Result<()> {
 //! let mut client = SshClient::new();
 //! client.connect("172.16.3.96", "jdfalk").await?;
-//! let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+//! let spec = HostSpec::for_lenserv(
+//!     "len-serv-003",
+//!     "172.16.3.96/23",
+//!     &["172.16.3.92", "172.16.3.94", "172.16.3.96"],
+//! );
 //! let report = verify_host(&mut client, &spec, "172.16.3.96").await?;
 //! report.print();
 //! # Ok(())
@@ -534,6 +538,13 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
 
+    /// The live Lenovo fleet's member IPs. `for_lenserv` previously defaulted
+    /// this internally via a hardcoded module-level constant; tests now pass
+    /// it in explicitly (PS-COCKROACH-16). Unused by the checks below (they
+    /// only compare hostname/IP/LUKS/etc against fixture output), so only
+    /// `for_lenserv`'s signature needs it.
+    const TEST_LENSERV_MEMBERS: &[&str] = &["172.16.3.92", "172.16.3.94", "172.16.3.96"];
+
     /// Minimal mock executor: returns pre-loaded output strings keyed by command.
     /// Any command not in the map returns an empty string.
     struct MockExecutor {
@@ -727,13 +738,13 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn hostname_passes_on_match() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         assert!(evaluate_hostname("len-serv-003\n", &spec).passed);
     }
 
     #[test]
     fn hostname_fails_on_mismatch() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let r = evaluate_hostname("len-serv-001\n", &spec);
         assert!(!r.passed);
         assert!(r.detail.contains("len-serv-001"));
@@ -741,14 +752,14 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn ip_address_passes_when_present() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let out = "enp1s0f0 UP 172.16.3.96/23 fe80::1/64";
         assert!(evaluate_ip_address(out, &spec).passed);
     }
 
     #[test]
     fn ip_address_fails_when_absent() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
         let r = evaluate_ip_address("enp1s0f0 UP 172.16.3.92/23", &spec);
         assert!(!r.passed);
     }
@@ -769,7 +780,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[tokio::test]
     async fn verify_host_all_pass_for_len_serv_003() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
@@ -800,7 +811,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[tokio::test]
     async fn verify_host_fails_on_wrong_hostname() {
-        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23");
+        let spec = HostSpec::for_lenserv("len-serv-001", "172.16.3.92/23", TEST_LENSERV_MEMBERS);
 
         let mut mock = MockExecutor::new(&[
             ("lsblk -o NAME,TYPE,FSTYPE", LSBLK_003),
@@ -830,7 +841,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[tokio::test]
     async fn verify_host_fails_on_missing_luks() {
-        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23");
+        let spec = HostSpec::for_lenserv("len-serv-003", "172.16.3.96/23", TEST_LENSERV_MEMBERS);
 
         let mut mock = MockExecutor::new(&[
             // No crypto_LUKS in output
