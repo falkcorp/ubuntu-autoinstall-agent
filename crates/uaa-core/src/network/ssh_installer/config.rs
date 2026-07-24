@@ -1,10 +1,12 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.12.0
+// version: 2.13.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
 //! Configuration structures for SSH/local installation
 
+use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
+use crate::network::ssh_installer::components::hooks::Hooks;
 use serde::{Deserialize, Serialize};
 
 /// Which initramfs generator is in use on the target.
@@ -208,6 +210,28 @@ pub struct InstallationConfig {
     /// `applications`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<DiskSpec>,
+    /// Target architecture (amd64/arm64). Defaults to `Amd64` — the entire
+    /// fleet today — so an omitting host serializes byte-identically.
+    /// `skip_serializing_if` keeps the key out of a stock amd64 config's
+    /// serialization (same cross-version-rollback rationale as
+    /// `storage_mode`). No behavior consumes this yet.
+    #[serde(default, skip_serializing_if = "Arch::is_amd64")]
+    pub arch: Arch,
+    /// Installation-target vs. external-Tang-server classifier. Defaults to
+    /// `InstallTarget` — every committed host config today — so an omitting
+    /// host serializes byte-identically. No behavior consumes this yet.
+    #[serde(default, skip_serializing_if = "HostRole::is_install_target")]
+    pub role: HostRole,
+    /// Per-board firmware/boot-loader workarounds (PS-QUIRK-05). Empty = none,
+    /// today's behavior for every committed host. No behavior consumes this
+    /// yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub firmware_quirks: Vec<FirmwareQuirk>,
+    /// Arbitrary host-specific commands at named install phases (PS-HOOK-06).
+    /// Empty = none, today's behavior for every committed host. No behavior
+    /// consumes this yet.
+    #[serde(default, skip_serializing_if = "Hooks::is_empty")]
+    pub hooks: Hooks,
 }
 
 /// Which encryption/storage layout the installer builds.
@@ -389,6 +413,10 @@ impl InstallationConfig {
             applications: Vec::new(),
             storage_mode: StorageMode::PlainLuks,
             disks: Vec::new(),
+            arch: Arch::Amd64,
+            role: HostRole::InstallTarget,
+            firmware_quirks: Vec::new(),
+            hooks: Hooks::default(),
         }
     }
 }
@@ -813,6 +841,65 @@ key-directory: /etc/tang/keys
             panic!("expected TangServer variant");
         };
         assert_eq!(tang.port, 80, "fleet Tang binds port 80 by default");
+    }
+
+    #[test]
+    fn test_all_new_axes_omit_when_default() {
+        // Cross-version rollback safety (same discipline as
+        // test_plain_luks_host_omits_storage_keys / StorageMode::is_default): a
+        // stock len-serv host — arch defaulted amd64, role install-target, no
+        // firmware quirks, no hooks — must serialize WITHOUT any of the four
+        // new keys, so a rolled-back control binary (whose deny_unknown_fields
+        // InstallationConfig predates these fields) still parses the placed
+        // file byte-for-byte as it did before this brief.
+        let cfg = InstallationConfig::for_len_serv_003();
+        assert_eq!(cfg.arch, Arch::Amd64, "fixture is amd64");
+        assert_eq!(cfg.role, HostRole::InstallTarget, "fixture is install-target");
+        assert!(cfg.firmware_quirks.is_empty(), "fixture has no firmware quirks");
+        assert!(cfg.hooks.is_empty(), "fixture has no hooks");
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        // Match on the YAML key form (`\nkey:`), not a bare substring — several
+        // existing keys (`debootstrap_mirror: http://archive...`) contain
+        // "arch" as a substring of unrelated text.
+        assert!(!yaml.contains("\narch:"), "a default-arch host must omit the arch key entirely, got:\n{yaml}");
+        assert!(!yaml.contains("\nrole:"), "an install-target host must omit the role key entirely, got:\n{yaml}");
+        assert!(
+            !yaml.contains("\nfirmware_quirks:"),
+            "a quirk-free host must omit the firmware_quirks key entirely, got:\n{yaml}"
+        );
+        assert!(!yaml.contains("\nhooks:"), "a hook-free host must omit the hooks key entirely, got:\n{yaml}");
+    }
+
+    #[test]
+    fn test_non_default_axes_all_serialize_and_round_trip() {
+        // The inverse guard: when the four axes carry non-default values, each
+        // key must actually appear (else the installer would silently fall
+        // back to the amd64/install-target/no-quirk/no-hook defaults).
+        let mut cfg = InstallationConfig::for_len_serv_003();
+        cfg.arch = Arch::Arm64;
+        cfg.role = HostRole::TangServer;
+        cfg.firmware_quirks = vec![crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk::GrubRemovableFallback];
+        let mut hooks = Hooks::default();
+        hooks.pre_phase.insert(
+            crate::network::ssh_installer::components::hooks::Phase::DiskPreparation,
+            vec![crate::network::ssh_installer::components::hooks::HookStep {
+                run: "echo hi".to_string(),
+                chroot: false,
+            }],
+        );
+        cfg.hooks = hooks;
+
+        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        assert!(yaml.contains("arch: arm64"), "arm64 arch must serialize, got:\n{yaml}");
+        assert!(yaml.contains("role: tang-server"), "tang-server role must serialize, got:\n{yaml}");
+        assert!(yaml.contains("firmware_quirks"), "non-empty firmware_quirks must serialize, got:\n{yaml}");
+        assert!(yaml.contains("hooks"), "non-empty hooks must serialize, got:\n{yaml}");
+
+        let back: InstallationConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.arch, cfg.arch);
+        assert_eq!(back.role, cfg.role);
+        assert_eq!(back.firmware_quirks, cfg.firmware_quirks);
+        assert_eq!(back.hooks, cfg.hooks);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.15.0
+// version: 2.15.1
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -1340,6 +1340,10 @@ mod tests {
             applications: vec![],
             storage_mode: Default::default(),
             disks: Vec::new(),
+            arch: Default::default(),
+            role: Default::default(),
+            firmware_quirks: Vec::new(),
+            hooks: Default::default(),
         }
     }
 

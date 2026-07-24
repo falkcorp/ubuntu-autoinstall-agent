@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/components/hooks.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 8574566e-c12f-4516-b66c-bffce50bb35c
 // last-edited: 2026-07-23
 
@@ -59,9 +59,38 @@ pub struct Hooks {
     pub post_phase: BTreeMap<Phase, Vec<HookStep>>,
 }
 
+impl Hooks {
+    /// `true` when neither `pre_phase` nor `post_phase` carries any steps —
+    /// the `skip_serializing_if` predicate for a `hooks` field wired onto
+    /// [`InstallationConfig`](super::super::config::InstallationConfig), so an
+    /// unhooked host omits the key entirely (same byte-identical discipline as
+    /// `StorageMode::is_default`).
+    pub fn is_empty(&self) -> bool {
+        self.pre_phase.is_empty() && self.post_phase.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_empty_true_for_default() {
+        assert!(Hooks::default().is_empty());
+    }
+
+    #[test]
+    fn is_empty_false_when_pre_phase_populated() {
+        let mut hooks = Hooks::default();
+        hooks.pre_phase.insert(
+            Phase::DiskPreparation,
+            vec![HookStep {
+                run: "echo pre-disk".to_string(),
+                chroot: false,
+            }],
+        );
+        assert!(!hooks.is_empty());
+    }
 
     #[test]
     fn default_hooks_serializes_with_both_maps_omitted() {

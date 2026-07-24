@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.2.0
+// version: 1.2.1
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
 // last-edited: 2026-07-23
 
@@ -453,6 +453,14 @@ pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(Installati
         applications,
         storage_mode,
         disks,
+        // Not yet resolvable from group/host overrides — `InstallationConfigPartial`
+        // carries no arch/role/firmware_quirks/hooks fields (PS-WIRE-AXES-10 wires
+        // them onto `InstallationConfig` only; profile-tier resolution is a later,
+        // per-axis task). Every resolved config gets the byte-identical default.
+        arch: Default::default(),
+        role: Default::default(),
+        firmware_quirks: Vec::new(),
+        hooks: Default::default(),
     };
 
     Ok((config, provenance))
