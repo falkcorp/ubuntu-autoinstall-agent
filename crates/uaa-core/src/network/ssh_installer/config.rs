@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.11.0
+// version: 2.12.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -191,6 +191,28 @@ impl StorageMode {
     /// predicate that keeps a Lenovo config's serialization key-for-key unchanged.
     pub fn is_default(&self) -> bool {
         matches!(self, StorageMode::PlainLuks)
+    }
+}
+
+/// Target architecture classifier — independent of `crate::config::Architecture`.
+/// This one belongs to the SSH installer pipeline; the retired `Architecture`
+/// enum belongs to the legacy TargetConfig/image pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Arch {
+    /// x86-64 / AMD64 — default and most common in the fleet.
+    #[default]
+    Amd64,
+    /// ARM 64-bit — used by some lightweight servers (e.g., RPi).
+    Arm64,
+}
+
+impl Arch {
+    /// `true` for the default (`Amd64`) — intended for use in a future
+    /// `#[serde(skip_serializing_if="Arch::is_amd64")]` to omit the field
+    /// for AMD64 hosts (mirroring the `StorageMode::is_default()` precedent).
+    pub fn is_amd64(&self) -> bool {
+        matches!(self, Arch::Amd64)
     }
 }
 
@@ -658,5 +680,34 @@ typo_field: oops
             err.to_string().contains("typo_field"),
             "error must name the unknown field: {err}"
         );
+    }
+
+    #[test]
+    fn test_arch_default_is_amd64() {
+        assert_eq!(Arch::default(), Arch::Amd64);
+    }
+
+    #[test]
+    fn test_arch_is_amd64() {
+        assert!(Arch::Amd64.is_amd64());
+        assert!(!Arch::Arm64.is_amd64());
+    }
+
+    #[test]
+    fn test_arch_serde_round_trip() {
+        // Amd64 should serialize to "amd64"
+        let amd64_yaml = serde_yaml::to_string(&Arch::Amd64).unwrap();
+        assert_eq!(amd64_yaml.trim(), "amd64");
+
+        // Arm64 should serialize to "arm64"
+        let arm64_yaml = serde_yaml::to_string(&Arch::Arm64).unwrap();
+        assert_eq!(arm64_yaml.trim(), "arm64");
+
+        // Round-trip: deserialize back
+        let amd64_back: Arch = serde_yaml::from_str("amd64").unwrap();
+        assert_eq!(amd64_back, Arch::Amd64);
+
+        let arm64_back: Arch = serde_yaml::from_str("arm64").unwrap();
+        assert_eq!(arm64_back, Arch::Arm64);
     }
 }
