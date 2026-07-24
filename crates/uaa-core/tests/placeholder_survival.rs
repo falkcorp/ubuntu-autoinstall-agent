@@ -1,5 +1,5 @@
 // file: crates/uaa-core/tests/placeholder_survival.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: fd8d505f-015d-4c23-92aa-f1147f5122bf
 // last-edited: 2026-07-24
 
@@ -25,6 +25,11 @@
 //! [`assert_placeholder_survives`] is the reusable entry point: future
 //! per-field migration briefs (e.g. UNLOCK-27, DISK-28) can call it for
 //! their own secret field once that field moves into a nested component.
+//!
+//! **PS-MIG-U1-23** is the first such caller: it exercises the SAME helper
+//! against the real unimatrixone component fixture
+//! (`tests/fixtures/components/unimatrixone.yaml`), not just the synthetic
+//! `GROUP_YAML`/`HOST_YAML` above — see the "unimatrixone" section below.
 
 use uaa_core::config_place::PLACEHOLDER;
 use uaa_core::network::ssh_installer::config::InstallationConfig;
@@ -132,4 +137,92 @@ fn placeholder_survives_install_ca_cert() {
     assert_placeholder_survives("install_ca_cert", &group, &host, |c| {
         Some(c.install_ca_cert.as_str())
     });
+}
+
+// ── PS-MIG-U1-23: unimatrixone (NativeKeystore/"keystore") coverage ────────
+//
+// The tests above prove the generic parse->merge placeholder-passthrough
+// mechanism using a synthetic len-serv-shaped fixture. This section is the
+// first call site `assert_placeholder_survives` was built for (see the
+// module doc): the REAL unimatrixone component fixture
+// (`crates/uaa-core/tests/fixtures/components/unimatrixone.yaml`,
+// NativeKeystore / D2-B keystore-zvol), so a regression specific to that
+// fixture's shape (nested `unlock_policy.tpm2_clevis_peer` leaf alongside
+// flat secret fields) is caught here, not just for the synthetic case.
+
+/// Mirrors `component_equality_gate.rs`'s `ComponentFixture` shape (a
+/// `HostGroupProfile` defaults blob + `HostProfile` overrides blob) — kept as
+/// its own copy here because integration-test binaries cannot share
+/// `#[cfg(test)]` items across files, and it is a small, stable shape.
+#[derive(Debug, serde::Deserialize)]
+struct UnimatrixoneFixture {
+    group: HostGroupProfile,
+    host: HostProfile,
+}
+
+fn parse_unimatrixone_fixture() -> (HostGroupProfile, HostProfile) {
+    let path = format!(
+        "{}/tests/fixtures/components/unimatrixone.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading unimatrixone component fixture {path}: {e}"));
+    let fixture: UnimatrixoneFixture = serde_yaml::from_str(&text)
+        .unwrap_or_else(|e| panic!("parsing unimatrixone component fixture {path}: {e}"));
+    (fixture.group, fixture.host)
+}
+
+/// `luks_key` is the keystore-LUKS recovery passphrase (break-glass over IPMI
+/// SOL) — the field the D2-B design doc calls out by name. It is the one the
+/// brief's acceptance criterion asks for explicitly ("keystore luks_key").
+#[test]
+fn unimatrixone_placeholder_survives_luks_key() {
+    let (group, host) = parse_unimatrixone_fixture();
+    assert_placeholder_survives("luks_key", &group, &host, |c| Some(c.luks_key.as_str()));
+}
+
+/// `root_password` and `install_ca_cert` are the other two secret-bearing
+/// flat fields unimatrixone's fixture actually authors as
+/// `REPLACE_AT_PLACE_TIME` (see the committed
+/// `examples/configs/install/unimatrixone.yaml`) — covered for the same
+/// reason as `luks_key` above, not called out separately by name in the
+/// brief but part of the same "keystore secrets" surface.
+#[test]
+fn unimatrixone_placeholder_survives_root_password() {
+    let (group, host) = parse_unimatrixone_fixture();
+    assert_placeholder_survives("root_password", &group, &host, |c| {
+        Some(c.root_password.as_str())
+    });
+}
+
+#[test]
+fn unimatrixone_placeholder_survives_install_ca_cert() {
+    let (group, host) = parse_unimatrixone_fixture();
+    assert_placeholder_survives("install_ca_cert", &group, &host, |c| {
+        Some(c.install_ca_cert.as_str())
+    });
+}
+
+/// `tpm2_pin` deliberately does NOT get an `assert_placeholder_survives` call
+/// here: unimatrixone's D2-B unlock policy sets `enroll_tpm2: false` and
+/// never authors `tpm2_pin` at all (its TPM2 factor is the clevis
+/// `tpm2_clevis_peer` pin, a completely different field/mechanism — see
+/// `profile/components/unlock_policy.rs`'s module doc and
+/// `component_equality_gate.rs`'s `tpm2_clevis_peer`-not-lowered test). The
+/// generic `placeholder_survives_tpm2_pin` test above already proves the
+/// FIELD-LEVEL passthrough mechanism `tpm2_pin` would use if a host DID
+/// author it (e.g. the len-serv PlainLuks hosts). This test instead proves
+/// the negative that matters for unimatrixone specifically: merging its
+/// fixture must NOT fabricate a placeholder (or any other value) for a field
+/// it never set.
+#[test]
+fn unimatrixone_tpm2_pin_stays_absent_not_a_stray_placeholder() {
+    let (group, host) = parse_unimatrixone_fixture();
+    let (config, _provenance) = merge(&group, &host).expect("unimatrixone fixture must merge");
+    assert_eq!(
+        config.tpm2_pin, None,
+        "unimatrixone must not author tpm2_pin (NativeKeystore's TPM2 factor is the clevis \
+         tpm2_clevis_peer pin, not systemd-cryptenroll tpm2_pin); merge() must not fabricate a \
+         value for it"
+    );
 }
