@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.17.0
+// version: 2.18.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-24
 
@@ -443,25 +443,48 @@ impl<'a> SystemConfigurator<'a> {
             InitramfsType::InitramfsTools => "zfs-initramfs zfsutils-linux",
         };
 
-        // clevis for Tang. 26.04 bundles the tang/tpm2 PINS into base `clevis`;
-        // there is no separate clevis-tang package (installing it fails).
+        // clevis for Tang. There is no separate clevis-tang package (the tang
+        // pin is bundled in base `clevis`), but the TPM2 pin is NOT — its
+        // `clevis-decrypt-tpm2` lives in the separate `clevis-tpm2` package.
+        // NativeKeystore D2-B binds a clevis SSS *tpm2 pin*, so it MUST pull
+        // clevis-tpm2 or the tpm2 share silently fails to unlock in the
+        // initramfs (and the clevis-pin-tpm2 / tpm2-tss dracut modules refuse to
+        // install for lack of clevis-decrypt-tpm2 + the tpm2 binary).
         let clevis_pkgs = if !config.tang_servers.is_empty() {
-            match config.initramfs_type {
+            let base = match config.initramfs_type {
                 InitramfsType::Dracut => " clevis clevis-luks clevis-dracut clevis-systemd",
                 InitramfsType::InitramfsTools => " clevis clevis-luks clevis-initramfs",
+            };
+            if config.storage_mode == StorageMode::NativeKeystore {
+                format!("{base} clevis-tpm2")
+            } else {
+                base.to_string()
             }
         } else {
-            ""
+            String::new()
         };
 
         // TPM2+PIN and FIDO2 keyslots are unlocked by systemd-cryptsetup (its own
         // package, which ships the cryptsetup tpm2/fido2 token plugins). tpm2-tools
         // pulls the libtss2 stack; tpm-udev creates the TPM device nodes;
         // libfido2-1 backs FIDO2. Matches the 003 reference set.
-        let crypt_extra = if config.enroll_tpm2 || config.expect_fido2 {
-            " systemd-cryptsetup tpm2-tools tpm-udev libfido2-1"
+        // NativeKeystore's clevis tpm2 pin needs the tpm2 userspace in the
+        // target (tpm2-tools = the `tpm2` binary the clevis-pin-tpm2 / tpm2-tss
+        // dracut modules require, + tpm-udev for the TPM device nodes) even when
+        // enroll_tpm2 is off. The systemd-cryptsetup TPM2+PIN / FIDO2 keyslot
+        // path additionally needs systemd-cryptsetup's token plugins + libfido2.
+        let needs_tpm2_userspace = config.storage_mode == StorageMode::NativeKeystore
+            || config.enroll_tpm2
+            || config.expect_fido2;
+        let sd_crypt = if config.enroll_tpm2 || config.expect_fido2 {
+            " systemd-cryptsetup libfido2-1"
         } else {
             ""
+        };
+        let crypt_extra = if needs_tpm2_userspace {
+            format!(" tpm2-tools tpm-udev{sd_crypt}")
+        } else {
+            String::new()
         };
 
         let chroot_commands = vec![
