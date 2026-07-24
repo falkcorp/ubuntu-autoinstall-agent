@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/db/store.rs
-// version: 1.2.1
+// version: 1.2.2
 // guid: a471e102-2da9-4bf8-8531-1de7595fd24d
-// last-edited: 2026-07-17
+// last-edited: 2026-07-23
 
 //! Degraded-mode layer (spec Decision 4).
 //!
@@ -611,6 +611,7 @@ mod tests {
                 applications: serde_json::json!([]),
                 content_hash: vec![0xab, 0xcd],
                 version: 1,
+                schema_version: 0,
                 created_at: None,
                 updated_at: None,
             }],
@@ -623,6 +624,7 @@ mod tests {
                 applications: serde_json::json!([]),
                 content_hash: vec![0x12],
                 version: 1,
+                schema_version: 0,
                 created_at: None,
                 updated_at: None,
             }],
@@ -669,6 +671,7 @@ mod tests {
             applications: serde_json::json!([]),
             content_hash: vec![0xde, 0xad],
             version: 1,
+            schema_version: 0,
             created_at: None,
             updated_at: None,
         };
