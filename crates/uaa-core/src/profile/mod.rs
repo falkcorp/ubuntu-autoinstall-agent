@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/mod.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: a24bb30b-4056-4a4d-9817-673754a41981
 // last-edited: 2026-07-23
 
@@ -19,6 +19,7 @@
 //! collide on this one.
 
 pub mod components;
+pub mod lower;
 pub mod merge;
 pub mod validate;
 
