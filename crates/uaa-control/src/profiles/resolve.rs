@@ -1,5 +1,5 @@
 // file: crates/uaa-control/src/profiles/resolve.rs
-// version: 0.3.0
+// version: 0.4.0
 // guid: 3f9c2b18-6d54-4a7e-b0c2-1e8d9a4f6572
 // last-edited: 2026-07-24
 
@@ -24,6 +24,16 @@
 //! be wrong — it computes the *next* index, not this host's existing one) and
 //! never falls back to a hand-authored `<host>.yaml`. Any missing group,
 //! profile, or allocation is a loud `Err`, never a partial config.
+//!
+//! **Post-merge gate (PS-PIPELINE-21).** `merge()` already lowers internally
+//! (PS-MERGE-13), so there is no separate `lower()` call here — adding one
+//! would double-lower. Instead, [`uaa_core::profile::validate::validate_resolved`]
+//! runs on the merged [`InstallationConfig`] at BOTH resolution sites below
+//! (the indexed-allocation path and the `hostname_override` fallback) after the
+//! roster-derived `cockroach_members` are populated and before it is ever
+//! returned: a resolved config that is individually well-formed per-field but
+//! an illegal COMBINATION once flattened (e.g. `NativeKeystore` with an empty
+//! disk roster) must never reach `config_place`.
 
 use anyhow::{anyhow, Result};
 
@@ -31,6 +41,7 @@ use uaa_core::autoinstall::host_spec::HostSpec;
 use uaa_core::network::ssh_installer::config::ApplicationSpec;
 use uaa_core::network::InstallationConfig;
 use uaa_core::profile::merge::merge;
+use uaa_core::profile::validate::validate_resolved;
 use uaa_core::profile::HostGroupProfile;
 
 use crate::db::HostGroupRow;
@@ -86,6 +97,7 @@ pub async fn resolve_from_registry(
         if has_cockroach_application(&config) {
             config.cockroach_members = cockroach_member_ips(store, group, &group_profile).await?;
         }
+        validate_resolved(&config).map_err(|e| anyhow!(e.to_string()))?;
         return Ok(config);
     }
 
@@ -106,6 +118,7 @@ pub async fn resolve_from_registry(
         if has_cockroach_application(&config) {
             config.cockroach_members = cockroach_member_ips(store, group, &group_profile).await?;
         }
+        validate_resolved(&config).map_err(|e| anyhow!(e.to_string()))?;
         return Ok(config);
     }
 
@@ -183,8 +196,10 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    use uaa_core::network::ssh_installer::config::StorageMode;
+
     use crate::db::store::StatePaths;
-    use crate::db::HostGroupRow;
+    use crate::db::{HostGroupRow, HostProfileRow};
     use crate::profiles::store::{ProfileStore, SnapshotProfileStore};
 
     // The resolved-vs-committed M2 gate (`test_resolved_equals_committed_by_
@@ -194,6 +209,12 @@ mod tests {
     // has no `PartialEq` — `TangServer` blocks it), which the `uaa` crate does
     // by canonical-serialization equality. These two tests cover resolution's
     // fail-loud behavior, which needs neither.
+    //
+    // The PS-PIPELINE-21 tests below (component fixture, illegal-combination
+    // rejection, flat-authored regression) compare `InstallationConfig`s via
+    // `serde_json::to_value` — this crate has no `serde_yaml` dependency, and
+    // `serde_json::Value` already implements the struct/field equality this
+    // module needs without adding one.
 
     fn group_row(id: Uuid, name: &str, pattern: &str) -> HostGroupRow {
         HostGroupRow {
@@ -202,6 +223,25 @@ mod tests {
             hostname_pattern: pattern.to_string(),
             is_standalone: false,
             defaults: serde_json::json!({}),
+            applications: serde_json::json!([]),
+            content_hash: vec![],
+            version: 1,
+            schema_version: 0,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    /// Bare-bones `HostProfileRow` builder for the PS-PIPELINE-21 tests below
+    /// — `sample_profile` in `store.rs` is `#[cfg(test)]`-private to that
+    /// module, so this mirrors its shape rather than importing it.
+    fn profile_row(group_id: Uuid, identity: &str, overrides: serde_json::Value) -> HostProfileRow {
+        HostProfileRow {
+            id: Uuid::new_v4(),
+            group_id,
+            identity: identity.to_string(),
+            hostname_override: None,
+            overrides,
             applications: serde_json::json!([]),
             content_hash: vec![],
             version: 1,
@@ -262,7 +302,6 @@ mod tests {
     /// `host_spec.rs`'s `for_lenserv_matches_known_hosts`).
     #[tokio::test]
     async fn test_cockroach_members_populated_from_group_roster() {
-        use crate::db::HostProfileRow;
         use uaa_core::network::ssh_installer::applications::derive_cockroach_endpoints;
         use uaa_core::network::ssh_installer::config::CockroachSpec;
 
@@ -343,5 +382,189 @@ mod tests {
             join, "172.16.2.30:36357,172.16.3.94:36357,172.16.3.96:36357",
             "must equal the former hardcoded-constant-derived join for len-serv-001"
         );
+    }
+
+    // -- PS-PIPELINE-21: validate_resolved wired into resolve_from_registry --
+
+    /// A component-authored group (nested `network` + `base_image` blocks in
+    /// `defaults`) plus a host override touching a leaf of each — mirrors the
+    /// `component_equality_gate` fixture shape from PS-GATE-15. Proves the
+    /// full `resolve_from_registry` -> `merge` (which internally `lower`s) ->
+    /// `validate_resolved` pipeline resolves a component-authored host to the
+    /// SAME `InstallationConfig` the pure `merge()` call underneath it
+    /// produces — isolating the assertion to `resolve_from_registry`'s own
+    /// plumbing (allocation lookup + hostname threading), not re-deriving the
+    /// merge/lower logic by hand.
+    #[tokio::test]
+    async fn test_component_authored_fixture_resolves_through_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+        let gid = Uuid::new_v4();
+
+        let mut group = group_row(gid, "comp-grp", "{name}-{index:03}");
+        group.defaults = serde_json::json!({
+            "disk_device": "/dev/nvme0n1",
+            "timezone": "UTC",
+            "luks_key": "groupkey",
+            "root_password": "grouppass",
+            "network_interface": "eth0",
+            "network_address": "192.0.2.10/24",
+            "network_gateway": "192.0.2.1",
+            "network_search": "example.test",
+            "network_nameservers": ["1.1.1.1"],
+            "network": {
+                "interface": "eth0",
+                "addressing": {
+                    "type": "static",
+                    "address": "192.0.2.10/24",
+                    "gateway": "192.0.2.1"
+                },
+                "search": "example.test",
+                "nameservers": ["1.1.1.1"]
+            },
+            "base_image": { "release": "jammy" },
+            "enroll_tpm2": true
+        });
+        store.put_group(group.clone(), "op").await.unwrap();
+
+        let identity = "aa:bb:cc:dd:ee:aa";
+        let alloc = store.allocate_index(gid, identity).await.unwrap();
+        assert_eq!(alloc.hostname, "comp-grp-001");
+
+        let prow = profile_row(
+            gid,
+            identity,
+            serde_json::json!({
+                "root_password": "hostpass",
+                "base_image": { "mirror": "http://mirror.example.internal/ubuntu/" }
+            }),
+        );
+        store.put_profile(prow.clone(), "op").await.unwrap();
+
+        // Independently derive the expected config through the SAME
+        // row->profile conversion + merge() `resolve_from_registry` wraps.
+        let group_profile = group_row_to_profile(&group).unwrap();
+        let mut host_profile = profile_row_to_profile(&prow, &group.name).unwrap();
+        host_profile.hostname_override = Some(alloc.hostname.clone());
+        let (expected, _prov) = merge(&group_profile, &host_profile).unwrap();
+
+        let resolved = resolve_from_registry(&store, "comp-grp-001").await.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "component-authored resolution must match the independently-derived merge() output"
+        );
+        // Spot-check the fields the fixture actually exercises, so a future
+        // change to `merge`/`lower` that breaks BOTH sides identically (and
+        // thus passes the equality assertion above vacuously) is still caught.
+        assert_eq!(resolved.hostname, "comp-grp-001");
+        assert_eq!(
+            resolved.root_password, "hostpass",
+            "host override must win over the group default"
+        );
+        assert_eq!(resolved.network_interface, "eth0");
+        assert_eq!(resolved.network_address, "192.0.2.10/24");
+        assert_eq!(resolved.network_gateway, "192.0.2.1");
+        assert_eq!(resolved.debootstrap_release.as_deref(), Some("jammy"));
+        assert_eq!(
+            resolved.debootstrap_mirror.as_deref(),
+            Some("http://mirror.example.internal/ubuntu/"),
+            "the host's base_image.mirror leaf override must flow through"
+        );
+
+        validate_resolved(&resolved).expect("component-authored fixture must pass validate_resolved");
+    }
+
+    /// A resolved config that is legal field-by-field pre-merge but an
+    /// illegal COMBINATION once flattened (`NativeKeystore` with an empty
+    /// disk roster — `validate_resolved` rule 1) must make
+    /// `resolve_from_registry` return `Err`, never a config that later fails
+    /// silently at install time.
+    #[tokio::test]
+    async fn test_illegal_resolved_combination_makes_resolve_from_registry_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+        let gid = Uuid::new_v4();
+
+        let mut group = group_row(gid, "bad-native", "{name}-{index:03}");
+        group.defaults = serde_json::json!({
+            "disk_device": "/dev/nvme0n1",
+            "timezone": "UTC",
+            "luks_key": "k",
+            "root_password": "r",
+            "network_interface": "eth0",
+            "network_address": "192.0.2.20/24",
+            "network_gateway": "192.0.2.1",
+            "network_search": "example.test",
+            "network_nameservers": ["1.1.1.1"],
+            "storage_mode": "native-keystore",
+            "disks": [],
+            "enroll_tpm2": true
+        });
+        store.put_group(group, "op").await.unwrap();
+
+        let identity = "aa:bb:cc:dd:ee:bb";
+        let alloc = store.allocate_index(gid, identity).await.unwrap();
+        assert_eq!(alloc.hostname, "bad-native-001");
+        store
+            .put_profile(profile_row(gid, identity, serde_json::json!({})), "op")
+            .await
+            .unwrap();
+
+        let err = resolve_from_registry(&store, "bad-native-001").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native-keystore requires a non-empty disk roster"),
+            "expected the validate_resolved rule-1 message, got: {err}"
+        );
+    }
+
+    /// Regression: an existing flat-authored host (no nested components at
+    /// all — every len-serv host today) must keep resolving exactly as it did
+    /// before the `validate_resolved` gate was wired in.
+    #[tokio::test]
+    async fn test_flat_authored_group_resolution_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
+        let gid = Uuid::new_v4();
+
+        let mut group = group_row(gid, "flat-grp", "{name}-{index:03}");
+        group.defaults = serde_json::json!({
+            "disk_device": "/dev/nvme0n1",
+            "timezone": "UTC",
+            "luks_key": "flatkey",
+            "root_password": "flatpass",
+            "network_interface": "eth0",
+            "network_address": "192.0.2.30/24",
+            "network_gateway": "192.0.2.1",
+            "network_search": "example.test",
+            "network_nameservers": ["1.1.1.1"],
+            "tang_servers": [{ "url": "http://tang1.example.internal" }],
+            "tang_threshold": 1
+        });
+        store.put_group(group.clone(), "op").await.unwrap();
+
+        let identity = "aa:bb:cc:dd:ee:cc";
+        let alloc = store.allocate_index(gid, identity).await.unwrap();
+        assert_eq!(alloc.hostname, "flat-grp-001");
+        let prow = profile_row(gid, identity, serde_json::json!({}));
+        store.put_profile(prow.clone(), "op").await.unwrap();
+
+        let group_profile = group_row_to_profile(&group).unwrap();
+        let mut host_profile = profile_row_to_profile(&prow, &group.name).unwrap();
+        host_profile.hostname_override = Some(alloc.hostname.clone());
+        let (expected, _prov) = merge(&group_profile, &host_profile).unwrap();
+
+        let resolved = resolve_from_registry(&store, "flat-grp-001").await.unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&resolved).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "flat-authored resolution must be unaffected by the validate_resolved wiring"
+        );
+        assert_eq!(resolved.storage_mode, StorageMode::PlainLuks);
+        assert_eq!(resolved.disk_device, "/dev/nvme0n1");
+        validate_resolved(&resolved).expect("flat-authored fleet-shaped host must pass validate_resolved");
     }
 }
