@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.15.1
+// version: 2.16.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -9,7 +9,7 @@
 //! kernel command line receives `rd.neednet=1 ip=dhcp` so the Tang servers are
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
-use super::config::{DiskRole, InitramfsType, InstallationConfig, StorageMode};
+use super::config::{Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -180,7 +180,22 @@ impl<'a> SystemConfigurator<'a> {
     /// (`?`): a headless server that can't be watched over SOL is a failed
     /// deployment, and a `mkdir -p` + file write in the chroot does not
     /// legitimately fail. MUST be called before `update-grub`.
-    async fn configure_serial_console(&mut self) -> Result<()> {
+    ///
+    /// Gated on `config.arch == Arch::Amd64` (skipped for `Arch::Arm64`): today's
+    /// fleet is headless x86_64 servers watched over IPMI SOL on `ttyS0`; arm64
+    /// targets are not assumed to have an equivalent serial path. `arch` is the
+    /// real serialized field added by PS-WIRE-AXES-10 (`#[serde(skip_serializing_if
+    /// = "Arch::is_amd64")]`), so every committed amd64 host omits the `arch:` key,
+    /// deserializes back to `Arch::Amd64` on the target, and still gets the
+    /// serial-console drop-in — the placed artifact stays byte-identical. A
+    /// `#[serde(skip)]` flag would NOT survive `config place` -> installer-reads-
+    /// serialized-YAML, since it would deserialize back to its default and could
+    /// silently stop applying; gating on the real `arch` axis avoids that trap.
+    async fn configure_serial_console(&mut self, config: &InstallationConfig) -> Result<()> {
+        if config.arch != Arch::Amd64 {
+            info!("Skipping serial console (arch={:?}, amd64-only default)", config.arch);
+            return Ok(());
+        }
         let b64 = BASE64.encode(SERIAL_CONSOLE_DROPIN);
         let cmd = format!(
             "chroot /mnt/targetos bash -lc 'mkdir -p /etc/default/grub.d && printf %s {b64} | base64 -d > /etc/default/grub.d/99-uaa-serial-console.cfg'"
@@ -658,7 +673,8 @@ impl<'a> SystemConfigurator<'a> {
 
         // Serial console for the headless fleet — MUST run before update-grub so
         // grub-mkconfig folds it into grub.cfg. See SERIAL_CONSOLE_DROPIN.
-        self.configure_serial_console().await?;
+        // Arch-gated (amd64-only default): see configure_serial_console doc.
+        self.configure_serial_console(config).await?;
 
         self.log_and_execute(
             "Updating GRUB config",
@@ -1189,6 +1205,93 @@ impl<'a> SystemConfigurator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+
+    /// Records every command routed through the executor into a shared log
+    /// so tests can assert on the recorded-command count, not just
+    /// `is_ok()`. Mirrors `applications.rs`/`installer.rs`'s `RecordingExecutor`.
+    #[derive(Clone, Default)]
+    struct RecordingExecutor {
+        commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingExecutor {
+        fn recorded(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl CommandExecutor for RecordingExecutor {
+        async fn connect(&mut self, _host: &str, _user: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn execute(&mut self, cmd: &str) -> Result<()> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(())
+        }
+        async fn execute_with_output(&mut self, cmd: &str) -> Result<String> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(String::new())
+        }
+        async fn execute_with_error_collection(
+            &mut self,
+            cmd: &str,
+            _desc: &str,
+        ) -> Result<(i32, String, String)> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok((0, String::new(), String::new()))
+        }
+        async fn check_silent(&mut self, cmd: &str) -> Result<bool> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            Ok(true)
+        }
+        async fn collect_debug_info(&mut self) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn upload_file(&mut self, _local_path: &str, _remote_path: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn download_file(&mut self, _remote_path: &str, _local_path: &str) -> Result<()> {
+            Ok(())
+        }
+        fn disconnect(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn test_configure_serial_console_runs_on_amd64() {
+        let mut cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        cfg.arch = Arch::Amd64;
+        let mut executor = RecordingExecutor::default();
+        {
+            let mut sysconf = SystemConfigurator::new(&mut executor);
+            sysconf.configure_serial_console(&cfg).await.unwrap();
+        }
+        let recorded = executor.recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|c| c.contains("99-uaa-serial-console.cfg")),
+            "amd64 config must write the serial-console drop-in, got: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configure_serial_console_skips_on_arm64() {
+        let mut cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        cfg.arch = Arch::Arm64;
+        let mut executor = RecordingExecutor::default();
+        {
+            let mut sysconf = SystemConfigurator::new(&mut executor);
+            sysconf.configure_serial_console(&cfg).await.unwrap();
+        }
+        let recorded = executor.recorded();
+        assert!(
+            recorded.is_empty(),
+            "arm64 config must skip the serial-console drop-in, got: {recorded:?}"
+        );
+    }
 
     #[test]
     fn test_serial_console_dropin_appends_and_sets_serial_terminal() {
