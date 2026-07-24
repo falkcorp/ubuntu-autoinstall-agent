@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/disk_ops.rs
-// version: 2.5.1
+// version: 2.6.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Disk operations for SSH installation
 
@@ -37,15 +37,6 @@ impl<'a> DiskManager<'a> {
         _auth: &WipeAuthorization,
     ) -> Result<()> {
         info!("Starting disk preparation for {}", config.disk_device);
-
-        // For an md/IMSM disk_device (e.g. unimatrixone's /dev/md/Volume0_0),
-        // the live ISO does not auto-assemble the array on boot — the device
-        // node simply doesn't exist yet, and the very next command (wipefs -a)
-        // hard-fails. assemble_md_if_needed is idempotent (mdadm --assemble
-        // --scan || true) and a no-op for non-md disks, so it's safe to call
-        // unconditionally as the first step of every fresh install, not just
-        // the selective-rerun path it was originally written for.
-        self.assemble_md_if_needed(config).await?;
 
         // Clean up any existing mounts first
         self.cleanup_existing_mounts(config).await?;
@@ -453,25 +444,10 @@ impl<'a> DiskManager<'a> {
 
     // -------------------------------------------------------------------------
     // Non-destructive mount-existing-target prep (phase-rerun/TASK-02).
-    // These helpers ASSEMBLE / OPEN existing state so a selective run that skips
-    // Phase 2 can reach an installed disk. They NEVER wipe/format, so they take
-    // no `WipeAuthorization` — they must be callable without wipe rights.
+    // This helper OPENs existing state so a selective run that skips
+    // Phase 2 can reach an installed disk. It NEVER wipes/formats, so it takes
+    // no `WipeAuthorization` — it must be callable without wipe rights.
     // -------------------------------------------------------------------------
-
-    /// Assemble any IMSM/mdraid array that backs the target disk, if the disk is
-    /// an md device (e.g. `/dev/md126`). `mdadm --assemble --scan` exits non-zero
-    /// when there is nothing new to assemble (array already up) — that is success
-    /// here, hence `|| true`. No-op for non-md disks.
-    pub async fn assemble_md_if_needed(&mut self, config: &InstallationConfig) -> Result<()> {
-        if config.disk_device.starts_with("/dev/md") {
-            self.log_and_execute(
-                "Assembling md array for existing target",
-                "mdadm --assemble --scan || true",
-            )
-            .await?;
-        }
-        Ok(())
-    }
 
     /// Re-open the existing LUKS mapper (`/dev/mapper/luks`) for a selective
     /// re-run, using the same 0600-keyfile channel as `setup_luks_encryption`
