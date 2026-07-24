@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.1.0
+# version: 1.2.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
-# last-edited: 2026-07-17
+# last-edited: 2026-07-23
 #
 # QEMU+swtpm VM validation gate. THIS SCRIPT PASSING IS THE GATE — no hardware
 # attempt or len-serv-003 wipe before it passes.
@@ -494,6 +494,12 @@ stage_echo 6 assert
 ASSERT_LOG="$WORKDIR/logs/06-assert.log"
 : > "$ASSERT_LOG"
 
+# NOTE (PS-VMGATE-19, out of scope here): the LUKS unlock + ZFS pool-import
+# assertions immediately below are storage-mode-specific (they assume the
+# ZfsLuks storage mode this VM gate exercises today). A pure arm64/tang-only
+# config that does not use that storage mode will need role/storage-mode
+# gating added to this block in a future brief before it can fully pass —
+# do not assume these two checks are storage-mode-generic.
 CRYPT_OUT="$(ssh_run 30 root "cryptsetup status luks" 2>&1 || true)"
 echo "$CRYPT_OUT" >>"$ASSERT_LOG"
 if echo "$CRYPT_OUT" | grep -q "is active"; then
@@ -531,29 +537,83 @@ else
   fi
 fi
 
-# CockroachDB readiness. Deliberately not a `systemctl is-active` check on
-# the cockroach unit: cockroach.service has Restart=always, so a node that
-# starts, fails to join a cluster, and retries forever sits "active
-# (running)" indefinitely — is-active would pass on a node that never
-# actually joined. The gate must prove readiness: the node answers SQL.
-# Bounded 30x5s (150s) retry so a slow-but-healthy start is not failed
-# (anti-over-suppression), while a target with no Cockroach installed at
-# all still fails (never skips).
-CRDB_READY=""
-for _ in $(seq 1 30); do
-  if ssh_run 15 root "cockroach sql --certs-dir=/var/lib/cockroach/certs --host=10.0.2.15:36257 -e 'SELECT 1'" >>"$ASSERT_LOG" 2>&1; then
-    CRDB_READY=yes
-    break
+# Application-kind readiness dispatch (PS-VMGATE-19). There is no
+# host-level "role" field in InstallationConfig — dispatch keys off
+# applications[].kind and disks[].role only (config.rs), so this reads
+# applications[0].kind straight out of the YAML `--config` file. An empty
+# (or absent) `applications:` section means "no application-specific
+# probe": the LUKS/ZFS/multi-user assertions above already fully prove
+# readiness for a role-free profile, so that case is a no-op here.
+APP_KIND="$(awk '
+  /^applications:[[:space:]]*(\[\][[:space:]]*)?$/ { inapps=1; next }
+  inapps && /^[^[:space:]#]/ { inapps=0 }
+  inapps && /kind:/ {
+    sub(/.*kind:[[:space:]]*/, "")
+    sub(/[[:space:]]*#.*$/, "")
+    gsub(/"/, "")
+    print
+    exit
+  }
+' "$CONFIG")"
+echo "application-kind dispatch: applications[0].kind='${APP_KIND:-<empty>}'" | tee -a "$ASSERT_LOG"
+
+case "$APP_KIND" in
+cockroach)
+  # CockroachDB readiness. Deliberately not a `systemctl is-active` check
+  # on the cockroach unit: cockroach.service has Restart=always, so a node
+  # that starts, fails to join a cluster, and retries forever sits "active
+  # (running)" indefinitely — is-active would pass on a node that never
+  # actually joined. The gate must prove readiness: the node answers SQL.
+  # Bounded 30x5s (150s) retry so a slow-but-healthy start is not failed
+  # (anti-over-suppression), while a target with no Cockroach installed at
+  # all still fails (never skips).
+  CRDB_READY=""
+  for _ in $(seq 1 30); do
+    if ssh_run 15 root "cockroach sql --certs-dir=/var/lib/cockroach/certs --host=10.0.2.15:36257 -e 'SELECT 1'" >>"$ASSERT_LOG" 2>&1; then
+      CRDB_READY=yes
+      break
+    fi
+    sleep 5
+  done
+  if [ -n "$CRDB_READY" ]; then
+    echo "PASS: cockroach answers SELECT 1 (node is ready)" | tee -a "$ASSERT_LOG"
+  else
+    ssh_run 15 root "systemctl status cockroach --no-pager" >>"$ASSERT_LOG" 2>&1 || true
+    ssh_run 15 root "journalctl -u cockroach --no-pager -n 50" >>"$ASSERT_LOG" 2>&1 || true
+    fail_stage 6 "cockroach never became ready (SELECT 1 failed for 150s) — see $ASSERT_LOG"
   fi
-  sleep 5
-done
-if [ -n "$CRDB_READY" ]; then
-  echo "PASS: cockroach answers SELECT 1 (node is ready)" | tee -a "$ASSERT_LOG"
-else
-  ssh_run 15 root "systemctl status cockroach --no-pager" >>"$ASSERT_LOG" 2>&1 || true
-  ssh_run 15 root "journalctl -u cockroach --no-pager -n 50" >>"$ASSERT_LOG" 2>&1 || true
-  fail_stage 6 "cockroach never became ready (SELECT 1 failed for 150s) — see $ASSERT_LOG"
-fi
+  ;;
+tang-server)
+  # Tang readiness, same probe shape as crates/uaa-core/src/luks_keys.rs's
+  # tang_adv_command: `curl -sf --max-time 5 <url>/adv`. `-sf` makes curl
+  # exit non-zero on any HTTP error (no silent skip); `--max-time 5` bounds
+  # a hung daemon. Probed against the node under test itself (this profile
+  # IS the Tang server) — the fleet's tangd binds plain port 80, so no
+  # explicit port suffix is added here either. Bounded 30x5s (150s) retry,
+  # same anti-over-suppression shape as the cockroach branch above.
+  TANG_READY=""
+  for _ in $(seq 1 30); do
+    if ssh_run 15 root "curl -sf --max-time 5 http://127.0.0.1/adv" >>"$ASSERT_LOG" 2>&1; then
+      TANG_READY=yes
+      break
+    fi
+    sleep 5
+  done
+  if [ -n "$TANG_READY" ]; then
+    echo "PASS: tang-server answers /adv (node is ready)" | tee -a "$ASSERT_LOG"
+  else
+    ssh_run 15 root "systemctl status tangd.socket --no-pager" >>"$ASSERT_LOG" 2>&1 || true
+    ssh_run 15 root "journalctl -u tangd.socket --no-pager -n 50" >>"$ASSERT_LOG" 2>&1 || true
+    fail_stage 6 "tang-server never became ready (curl /adv failed for 150s) — see $ASSERT_LOG"
+  fi
+  ;;
+"")
+  echo "PASS: no applications configured — multi-user.target reached is sufficient (already asserted above)" | tee -a "$ASSERT_LOG"
+  ;;
+*)
+  fail_stage 6 "unknown applications[0].kind='$APP_KIND' — vm-validate.sh stage 6 has no readiness probe for it; extend the case in scripts/vm-validate.sh before using this kind in a VM-gate config"
+  ;;
+esac
 
 # =========================================================================
 # Stage 7: report — GATE: PASS only if stages 2-6 all passed above.
