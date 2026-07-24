@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
-// last-edited: 2026-07-17
+// last-edited: 2026-07-23
 
 //! Validation logic for `HostGroupProfile` / `HostProfile` (DS-PRF-03).
 //!
@@ -30,6 +30,10 @@
 
 use super::{HostGroupProfile, HostProfile};
 use crate::error::{AutoInstallError, Result};
+use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
+use crate::network::ssh_installer::config::{
+    ApplicationSpec, Arch, HostRole, InstallationConfig, StorageMode,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Every rule. Collects ALL violations and returns them together — a weak
@@ -54,6 +58,135 @@ pub fn validate(groups: &[HostGroupProfile], profiles: &[HostProfile]) -> Result
     }
     if let Err(e) = check_global_hostname_uniqueness(groups, profiles) {
         violations.push(e.to_string());
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(AutoInstallError::ConfigError(violations.join("; ")))
+    }
+}
+
+/// Post-merge composition-legality checks over a fully resolved
+/// [`InstallationConfig`] — sibling to [`validate`], which runs pre-merge
+/// over [`HostGroupProfile`]/[`HostProfile`]. `validate` catches malformed
+/// authoring input; `validate_resolved` catches a *combination* of
+/// otherwise-legal fields that doesn't make sense together once everything
+/// has been merged down to one wire config (PS-VALIDATE-14).
+///
+/// Rules enforced, collecting every violation rather than stopping at the
+/// first (same "one fix-it round-trip" rationale as [`validate`]):
+///
+/// 1. `storage_mode == NativeKeystore` requires a non-empty `disks` roster
+///    AND `arch == Amd64` — the only board this layout has been proven on
+///    (X10DSC+) is amd64; `disk_device`-only PlainLuks hosts never hit this.
+/// 2. A non-empty `tang_servers` roster requires
+///    `1 <= tang_threshold <= tang_servers.len()`: a threshold of zero is a
+///    no-op unlock and a threshold above the roster size can never be met.
+/// 3. The D2-B clevis `tpm2` peer path: `tpm2_clevis_peer` is not itself a
+///    wire field on [`InstallationConfig`], so there is nothing to read off
+///    the resolved form beyond what rule 1 already enforces. The surrogate
+///    rule is `storage_mode == NativeKeystore` gating the peer path — rule 1
+///    already requires that. The authoring-time cross-check ("an authored
+///    NativeKeystore is the only config permitted to reach the D2-B peer")
+///    belongs at merge time, outside a post-merge validator's scope, and is
+///    intentionally not duplicated here.
+/// 4. `arch == Arm64` must NOT carry `FirmwareQuirk::GrubRemovableFallback`
+///    — that workaround targets the amd64 X10DSC+ board only.
+/// 5. `role == TangServer` permits empty `disks` and empty unlock (a Tang
+///    server has neither a ZFS pool nor a Clevis binding of its own) but
+///    requires an `ApplicationSpec::TangServer` entry in `applications` — a
+///    Tang-server host with no Tang workload is a misconfigured host.
+///    `role == InstallTarget` requires both a storage disk plan
+///    (`disk_device` set OR `disks` non-empty) and a non-empty unlock
+///    (`tang_servers` non-empty OR `enroll_tpm2` true) — an install target
+///    with neither is a host nobody can unlock after first boot.
+///
+/// **Not checked here (PS-INSTALLER-29):** a resolved config carrying
+/// non-default disk sizes or `reset_enabled` would be unsupported today, but
+/// neither is a wire field on [`InstallationConfig`] yet, so this reduces to
+/// a no-op — the guard belongs in `merge`/`lower` once sizes become wire
+/// fields, not here.
+pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
+    let mut violations = Vec::new();
+
+    // Rule 1: NativeKeystore requires a disk roster and an amd64 target.
+    if cfg.storage_mode == StorageMode::NativeKeystore {
+        if cfg.disks.is_empty() {
+            violations.push(
+                "storage_mode is native-keystore but disks is empty; \
+                 native-keystore requires a non-empty disk roster"
+                    .to_string(),
+            );
+        }
+        if cfg.arch != Arch::Amd64 {
+            violations.push(format!(
+                "storage_mode is native-keystore but arch is {:?}; \
+                 native-keystore is amd64-only",
+                cfg.arch
+            ));
+        }
+    }
+
+    // Rule 2: an SSS threshold that can actually be met.
+    if !cfg.tang_servers.is_empty() {
+        let n = cfg.tang_servers.len();
+        if cfg.tang_threshold < 1 || (cfg.tang_threshold as usize) > n {
+            violations.push(format!(
+                "tang_threshold {} is out of range for {n} tang_servers; \
+                 must be between 1 and {n}",
+                cfg.tang_threshold
+            ));
+        }
+    }
+
+    // Rule 3: no separate check — see doc comment; rule 1 already covers
+    // the surrogate (storage_mode == NativeKeystore) for the D2-B peer path.
+
+    // Rule 4: the removable-fallback GRUB quirk is amd64-only.
+    if cfg.arch == Arch::Arm64
+        && cfg
+            .firmware_quirks
+            .contains(&FirmwareQuirk::GrubRemovableFallback)
+    {
+        violations.push(
+            "arch is arm64 but firmware_quirks contains grub-removable-fallback; \
+             that workaround is amd64-only"
+                .to_string(),
+        );
+    }
+
+    // Rule 5: role-specific requirements.
+    match cfg.role {
+        HostRole::TangServer => {
+            let has_tang_app = cfg
+                .applications
+                .iter()
+                .any(|a| matches!(a, ApplicationSpec::TangServer(_)));
+            if !has_tang_app {
+                violations.push(
+                    "role is tang-server but applications has no tang-server entry".to_string(),
+                );
+            }
+        }
+        HostRole::InstallTarget => {
+            let has_disk_plan = !cfg.disk_device.is_empty() || !cfg.disks.is_empty();
+            if !has_disk_plan {
+                violations.push(
+                    "role is install-target but neither disk_device nor disks is set; \
+                     a storage disk plan is required"
+                        .to_string(),
+                );
+            }
+            let has_unlock = !cfg.tang_servers.is_empty() || cfg.enroll_tpm2;
+            if !has_unlock {
+                violations.push(
+                    "role is install-target but unlock is empty (no tang_servers and \
+                     enroll_tpm2 is false); at least one unlock factor is required"
+                        .to_string(),
+                );
+            }
+        }
     }
 
     if violations.is_empty() {
@@ -121,12 +254,14 @@ fn materialize_hostnames(
     let mut next_index: HashMap<&str, u32> = HashMap::new();
     let mut out = Vec::with_capacity(profiles.len());
     for profile in profiles {
-        let group = groups_by_name.get(profile.group_name.as_str()).ok_or_else(|| {
-            AutoInstallError::ConfigError(format!(
-                "host {} references unknown group {:?}",
-                profile.identity, profile.group_name
-            ))
-        })?;
+        let group = groups_by_name
+            .get(profile.group_name.as_str())
+            .ok_or_else(|| {
+                AutoInstallError::ConfigError(format!(
+                    "host {} references unknown group {:?}",
+                    profile.identity, profile.group_name
+                ))
+            })?;
 
         let slot = next_index.entry(profile.group_name.as_str()).or_insert(0);
         *slot += 1;
@@ -161,7 +296,9 @@ fn render_hostname(pattern: &str, name: &str, index: u32) -> String {
             break;
         };
         let token = &after[1..end]; // "index" or "index:0N"
-        let width = token.strip_prefix("index:0").and_then(|w| w.parse::<usize>().ok());
+        let width = token
+            .strip_prefix("index:0")
+            .and_then(|w| w.parse::<usize>().ok());
         match width {
             Some(width) => out.push_str(&format!("{index:0width$}")),
             None => out.push_str(&index.to_string()),
@@ -210,9 +347,8 @@ pub fn check_standalone_rules(groups: &[HostGroupProfile], profiles: &[HostProfi
     let standalone: Vec<&HostGroupProfile> = groups.iter().filter(|g| g.is_standalone).collect();
     match standalone.len() {
         1 => {}
-        0 => violations.push(
-            "no group is marked is_standalone=true; exactly one is required".to_string(),
-        ),
+        0 => violations
+            .push("no group is marked is_standalone=true; exactly one is required".to_string()),
         n => violations.push(format!(
             "{n} groups are marked is_standalone=true; exactly one is required"
         )),
@@ -289,8 +425,8 @@ pub fn check_no_rename(existing: &[HostGroupProfile], proposed: &HostGroupProfil
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::InstallationConfigPartial;
+    use super::*;
 
     fn group(name: &str, pattern: &str, is_standalone: bool) -> HostGroupProfile {
         HostGroupProfile {
@@ -435,5 +571,261 @@ mod tests {
     #[test]
     fn test_zero_groups_is_legal() {
         assert!(validate(&[], &[]).is_ok());
+    }
+
+    // -- validate_resolved (PS-VALIDATE-14) --
+
+    use crate::network::ssh_installer::config::{DiskRole, DiskSpec, TangServer, TangServerSpec};
+
+    /// A minimal legal `InstallationConfig`: `PlainLuks`/amd64/`InstallTarget`
+    /// with a disk_device and TPM2 unlock — mirrors the pattern used by
+    /// `applications.rs::sample_config` elsewhere in this crate.
+    fn base_config() -> InstallationConfig {
+        InstallationConfig {
+            hostname: "test-host".into(),
+            disk_device: "/dev/nvme0n1".into(),
+            timezone: "UTC".into(),
+            luks_key: "key".into(),
+            root_password: "root".into(),
+            network_interface: "eth0".into(),
+            network_address: "192.0.2.10/24".into(),
+            network_gateway: "192.0.2.1".into(),
+            network_search: "example.test".into(),
+            network_nameservers: vec!["1.1.1.1".into()],
+            network_renderer: crate::network::ssh_installer::config::default_network_renderer(),
+            debootstrap_release: None,
+            debootstrap_mirror: None,
+            initramfs_type: Default::default(),
+            tang_servers: vec![],
+            tang_threshold: 2,
+            ssh_authorized_keys: vec![],
+            enroll_tpm2: true,
+            tpm2_pin: None,
+            tpm2_pcr_ids: "7".into(),
+            expect_fido2: true,
+            install_ca_cert: "test-ca-pem".into(),
+            applications: vec![],
+            storage_mode: StorageMode::PlainLuks,
+            disks: Vec::new(),
+            arch: Arch::Amd64,
+            role: HostRole::InstallTarget,
+            firmware_quirks: Vec::new(),
+            hooks: Default::default(),
+        }
+    }
+
+    fn disk(id: &str, role: DiskRole) -> DiskSpec {
+        DiskSpec {
+            id: id.to_string(),
+            role,
+        }
+    }
+
+    #[test]
+    fn test_base_config_passes() {
+        assert!(validate_resolved(&base_config()).is_ok());
+    }
+
+    // Rule 1: NativeKeystore requires disks + amd64.
+
+    #[test]
+    fn test_rule1_native_keystore_with_disks_and_amd64_passes() {
+        let mut cfg = base_config();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+        cfg.disks = vec![disk("disk-a", DiskRole::System)];
+        cfg.arch = Arch::Amd64;
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_rule1_native_keystore_without_disks_fails() {
+        let mut cfg = base_config();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+        cfg.disks = Vec::new();
+        cfg.arch = Arch::Amd64;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native-keystore requires a non-empty disk roster"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rule1_native_keystore_on_arm64_fails() {
+        let mut cfg = base_config();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+        cfg.disks = vec![disk("disk-a", DiskRole::System)];
+        cfg.arch = Arch::Arm64;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("native-keystore is amd64-only"),
+            "got: {err}"
+        );
+    }
+
+    // Rule 2: tang_threshold in range.
+
+    #[test]
+    fn test_rule2_threshold_in_range_passes() {
+        let mut cfg = base_config();
+        cfg.tang_servers = vec![
+            TangServer {
+                url: "http://tang1".into(),
+            },
+            TangServer {
+                url: "http://tang2".into(),
+            },
+        ];
+        cfg.tang_threshold = 1;
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_rule2_threshold_above_server_count_fails() {
+        let mut cfg = base_config();
+        cfg.tang_servers = vec![TangServer {
+            url: "http://tang1".into(),
+        }];
+        cfg.tang_threshold = 2;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("tang_threshold 2 is out of range for 1 tang_servers"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rule2_zero_threshold_fails() {
+        let mut cfg = base_config();
+        cfg.tang_servers = vec![TangServer {
+            url: "http://tang1".into(),
+        }];
+        cfg.tang_threshold = 0;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("tang_threshold 0 is out of range"),
+            "got: {err}"
+        );
+    }
+
+    // Rule 4: arm64 must not carry GrubRemovableFallback.
+
+    #[test]
+    fn test_rule4_arm64_without_grub_quirk_passes() {
+        let mut cfg = base_config();
+        cfg.arch = Arch::Arm64;
+        cfg.firmware_quirks = Vec::new();
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_rule4_arm64_with_grub_removable_fallback_fails() {
+        let mut cfg = base_config();
+        cfg.arch = Arch::Arm64;
+        cfg.firmware_quirks = vec![FirmwareQuirk::GrubRemovableFallback];
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("that workaround is amd64-only"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rule4_amd64_with_grub_removable_fallback_passes() {
+        let mut cfg = base_config();
+        cfg.arch = Arch::Amd64;
+        cfg.firmware_quirks = vec![FirmwareQuirk::GrubRemovableFallback];
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    // Rule 5: role-specific requirements.
+
+    #[test]
+    fn test_rule5_tang_server_with_tang_app_passes() {
+        let mut cfg = base_config();
+        cfg.role = HostRole::TangServer;
+        cfg.disk_device = String::new();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+        cfg.applications = vec![ApplicationSpec::TangServer(TangServerSpec {
+            port: 80,
+            key_directory: "/etc/tang/keys".into(),
+        })];
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_rule5_tang_server_without_tang_app_fails() {
+        let mut cfg = base_config();
+        cfg.role = HostRole::TangServer;
+        cfg.applications = Vec::new();
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role is tang-server but applications has no tang-server entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rule5_install_target_with_disk_and_unlock_passes() {
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.enroll_tpm2 = true;
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_rule5_install_target_with_empty_unlock_fails() {
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role is install-target but unlock is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rule5_install_target_without_disk_plan_fails() {
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = String::new();
+        cfg.disks = Vec::new();
+        cfg.enroll_tpm2 = true;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role is install-target but neither disk_device nor disks is set"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_all_violations_collected_together() {
+        let mut cfg = base_config();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+        cfg.disks = Vec::new();
+        cfg.arch = Arch::Arm64;
+        cfg.firmware_quirks = vec![FirmwareQuirk::GrubRemovableFallback];
+        cfg.tang_servers = vec![TangServer {
+            url: "http://tang1".into(),
+        }];
+        cfg.tang_threshold = 5;
+        let err = validate_resolved(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("non-empty disk roster"), "got: {msg}");
+        assert!(msg.contains("amd64-only"), "got: {msg}");
+        assert!(
+            msg.contains("tang_threshold 5 is out of range"),
+            "got: {msg}"
+        );
     }
 }
