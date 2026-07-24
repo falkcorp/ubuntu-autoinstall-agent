@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.2.1
+// version: 1.3.0
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -22,7 +22,7 @@
 //! no-op: zero commands are executed and `Ok(())` is returned, so behavior
 //! is byte-identical to before this module existed.
 
-use super::config::{ApplicationSpec, CockroachSpec, InstallationConfig};
+use super::config::{ApplicationSpec, CockroachSpec, InstallationConfig, TangServerSpec};
 use crate::autoinstall::host_spec::{HostSpec, LENSERV_MEMBER_IPS};
 use crate::error::AutoInstallError;
 use crate::network::CommandExecutor;
@@ -68,8 +68,22 @@ impl<'a> ApplicationInstaller<'a> {
                 ApplicationSpec::Cockroach(spec) => {
                     self.install_cockroach(config, spec).await?;
                 }
+                ApplicationSpec::TangServer(spec) => {
+                    self.install_tang_server(&config.hostname, spec).await?;
+                }
             }
         }
+        Ok(())
+    }
+
+    /// TangServer applications are expressibility-only for now: no applier
+    /// exists (rpi Tang is provisioned outside this installer today), so
+    /// dispatch is a no-op skip — never an error, never a panic — logged at
+    /// warn so an authored-but-unactioned application is visible in logs.
+    async fn install_tang_server(&mut self, hostname: &str, _spec: &TangServerSpec) -> Result<()> {
+        tracing::warn!(
+            "TangServer application authored but installer not implemented (host={hostname}) — skipping"
+        );
         Ok(())
     }
 
@@ -270,6 +284,7 @@ impl<'a> ApplicationInstaller<'a> {
         for app in apps {
             let kind = match app {
                 ApplicationSpec::Cockroach(_) => "cockroach",
+                ApplicationSpec::TangServer(_) => "tang-server",
             };
             if !seen.insert(kind) {
                 return Err(crate::error::AutoInstallError::ConfigError(format!(
@@ -409,6 +424,13 @@ mod tests {
         }
     }
 
+    fn sample_tang_server_spec() -> TangServerSpec {
+        TangServerSpec {
+            port: 80,
+            key_directory: "/etc/tang/keys".into(),
+        }
+    }
+
     #[tokio::test]
     async fn test_empty_applications_runs_no_commands() {
         let mut executor = RecordingExecutor::new();
@@ -435,6 +457,47 @@ mod tests {
 
         let err = result.expect_err("duplicate application kinds must be rejected");
         assert!(err.to_string().contains("cockroach"));
+        assert_eq!(
+            executor.recorded().len(),
+            0,
+            "rejection must happen before any command executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tang_server_dispatch_is_noop_skip() {
+        // TangServer is expressibility-only for now (rpi, no applier): the
+        // dispatch must skip it with Ok(()) and zero commands, never error
+        // or panic.
+        let mut executor = RecordingExecutor::new();
+        let mut config = sample_config();
+        config.applications = vec![ApplicationSpec::TangServer(sample_tang_server_spec())];
+        let mut installer = ApplicationInstaller::new(&mut executor);
+
+        let result = installer.install(&config).await;
+
+        assert!(result.is_ok(), "TangServer dispatch must not error: {result:?}");
+        assert_eq!(
+            executor.recorded().len(),
+            0,
+            "TangServer has no applier yet; must run zero commands"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_tang_server_kind_rejected() {
+        let mut executor = RecordingExecutor::new();
+        let mut config = sample_config();
+        config.applications = vec![
+            ApplicationSpec::TangServer(sample_tang_server_spec()),
+            ApplicationSpec::TangServer(sample_tang_server_spec()),
+        ];
+        let mut installer = ApplicationInstaller::new(&mut executor);
+
+        let result = installer.install(&config).await;
+
+        let err = result.expect_err("duplicate tang-server application kinds must be rejected");
+        assert!(err.to_string().contains("tang-server"));
         assert_eq!(
             executor.recorded().len(),
             0,

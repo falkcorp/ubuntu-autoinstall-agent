@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.1.2
+// version: 1.2.0
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Merge logic for `InstallationConfigPartial` -> `InstallationConfig` (DS-PRF-02).
 //!
@@ -156,6 +156,7 @@ fn resolved_defaults() -> InstallationConfig {
 fn app_kind(app: &ApplicationSpec) -> &'static str {
     match app {
         ApplicationSpec::Cockroach(_) => "cockroach",
+        ApplicationSpec::TangServer(_) => "tang-server",
     }
 }
 

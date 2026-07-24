@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.11.0
+// version: 2.12.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -46,6 +46,7 @@ pub struct TangServer {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ApplicationSpec {
     Cockroach(CockroachSpec),
+    TangServer(TangServerSpec),
 }
 
 /// CockroachDB node parameters. `advertise`/`join` are NOT here: they are
@@ -70,6 +71,20 @@ pub struct CockroachSpec {
     pub max_sql_memory: String,
     #[serde(default = "default_cockroach_locality")]
     pub locality: String,
+}
+
+/// Tang server workload parameters. Expressibility-only for now (rpi
+/// hosts): the installer dispatch skips it with a warning rather than
+/// applying it — no `tang-server` applier exists yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TangServerSpec {
+    /// Fleet Tang binds port 80 (verified 2026-07-16).
+    #[serde(default = "default_tang_port")]
+    pub port: u16,
+    /// Directory holding the Tang server's advertised keys, e.g.
+    /// `/etc/tang/keys`. Required — Tang has no sane default location.
+    pub key_directory: String,
 }
 
 /// Complete configuration for a machine installation.
@@ -266,6 +281,10 @@ fn default_cockroach_max_sql() -> String {
 
 fn default_cockroach_locality() -> String {
     "region=us,cluster-unit=lenovo".to_string()
+}
+
+fn default_tang_port() -> u16 {
+    80
 }
 
 impl InstallationConfig {
@@ -626,7 +645,9 @@ kind: cockroach
 seed_ip: 172.16.3.92
 "#;
         let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
-        let ApplicationSpec::Cockroach(cockroach) = spec;
+        let ApplicationSpec::Cockroach(cockroach) = spec else {
+            panic!("expected Cockroach variant, got {spec:?}");
+        };
         assert_eq!(cockroach.version, "v25.3.0");
         assert_eq!(cockroach.port, 36357);
         assert_eq!(cockroach.sql_port, 36257);
@@ -651,6 +672,53 @@ kind: redis
         let yaml = r#"
 kind: cockroach
 seed_ip: 172.16.3.92
+typo_field: oops
+"#;
+        let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("typo_field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_tang_server_spec_round_trips() {
+        let yaml = r#"
+kind: tang-server
+port: 80
+key-directory: /etc/tang/keys
+"#;
+        let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let ApplicationSpec::TangServer(tang) = &spec else {
+            panic!("expected TangServer variant, got {spec:?}");
+        };
+        assert_eq!(tang.port, 80);
+        assert_eq!(tang.key_directory, "/etc/tang/keys");
+
+        // And back to YAML, round-tripping through the closed enum again.
+        let back_yaml = serde_yaml::to_string(&spec).unwrap();
+        let back: ApplicationSpec = serde_yaml::from_str(&back_yaml).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn test_tang_server_spec_defaults_port() {
+        let yaml = r#"
+kind: tang-server
+key-directory: /etc/tang/keys
+"#;
+        let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let ApplicationSpec::TangServer(tang) = spec else {
+            panic!("expected TangServer variant");
+        };
+        assert_eq!(tang.port, 80, "fleet Tang binds port 80 by default");
+    }
+
+    #[test]
+    fn test_tang_server_spec_unknown_field_rejected() {
+        let yaml = r#"
+kind: tang-server
+key-directory: /etc/tang/keys
 typo_field: oops
 "#;
         let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
