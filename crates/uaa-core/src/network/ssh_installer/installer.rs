@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.14.2
+// version: 2.15.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-24
 
@@ -1017,7 +1017,7 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         // (never initramfs-tools), zfs-dracut (never zfs-initramfs), base clevis
         // (the tang pin is bundled — no clevis-tang pkg), and systemd-cryptsetup +
         // tpm2/fido2 stacks for the TPM2+PIN and YubiKey keyslots.
-        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd systemd-cryptsetup tpm2-tools tpm-udev libfido2-1'".to_string(),
+        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1'".to_string(),
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
         format!("bash -lc 'UUID=$(blkid -s UUID -o value {p4} 2>/dev/null || true); DEV=\"{p4}\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'"),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),

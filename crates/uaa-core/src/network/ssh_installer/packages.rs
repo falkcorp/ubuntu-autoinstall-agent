@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/packages.rs
-// version: 2.1.1
+// version: 2.2.0
 // guid: sshpkg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-10
+// last-edited: 2026-07-24
 
 //! Package management for SSH installation
 
@@ -48,6 +48,12 @@ impl<'a> PackageManager<'a> {
             "util-linux",
             "clevis",
             "clevis-luks",
+            // tpm2 stack for the clevis SSS *tpm2 pin*: `clevis luks bind sss`
+            // with a tpm2 pin runs `clevis-encrypt-tpm2` on the LIVE host, which
+            // needs clevis-tpm2 + tpm2-tools. Without them the tpm2 share of the
+            // D2-B binding silently never gets created (bind fails to seal).
+            "clevis-tpm2",
+            "tpm2-tools",
             "mdadm",
         ];
 
