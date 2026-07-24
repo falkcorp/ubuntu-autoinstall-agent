@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.16.1
+// version: 2.17.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-24
 
@@ -779,14 +779,15 @@ impl<'a> SystemConfigurator<'a> {
         }
 
         // Regenerate the initramfs so crypttab + clevis + the keystore-wait
-        // module are baked in.
+        // module are baked in. FATAL on failure: a keystore host whose initramfs
+        // lacks the clevis/tpm2/zfs unlock modules cannot unlock at boot, so a
+        // dracut failure here must abort the install rather than be swallowed.
         let regen_cmd = config.initramfs_type.regenerate_cmd();
-        let _ = self
-            .log_and_execute(
-                "Regenerate initramfs (keystore)",
-                &format!("chroot /mnt/targetos bash -lc '{regen_cmd}'"),
-            )
-            .await;
+        self.log_and_execute(
+            "Regenerate initramfs (keystore)",
+            &format!("chroot /mnt/targetos bash -lc '{regen_cmd}'"),
+        )
+        .await?;
 
         Ok(())
     }
@@ -884,11 +885,22 @@ impl<'a> SystemConfigurator<'a> {
         // SHA-256 bank (clevis defaults to sha1, which Secure Boot doesn't
         // populate). A lone tpm2 share is 1 < t=2, so it improves availability
         // (survives 2 Tang down) without weakening the off-LAN threat model.
-        let tang_entries: Vec<String> = config
-            .tang_servers
-            .iter()
-            .map(|s| format!(r#"{{"url":"{}"}}"#, s.url))
-            .collect();
+        // Pre-fetch each Tang advertisement to a root-only file and reference it
+        // via the clevis `adv` key. WITHOUT a pre-fetched adv, `clevis luks bind`
+        // prompts on /dev/tty to confirm trust of the Tang signing keys, which
+        // fails non-interactively over SSH ("/dev/tty: No such device or
+        // address") and would leave the keystore with NO unattended-unlock
+        // binding. Embedding the adv makes the bind fully non-interactive.
+        let mut tang_entries: Vec<String> = Vec::with_capacity(config.tang_servers.len());
+        for (i, s) in config.tang_servers.iter().enumerate() {
+            let adv_path = format!("/run/uaa-tang-{i}.adv");
+            self.log_and_execute(
+                &format!("Fetch Tang advertisement from {}", s.url),
+                &format!("curl -sf --max-time 10 {}/adv -o {}", s.url, adv_path),
+            )
+            .await?;
+            tang_entries.push(format!(r#"{{"url":"{}","adv":"{}"}}"#, s.url, adv_path));
+        }
         let tpm2_pin = if include_tpm2_peer {
             format!(r#","tpm2":{{"pcr_ids":"{}","pcr_bank":"sha256"}}"#, config.tpm2_pcr_ids)
         } else {
@@ -948,14 +960,20 @@ impl<'a> SystemConfigurator<'a> {
             &format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)
         ).await;
 
+        // Clean up the pre-fetched advertisements regardless of outcome.
+        let _ = self.runner.execute("rm -f /run/uaa-tang-*.adv").await;
+
         if let Err(e) = bind_result {
-            warn!(
-                "Clevis Tang enrollment failed (non-fatal — passphrase fallback remains): {}",
-                e
-            );
-        } else {
-            info!("Tang/Clevis SSS enrollment complete");
+            // FATAL: a NativeKeystore/Tang host without this binding has NO
+            // unattended unlock — the entire point of the encrypted install.
+            // Never report success with a silently passphrase-only keystore
+            // (the pre-fix behaviour that produced a "🎉 success" that couldn't
+            // boot unattended).
+            return Err(crate::error::AutoInstallError::SystemError(format!(
+                "Clevis Tang+TPM2 SSS enrollment failed — keystore has no unattended-unlock binding: {e}"
+            )));
         }
+        info!("Tang/Clevis SSS enrollment complete");
 
         Ok(())
     }
