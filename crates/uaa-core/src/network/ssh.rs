@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh.rs
-// version: 1.6.0
+// version: 1.6.1
 // guid: t0u1v2w3-x4y5-6789-0123-456789tuvwxy
-// last-edited: 2026-07-13
+// last-edited: 2026-07-23
 
 //! SSH client for remote deployment operations
 
@@ -547,8 +547,8 @@ mod tests {
     #[test]
     fn test_wrap_sudo_wraps_simple_command() {
         assert_eq!(
-            wrap_sudo(true, "wipefs -a /dev/md126"),
-            "sudo -n bash -c 'wipefs -a /dev/md126'"
+            wrap_sudo(true, "wipefs -a /dev/nvme0n1"),
+            "sudo -n bash -c 'wipefs -a /dev/nvme0n1'"
         );
     }
 

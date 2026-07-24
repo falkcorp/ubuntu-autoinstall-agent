@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/layout.rs
-// version: 2.0.0
+// version: 2.0.1
 // guid: 95e0d672-e175-4029-b56a-a025267f71d2
 // last-edited: 2026-07-23
 
@@ -32,7 +32,8 @@
 //!   there is no small-file latency to offload onto the Optane (only worth it in
 //!   front of spinning rust). Set in [`super::zfs_native`].
 //! - Both System ESPs are registered in NVRAM independently; they are **never**
-//!   mdadm-mirrored (a later phase syncs them file-by-file — see design §D7.3).
+//!   block-level RAID-mirrored (a later phase syncs them file-by-file — see
+//!   design §D7.3).
 //!
 //! ESP and bpool are [`PartSize::Fixed`] because they become ZFS *mirror
 //! members* (both System SSDs must contribute byte-identical partitions), and

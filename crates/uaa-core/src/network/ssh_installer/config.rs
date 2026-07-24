@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.11.0
+// version: 2.12.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-23
 
@@ -31,8 +31,31 @@ impl InitramfsType {
     }
 }
 
+/// Classifies the role of a host: installation target or external Tang server.
+///
+/// This distinguishes between machines that will receive the autoinstall
+/// (InstallTarget) and external Tang servers that provide network encryption
+/// unlock. Note: HostRole::TangServer is the enum variant, distinct from the
+/// TangServer struct below that describes a Tang server's connection details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostRole {
+    /// The default: this host is an installation target.
+    #[default]
+    InstallTarget,
+    /// This host is an external Tang server providing Clevis unlock.
+    TangServer,
+}
+
+impl HostRole {
+    /// Returns true if this role is the installation target (the default).
+    pub fn is_install_target(&self) -> bool {
+        matches!(self, HostRole::InstallTarget)
+    }
+}
+
 /// Tang server entry for Clevis SSS binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TangServer {
     pub url: String,
 }
@@ -46,6 +69,7 @@ pub struct TangServer {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ApplicationSpec {
     Cockroach(CockroachSpec),
+    TangServer(TangServerSpec),
 }
 
 /// CockroachDB node parameters. `advertise`/`join` are NOT here: they are
@@ -70,6 +94,20 @@ pub struct CockroachSpec {
     pub max_sql_memory: String,
     #[serde(default = "default_cockroach_locality")]
     pub locality: String,
+}
+
+/// Tang server workload parameters. Expressibility-only for now (rpi
+/// hosts): the installer dispatch skips it with a warning rather than
+/// applying it — no `tang-server` applier exists yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct TangServerSpec {
+    /// Fleet Tang binds port 80 (verified 2026-07-16).
+    #[serde(default = "default_tang_port")]
+    pub port: u16,
+    /// Directory holding the Tang server's advertised keys, e.g.
+    /// `/etc/tang/keys`. Required — Tang has no sane default location.
+    pub key_directory: String,
 }
 
 /// Complete configuration for a machine installation.
@@ -194,6 +232,28 @@ impl StorageMode {
     }
 }
 
+/// Target architecture classifier — independent of `crate::config::Architecture`.
+/// This one belongs to the SSH installer pipeline; the retired `Architecture`
+/// enum belongs to the legacy TargetConfig/image pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Arch {
+    /// x86-64 / AMD64 — default and most common in the fleet.
+    #[default]
+    Amd64,
+    /// ARM 64-bit — used by some lightweight servers (e.g., RPi).
+    Arm64,
+}
+
+impl Arch {
+    /// `true` for the default (`Amd64`) — intended for use in a future
+    /// `#[serde(skip_serializing_if="Arch::is_amd64")]` to omit the field
+    /// for AMD64 hosts (mirroring the `StorageMode::is_default()` precedent).
+    pub fn is_amd64(&self) -> bool {
+        matches!(self, Arch::Amd64)
+    }
+}
+
 /// Role a physical disk plays in the [`StorageMode::NativeKeystore`] layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -266,6 +326,10 @@ fn default_cockroach_max_sql() -> String {
 
 fn default_cockroach_locality() -> String {
     "region=us,cluster-unit=lenovo".to_string()
+}
+
+fn default_tang_port() -> u16 {
+    80
 }
 
 impl InstallationConfig {
@@ -626,7 +690,9 @@ kind: cockroach
 seed_ip: 172.16.3.92
 "#;
         let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
-        let ApplicationSpec::Cockroach(cockroach) = spec;
+        let ApplicationSpec::Cockroach(cockroach) = spec else {
+            panic!("expected Cockroach variant, got {spec:?}");
+        };
         assert_eq!(cockroach.version, "v25.3.0");
         assert_eq!(cockroach.port, 36357);
         assert_eq!(cockroach.sql_port, 36257);
@@ -651,6 +717,109 @@ kind: redis
         let yaml = r#"
 kind: cockroach
 seed_ip: 172.16.3.92
+typo_field: oops
+"#;
+        let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("typo_field"),
+            "error must name the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_arch_default_is_amd64() {
+        assert_eq!(Arch::default(), Arch::Amd64);
+    }
+
+    #[test]
+    fn test_arch_is_amd64() {
+        assert!(Arch::Amd64.is_amd64());
+        assert!(!Arch::Arm64.is_amd64());
+    }
+
+    #[test]
+    fn test_arch_serde_round_trip() {
+        // Amd64 should serialize to "amd64"
+        let amd64_yaml = serde_yaml::to_string(&Arch::Amd64).unwrap();
+        assert_eq!(amd64_yaml.trim(), "amd64");
+
+        // Arm64 should serialize to "arm64"
+        let arm64_yaml = serde_yaml::to_string(&Arch::Arm64).unwrap();
+        assert_eq!(arm64_yaml.trim(), "arm64");
+
+        // Round-trip: deserialize back
+        let amd64_back: Arch = serde_yaml::from_str("amd64").unwrap();
+        assert_eq!(amd64_back, Arch::Amd64);
+
+        let arm64_back: Arch = serde_yaml::from_str("arm64").unwrap();
+        assert_eq!(arm64_back, Arch::Arm64);
+    }
+
+    #[test]
+    fn test_host_role_default_is_install_target() {
+        assert_eq!(HostRole::default(), HostRole::InstallTarget);
+    }
+
+    #[test]
+    fn test_host_role_is_install_target() {
+        assert!(HostRole::InstallTarget.is_install_target());
+        assert!(!HostRole::TangServer.is_install_target());
+    }
+
+    #[test]
+    fn test_host_role_serde_round_trip() {
+        // Verify wire strings match kebab-case naming.
+        let install_target_yaml = "install-target";
+        let deserialized: HostRole = serde_yaml::from_str(install_target_yaml).unwrap();
+        assert_eq!(deserialized, HostRole::InstallTarget);
+        let serialized = serde_yaml::to_string(&deserialized).unwrap();
+        assert!(serialized.contains("install-target"), "serialized should contain 'install-target', got: {serialized}");
+
+        let tang_server_yaml = "tang-server";
+        let deserialized: HostRole = serde_yaml::from_str(tang_server_yaml).unwrap();
+        assert_eq!(deserialized, HostRole::TangServer);
+        let serialized = serde_yaml::to_string(&deserialized).unwrap();
+        assert!(serialized.contains("tang-server"), "serialized should contain 'tang-server', got: {serialized}");
+    }
+
+    #[test]
+    fn test_tang_server_spec_round_trips() {
+        let yaml = r#"
+kind: tang-server
+port: 80
+key-directory: /etc/tang/keys
+"#;
+        let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let ApplicationSpec::TangServer(tang) = &spec else {
+            panic!("expected TangServer variant, got {spec:?}");
+        };
+        assert_eq!(tang.port, 80);
+        assert_eq!(tang.key_directory, "/etc/tang/keys");
+
+        // And back to YAML, round-tripping through the closed enum again.
+        let back_yaml = serde_yaml::to_string(&spec).unwrap();
+        let back: ApplicationSpec = serde_yaml::from_str(&back_yaml).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn test_tang_server_spec_defaults_port() {
+        let yaml = r#"
+kind: tang-server
+key-directory: /etc/tang/keys
+"#;
+        let spec: ApplicationSpec = serde_yaml::from_str(yaml).unwrap();
+        let ApplicationSpec::TangServer(tang) = spec else {
+            panic!("expected TangServer variant");
+        };
+        assert_eq!(tang.port, 80, "fleet Tang binds port 80 by default");
+    }
+
+    #[test]
+    fn test_tang_server_spec_unknown_field_rejected() {
+        let yaml = r#"
+kind: tang-server
+key-directory: /etc/tang/keys
 typo_field: oops
 "#;
         let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
