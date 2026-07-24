@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/mod.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: a24bb30b-4056-4a4d-9817-673754a41981
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! Host-group / per-host profile scaffolding (DS-PRF-01).
 //!
@@ -18,6 +18,7 @@
 //! stubs here so the two sibling tasks each own one disjoint file and never
 //! collide on this one.
 
+pub mod components;
 pub mod merge;
 pub mod validate;
 
