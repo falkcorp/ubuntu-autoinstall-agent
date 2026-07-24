@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.14.1
+// version: 2.15.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-22
+// last-edited: 2026-07-23
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -449,21 +449,11 @@ impl<'a> SystemConfigurator<'a> {
             ""
         };
 
-        // mdadm in the TARGET so its initramfs can re-assemble a BIOS/IMSM
-        // fake-RAID root (e.g. unimatrixone's /dev/md126) before LUKS/ZFS unlock.
-        // Without it the installed system boots to an initramfs that can't find
-        // the array. Harmless on hosts with a plain (non-md) disk.
-        let mdadm_pkg = if config.disk_device.starts_with("/dev/md") {
-            " mdadm"
-        } else {
-            ""
-        };
-
         let chroot_commands = vec![
             "apt update".to_string(),
             format!(
-                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}{}",
-                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra, mdadm_pkg
+                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}",
+                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra
             ),
             "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-generic".to_string(),
             "DEBIAN_FRONTEND=noninteractive apt install -y openssh-server vim htop curl".to_string(),
@@ -961,30 +951,15 @@ impl<'a> SystemConfigurator<'a> {
     /// - `crypt` + `tpm2-tss` + the cryptsetup token plugins let
     ///   systemd-cryptsetup satisfy the TPM2+PIN and FIDO2/YubiKey keyslots at
     ///   the boot prompt.
-    /// - `mdraid` assembles a BIOS/IMSM fake-RAID root (e.g. /dev/md126) in the
-    ///   initramfs BEFORE LUKS/ZFS, so the array exists when unlock runs. Only
-    ///   added for md-backed targets.
     ///
     /// NOTE: the exact module/plugin set is confirmed on the QEMU+swtpm VM
     /// before any real host is installed (see PLAN test strategy).
-    fn build_dracut_crypt_conf(include_clevis: bool, include_mdraid: bool, nic_driver: &str) -> String {
+    fn build_dracut_crypt_conf(include_clevis: bool, nic_driver: &str) -> String {
         // `network` is REQUIRED alongside clevis: Tang unlock happens over the net
         // in the initramfs, so the network stack must be present. Without it the
         // initramfs "fails to start the network", clevis can't reach Tang, LUKS
         // never opens, and the zfs import (rpool on /dev/mapper/luks) fails.
         let clevis = if include_clevis { " clevis network" } else { "" };
-        let mdraid = if include_mdraid { " mdraid" } else { "" };
-        // For an md/IMSM root, also bake the array config (/etc/mdadm/mdadm.conf,
-        // the ARRAY UUID lines) into the initramfs and force the raid1 driver, so
-        // the fake-RAID volume assembles deterministically at boot before LUKS.
-        // NOTE: the dracut module is `mdraid` (dir 90mdraid); there is no `mdadm`
-        // dracut module — `mdadmconf` is the directive that includes mdadm.conf.
-        let mdadm_extra = if include_mdraid {
-            "mdadmconf=\"yes\"\n\
-             add_drivers+=\" md_mod raid1 \"\n"
-        } else {
-            ""
-        };
         // Force the boot NIC's kernel driver into the initramfs for Tang unlock —
         // dracut hostonly omits it because the NIC isn't needed to reach a LOCAL
         // root, so `rd.neednet=1 ip=dhcp` has no device to bring up otherwise.
@@ -998,10 +973,8 @@ impl<'a> SystemConfigurator<'a> {
              # Unlock subsystems + ZFS import must live in the initramfs:\n\
              #   crypt/tpm2/fido2 -> systemd-cryptsetup for TPM2+PIN and YubiKey\n\
              #   clevis+network   -> Tang (network) unlock (needs NIC driver, below)\n\
-             #   mdraid           -> assemble BIOS/IMSM fake-RAID (md) root before unlock\n\
              #   zfs              -> import rpool/bpool\n\
-             add_dracutmodules+=\" crypt tpm2-tss zfs{clevis}{mdraid} \"\n\
-             {mdadm_extra}\
+             add_dracutmodules+=\" crypt tpm2-tss zfs{clevis} \"\n\
              {nic}\
              # cryptsetup token plugins + libfido2 so TPM2/FIDO2 slots resolve in initrd\n\
              install_optional_items+=\" /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-tpm2.so /usr/lib/*/cryptsetup/libcryptsetup-token-systemd-fido2.so /usr/lib/*/libfido2.so* \"\n"
@@ -1014,7 +987,6 @@ impl<'a> SystemConfigurator<'a> {
             return Ok(());
         }
         info!("Configuring dracut modules for clevis + systemd-cryptsetup (TPM2/FIDO2)");
-        let is_md = config.disk_device.starts_with("/dev/md");
         // Detect the boot NIC's kernel driver (for Tang network unlock) from the
         // live env — the config interface name matches (predictable naming).
         // SECURITY: network_interface may come from a server-fetched config in the
@@ -1054,26 +1026,12 @@ impl<'a> SystemConfigurator<'a> {
         if !config.tang_servers.is_empty() {
             info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
         }
-        let conf =
-            Self::build_dracut_crypt_conf(!config.tang_servers.is_empty(), is_md, nic_driver);
+        let conf = Self::build_dracut_crypt_conf(!config.tang_servers.is_empty(), nic_driver);
         let cmd = format!(
             "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
             conf
         );
         let _ = self.log_and_execute("Write dracut crypt-module config", &cmd).await;
-
-        // For an md-backed target, the initramfs also needs the array definition
-        // so it can assemble it at boot. `mdadm --detail --scan` runs in the LIVE
-        // env (where the array is already assembled) and its output — the ARRAY
-        // lines for the IMSM container + volume — is written into the target's
-        // /etc/mdadm/mdadm.conf, which the dracut `mdraid` module reads.
-        if is_md {
-            let mdadm_conf_cmd =
-                "mkdir -p /mnt/targetos/etc/mdadm && mdadm --detail --scan > /mnt/targetos/etc/mdadm/mdadm.conf && cat /mnt/targetos/etc/mdadm/mdadm.conf";
-            let _ = self
-                .log_and_execute("Write target /etc/mdadm/mdadm.conf from live array scan", mdadm_conf_cmd)
-                .await;
-        }
         Ok(())
     }
 
@@ -1433,15 +1391,14 @@ mod tests {
     }
 
     #[test]
-    fn test_dracut_crypt_conf_includes_both_subsystems() {
-        let conf = SystemConfigurator::build_dracut_crypt_conf(true, true, "ixgbe");
+    fn test_dracut_crypt_conf_includes_clevis_subsystem() {
+        let conf = SystemConfigurator::build_dracut_crypt_conf(true, "ixgbe");
         let modules = dracut_modules_line(&conf);
-        // Both unlock subsystems must be enabled in the initramfs module list.
+        // The clevis (Tang) and crypt/tpm2 unlock subsystems must both be
+        // enabled in the initramfs module list.
         assert!(modules.contains("clevis"), "Tang unlock (clevis) missing: {modules}");
         assert!(modules.contains("crypt"), "systemd-cryptsetup (crypt) missing: {modules}");
         assert!(modules.contains("tpm2-tss"), "TPM2 support missing: {modules}");
-        // md-backed target -> mdraid must be present to assemble the array.
-        assert!(modules.contains("mdraid"), "mdraid module missing for md target: {modules}");
         // zfs module must be present so rpool/bpool import in the initramfs.
         assert!(modules.contains("zfs"), "zfs module missing: {modules}");
         // Tang unlock needs the network stack + the NIC driver in the initramfs.
@@ -1458,8 +1415,8 @@ mod tests {
     }
 
     #[test]
-    fn test_dracut_crypt_conf_omits_clevis_and_mdraid_when_not_needed() {
-        let conf = SystemConfigurator::build_dracut_crypt_conf(false, false, "");
+    fn test_dracut_crypt_conf_omits_clevis_when_not_needed() {
+        let conf = SystemConfigurator::build_dracut_crypt_conf(false, "");
         let modules = dracut_modules_line(&conf);
         assert!(
             !modules.contains("clevis"),
@@ -1468,10 +1425,6 @@ mod tests {
         assert!(
             !modules.contains("network"),
             "network module should be absent with no Tang servers: {modules}"
-        );
-        assert!(
-            !modules.contains("mdraid"),
-            "mdraid module should be absent for a non-md disk: {modules}"
         );
         // TPM2/FIDO2 support still present for the non-Tang keyslots.
         assert!(modules.contains("crypt"));
