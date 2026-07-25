@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.18.0
+// version: 2.19.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-24
 
@@ -29,7 +29,7 @@ use tracing::{info, warn};
 /// **last** so it is the primary console (kernel log + login getty) on a
 /// headless box; `console=tty0` keeps a local VGA console too. Harmless on a
 /// host with no physical UART (the kernel just never opens it).
-const SERIAL_CONSOLE_DROPIN: &str = "# file: /etc/default/grub.d/99-uaa-serial-console.cfg\n# Installed by ubuntu-autoinstall-agent: expose boot + LUKS unlock on ttyS0\n# (headless fleet, IPMI SOL). Sourced after /etc/default/grub, so this APPENDS.\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX console=tty0 console=ttyS0,115200n8\"\nGRUB_TERMINAL=\"console serial\"\nGRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1\"\n";
+const SERIAL_CONSOLE_DROPIN: &str = "# file: /etc/default/grub.d/99-uaa-serial-console.cfg\n# Installed by ubuntu-autoinstall-agent: expose boot + LUKS unlock + emergency\n# shell on serial for IPMI SOL. Supermicro X10 BMC SOL = COM2/ttyS1 (IPMI SOL\n# payload channel 1), NOT ttyS0/COM1 — emit to BOTH COM ports with ttyS1 LAST so\n# it wins /dev/console (interactive LUKS/maintenance prompts land where SOL reads).\n# Sourced after /etc/default/grub, so this APPENDS.\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX console=tty0 console=ttyS0,115200n8 console=ttyS1,115200n8\"\nGRUB_TERMINAL=\"console serial\"\nGRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=1 --word=8 --parity=no --stop=1\"\n";
 
 pub struct SystemConfigurator<'a> {
     runner: &'a mut dyn CommandExecutor,
@@ -583,10 +583,25 @@ impl<'a> SystemConfigurator<'a> {
             "Touch zfs-list.cache files",
             "bash -lc 'touch /mnt/targetos/etc/zfs/zfs-list.cache/bpool /mnt/targetos/etc/zfs/zfs-list.cache/rpool'",
         ).await;
-        let _ = self.log_and_execute(
-            "Populate zfs-list via zed",
-            "chroot /mnt/targetos bash -lc 'timeout 5 zed -F || true'",
-        ).await;
+        // Populate zfs-list.cache DIRECTLY via `zfs list` (deterministic). The
+        // prior `timeout 5 zed -F` was a NO-OP: zed only writes the cache in
+        // response to a zpool history EVENT, and running it briefly (inside the
+        // chroot, blind to the host-imported pools) with no event triggered left
+        // the files EMPTY — so zfs-mount-generator produced no mount units and
+        // every dataset (/var, /var/log, ...) failed to mount at boot, dropping
+        // to the systemd MAINTENANCE shell even though the D2-B unlock succeeded.
+        // Generate the exact tab-separated format the zed cacher emits, on the
+        // HOST where rpool/bpool are imported (mountpoints carry the /mnt/targetos
+        // altroot prefix here; the sed below strips it back to /).
+        let zfs_list_props = "name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand,encroot,keylocation,org.openzfs.systemd:requires,org.openzfs.systemd:requires-mounts-for,org.openzfs.systemd:before,org.openzfs.systemd:after,org.openzfs.systemd:wanted-by,org.openzfs.systemd:required-by,org.openzfs.systemd:nofail,org.openzfs.systemd:ignore";
+        for pool in ["rpool", "bpool"] {
+            let _ = self.log_and_execute(
+                &format!("Generate zfs-list.cache/{pool}"),
+                &format!(
+                    "zfs list -H -t filesystem -o {zfs_list_props} -r {pool} | sort > /mnt/targetos/etc/zfs/zfs-list.cache/{pool}"
+                ),
+            ).await;
+        }
         // Fix mountpoint paths — run on host so sed can see the file directly
         let _ = self.log_and_execute(
             "Fix zfs-list paths",
@@ -1352,11 +1367,17 @@ mod tests {
             .expect("drop-in has a GRUB_CMDLINE_LINUX line");
         let tty0 = cmdline.find("console=tty0").expect("tty0 present");
         let ttys0 = cmdline.find("console=ttyS0,115200n8").expect("ttyS0 present");
-        assert!(tty0 < ttys0, "ttyS0 must be last so it is the primary console");
-        // GRUB's own menu on serial too, at a matching baud.
+        let ttys1 = cmdline.find("console=ttyS1,115200n8").expect("ttyS1 present");
+        // ttyS1 (Supermicro X10 BMC SOL = COM2) must be LAST so it wins the
+        // primary /dev/console — the one SOL watches on a headless box.
+        assert!(
+            tty0 < ttys0 && ttys0 < ttys1,
+            "ttyS1 must be last so it is the primary (SOL) console"
+        );
+        // GRUB's own menu on serial too (COM2 / unit 1), at a matching baud.
         assert!(SERIAL_CONSOLE_DROPIN.contains("GRUB_TERMINAL=\"console serial\""));
         assert!(SERIAL_CONSOLE_DROPIN
-            .contains("GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=0"));
+            .contains("GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=1"));
     }
 
     #[test]
