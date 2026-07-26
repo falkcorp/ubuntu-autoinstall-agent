@@ -1,7 +1,7 @@
 <!-- file: docs/specs/u1-zfs-native-encryption-design.md -->
-<!-- version: 1.2.0 -->
+<!-- version: 1.3.0 -->
 <!-- guid: e7a1c9d4-2b6f-4e83-9a15-8c4d0f7b3e21 -->
-<!-- last-edited: 2026-07-23 -->
+<!-- last-edited: 2026-07-26 -->
 
 # U1 ZFS Native Encryption + Keystore — Design Spec
 
@@ -186,10 +186,17 @@ recovery key (attended).
   `zfs load-key` can fire before the node exists → emergency shell. The hook
   blocks (`pre-mount 89`) until the keystore zvol appears. Without it this is an
   intermittent race — the worst failure class.
-- **D7.2 `network-online` ordering drop-in.** clevis's auto-wiring never fires
-  on Ubuntu (`hostonly_cmdline` empty), so `clevis-luks-askpass` isn't ordered
-  after `network-online.target`. We already set `rd.neednet=1 ip=dhcp` by hand
-  (`system_setup.rs`); this is the other half.
+- **D7.2 `network-online` gate — IMPLEMENTED (2026-07-26).** clevis's auto-wiring
+  never fires on Ubuntu (`hostonly_cmdline` empty), so `clevis-luks-askpass` isn't
+  ordered after `network-online.target`; and the keystore is opened directly by
+  `90zfs/zfs-load-key.sh` (`systemd-cryptsetup attach`, pre-mount 90), *not*
+  through the `_netdev` crypttab unit — so a crypttab option cannot gate it. We
+  set `rd.neednet=1 ip=dhcp` (`system_setup.rs`) AND, rather than a fragile
+  drop-in keyed on the clevis unit name, the `91uaa-keystore-wait` hook (pre-mount
+  **89**, i.e. guaranteed to complete before the unlock at 90) now also blocks
+  until the network is up when `rd.neednet` is set. Name-independent and provably
+  ordered before the unlock. Verified against the server's installed 90zfs/60clevis
+  dracut modules.
 
 ## 6. Secure Boot
 
