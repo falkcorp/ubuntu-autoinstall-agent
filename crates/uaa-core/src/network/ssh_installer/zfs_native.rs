@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/zfs_native.rs
-// version: 2.0.0
+// version: 2.1.0
 // guid: bca3258c-2a81-4e7d-a50b-50128c83b2cc
-// last-edited: 2026-07-23
+// last-edited: 2026-07-27
 
 //! ZFS **native-encryption** pool + keystore builder for
 //! [`StorageMode::NativeKeystore`] (U1 / the future server profile) — Phase 3's
@@ -112,8 +112,17 @@ impl<'a> ZfsNativeManager<'a> {
     /// rpool: data mirror(System SSD p3) + special metadata mirror(Optane p1),
     /// root UNENCRYPTED (encryption lives on rpool/ROOT + rpool/USERDATA).
     async fn create_rpool(&mut self, data_members: &str, special_members: &str) -> Result<()> {
+        // `cachefile=/etc/zfs/zpool.cache` is MANDATORY and was missing — the
+        // single most important line in the whole install. Importing with
+        // `-R /mnt/targetos` (altroot) defaults `cachefile=none`, so without an
+        // explicit cachefile rpool is NEVER written to /etc/zfs/zpool.cache. That
+        // cache is copied into the initramfs; at boot `zfs-import-cache` imports
+        // only the pools it lists — so rpool (which holds the encrypted root AND
+        // the keystore zvol) never imports, the keystore never appears, no key is
+        // ever loaded, and `sysroot.mount` fails ("failed to mount sysroot").
+        // bpool has it (above); rpool must too.
         let cmd = format!(
-            "zpool create -f -o ashift=12 -o autotrim=on \
+            "zpool create -f -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
              -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
              -O normalization=formD -O relatime=on -O special_small_blocks=0 \
              -O canmount=off -O mountpoint=none -m none -R /mnt/targetos \
