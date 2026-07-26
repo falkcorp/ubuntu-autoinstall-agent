@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.20.0
+// version: 2.21.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-26
 
@@ -770,10 +770,16 @@ impl<'a> SystemConfigurator<'a> {
             &config.disk_device,
             if uuid.is_empty() { None } else { Some(uuid) },
         );
-        let _ = self.runner.execute(&format!(
-            "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{}' > /mnt/targetos/etc/crypttab",
-            crypttab_entry
-        )).await;
+        // FATAL: no crypttab entry = no unlock unit = unbootable encrypted root.
+        // Same silent-killer class as the keystore path — never swallow it.
+        self.log_and_execute(
+            "Write LUKS crypttab",
+            &format!(
+                "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{}' > /mnt/targetos/etc/crypttab",
+                crypttab_entry
+            ),
+        )
+        .await?;
 
         // Ensure the initramfs carries BOTH unlock subsystems before any regen:
         //   - clevis  → Tang (network) unlock
@@ -834,9 +840,17 @@ impl<'a> SystemConfigurator<'a> {
         } else {
             format!("keystore-rpool UUID={uuid} none luks,_netdev,initramfs")
         };
-        let _ = self.runner.execute(&format!(
-            "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{crypttab_entry}' > /mnt/targetos/etc/crypttab"
-        )).await;
+        // FATAL: a keystore host with no /etc/crypttab entry has no unlock unit at
+        // all — the initramfs never opens the keystore LUKS, `zfs load-key` never
+        // runs, and the box is unbootable. A swallowed write here is exactly the
+        // "silent killer" that reports success on an unbootable install.
+        self.log_and_execute(
+            "Write keystore crypttab",
+            &format!(
+                "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{crypttab_entry}' > /mnt/targetos/etc/crypttab"
+            ),
+        )
+        .await?;
 
         // dracut: clevis/network/tpm2/zfs modules + the D7.1 keystore-wait hook.
         self.configure_dracut_crypt_modules(config).await?;
@@ -997,11 +1011,18 @@ impl<'a> SystemConfigurator<'a> {
         //     for filesystems where shred is not installed.
         let tmp_key_path = "/run/.uaa-tang-enroll.key";
 
-        // Create empty 0600 file
+        // Create empty 0600 file.
+        //
+        // FATAL, not "skip": this function is only reached when Tang enrollment is
+        // required (tang_servers non-empty). A silent `return Ok(())` here bypasses
+        // the fatal bind below and lets the install report success on a keystore
+        // with NO unattended-unlock binding — the exact silent-killer the bind's
+        // fatal handling was added to prevent.
         let mk_tmp = format!("install -m 0600 /dev/null {}", tmp_key_path);
         if let Err(e) = self.runner.execute(&mk_tmp).await {
-            warn!("Clevis enrollment: could not create key tempfile ({}); skipping", e);
-            return Ok(());
+            return Err(crate::error::AutoInstallError::SystemError(format!(
+                "Clevis enrollment: could not create key tempfile ({e}) — keystore would have no unattended-unlock binding"
+            )));
         }
 
         // Write passphrase — NOT logged (no log_and_execute)
@@ -1012,8 +1033,9 @@ impl<'a> SystemConfigurator<'a> {
         );
         if let Err(e) = self.runner.execute(&write_key).await {
             let _ = self.runner.execute(&format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)).await;
-            warn!("Clevis enrollment: could not write key to tempfile ({}); skipping", e);
-            return Ok(());
+            return Err(crate::error::AutoInstallError::SystemError(format!(
+                "Clevis enrollment: could not write key to tempfile ({e}) — keystore would have no unattended-unlock binding"
+            )));
         }
 
         // Run clevis bind — key path in command, not the key itself
@@ -1134,7 +1156,13 @@ impl<'a> SystemConfigurator<'a> {
             "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
             conf
         );
-        let _ = self.log_and_execute("Write dracut crypt-module config", &cmd).await;
+        // FATAL: this fragment is what pulls the crypt/tpm2/zfs/network unlock
+        // modules (and the forced NIC driver for Tang) INTO the initramfs. If it
+        // silently fails to write, the regenerated initramfs ships without the
+        // unlock stack and the box cannot decrypt at boot — another "silent
+        // killer" that must abort the install, not be swallowed.
+        self.log_and_execute("Write dracut crypt-module config", &cmd)
+            .await?;
         Ok(())
     }
 
