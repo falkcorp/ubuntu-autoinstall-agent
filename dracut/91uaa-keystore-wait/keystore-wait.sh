@@ -1,6 +1,6 @@
 #!/bin/sh
 # file: dracut/91uaa-keystore-wait/keystore-wait.sh
-# version: 2.0.0
+# version: 3.0.0
 # guid: 3cf623e7-f792-4410-9cca-6d54b9f3732d
 # last-edited: 2026-07-26
 #
@@ -80,6 +80,45 @@ if grep -qw rd.neednet /proc/cmdline 2>/dev/null; then
         fi
         sleep 1
     done
+fi
+
+# ---- D7.3: perform the keystore unlock DIRECTLY (the proven manual path) ----
+# zfs-dracut's stock keystore open at pre-mount 90 (zfs-load-key.sh ->
+# `systemd-cryptsetup attach` + clevis-luks-askpass answering an ask-password
+# request) does NOT fire reliably in this initramfs — the boot hangs silently
+# waiting for a password nobody answers. Since this hook runs at pre-mount 89
+# (dracut runs pre-mount hooks sequentially, so 89 fully completes before 90),
+# do the exact sequence that works by hand: clevis-unlock the keystore LUKS,
+# mount it at the keylocation path, and `zfs load-key`. Stock zfs-load-key.sh
+# then hits its own guard (`[ keystatus = unavailable ] || return 0`), sees the
+# key already loaded, and no-ops the fragile askpass path entirely.
+#
+# Mapper name MUST match zfs-load-key.sh's ("keystore-<pool>") and the mount
+# path MUST be the keylocation dir (/run/keystore/<pool>) so `zfs load-key -a`
+# finds system.key.
+POOL="rpool"
+KS="/dev/zvol/$POOL/keystore"
+MAPPER="keystore-$POOL"
+KEYDIR="/run/keystore/$POOL"
+if [ -e "$KS" ]; then
+    if [ ! -e "/dev/mapper/$MAPPER" ]; then
+        info "clevis-unlocking keystore $KS -> $MAPPER"
+        clevis luks unlock -d "$KS" -n "$MAPPER" 2>&1 | while IFS= read -r l; do info "clevis: $l"; done
+    fi
+    if [ -e "/dev/mapper/$MAPPER" ]; then
+        mkdir -p "$KEYDIR"
+        if ! mountpoint -q "$KEYDIR" 2>/dev/null; then
+            mount "/dev/mapper/$MAPPER" "$KEYDIR" 2>&1 | while IFS= read -r l; do info "mount: $l"; done
+        fi
+        info "loading ZFS keys from keystore"
+        if zfs load-key -a >/dev/null 2>&1; then
+            info "ZFS keys loaded from keystore"
+        else
+            warn "zfs load-key -a failed; stock pre-mount 90 will attempt its own path"
+        fi
+    else
+        warn "keystore mapper $MAPPER did not open; falling through to stock pre-mount 90"
+    fi
 fi
 
 exit 0

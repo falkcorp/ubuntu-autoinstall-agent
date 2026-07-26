@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: dracut/91uaa-keystore-wait/module-setup.sh
-# version: 2.0.0
+# version: 3.0.0
 # guid: 3a3d7611-6c6d-4ddf-b3fa-79834c3febad
 # last-edited: 2026-07-26
 #
@@ -31,14 +31,24 @@ check() {
 
 # dracut hook: module dependencies.
 depends() {
-    echo zfs
+    # zfs: pool import + `zfs load-key` + the keystore zvol.
+    # crypt: cryptsetup/systemd-cryptsetup.
+    # clevis + pins: the `clevis luks unlock` decrypt chain (tang + tpm2) that
+    #   D7.3 in the hook drives directly.
+    echo zfs crypt clevis clevis-pin-tang clevis-pin-tpm2 clevis-pin-sss
     return 0
 }
 
 # dracut hook: install the hook script + the binaries it needs into the initramfs.
 install() {
-    # udevadm+sleep: D7.1 zvol wait. ip: D7.2 network readiness check
-    # (systemctl is already present in the systemd-based initramfs).
-    inst_multiple udevadm sleep ip
+    # udevadm+sleep: D7.1 zvol wait. ip: D7.2 network readiness check.
+    # The D7.3 direct unlock needs the `clevis luks unlock` wrapper chain +
+    # mount/cryptsetup/zfs. Most decrypt helpers come from the clevis* modules
+    # above; -o keeps the build from failing if a helper name is absent on a
+    # given release (the pin modules still install them).
+    inst_multiple udevadm sleep ip mount mountpoint mkdir cryptsetup zfs
+    inst_multiple -o clevis clevis-luks-unlock clevis-luks-common-functions \
+        clevis-decrypt clevis-decrypt-tang clevis-decrypt-tpm2 jose curl \
+        clevis-luks-list clevis-luks-bind
     inst_hook pre-mount 89 "$moddir/keystore-wait.sh"
 }
