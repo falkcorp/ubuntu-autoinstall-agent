@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.21.0
+// version: 2.22.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-26
 
@@ -526,11 +526,24 @@ impl<'a> SystemConfigurator<'a> {
             self.run_tolerating_zsys_errors(&desc, &wrapped).await?;
         }
 
-        // hostid for ZFS
-        let _ = self.log_and_execute(
-            "Generate /etc/hostid",
-            "chroot /mnt/targetos bash -lc 'command -v zgenhostid >/dev/null 2>&1 && zgenhostid -f /etc/hostid || (command -v hostid >/dev/null 2>&1 && hostid > /etc/hostid) || true'"
-        ).await;
+        // /etc/hostid for ZFS — MUST match the hostid the pools were created
+        // under (the LIVE environment's hostid), or the initramfs `zpool import`
+        // sees the pool as "last used by another system" and (if the pool wasn't
+        // cleanly exported) refuses to import → `zfs-import.target` never
+        // activates → the boot hangs.
+        //
+        // The old code ran INSIDE the chroot: `zgenhostid -f /etc/hostid` is
+        // malformed (treats the path as a *value*), and the fallback `hostid >
+        // /etc/hostid` wrote the chroot's null hostid as the ASCII text
+        // "00000000" — never a valid 4-byte binary hostid, and never matching the
+        // pool. Fix: run on the LIVE host (where `hostid` returns the value the
+        // pools were created with) and write a proper binary file with zgenhostid.
+        // Must precede the initramfs regen so the correct hostid is baked in.
+        self.log_and_execute(
+            "Write /etc/hostid matching pool (live-env hostid)",
+            "HID=$(hostid); zgenhostid -f -o /mnt/targetos/etc/hostid \"0x${HID}\"",
+        )
+        .await?;
 
         // Root password
         let _ = self.log_and_execute(
@@ -816,39 +829,25 @@ impl<'a> SystemConfigurator<'a> {
         let keystore_dev = "/dev/zvol/rpool/keystore";
         info!("Configuring keystore-LUKS crypttab + clevis (device {keystore_dev})");
 
-        // crypttab: unlock the keystore in the initramfs (by LUKS UUID). The
-        // clevis dracut module answers the passphrase prompt via Tang+TPM2.
+        // NO crypttab entry for the keystore — deliberately.
         //
-        // `_netdev` is LOAD-BEARING for the D2-B (SSS t=2) unlock: the clevis
-        // binding needs ≥1 Tang server, so the keystore cannot unlock until the
-        // network is up. Without `_netdev`, systemd-cryptsetup-generator files
-        // this unit in the LOCAL `cryptsetup.target` phase, which is ordered
-        // BEFORE networking — so clevis-luks-askpass fires while the NIC is still
-        // down, every Tang share fails, t=2 is unmet, `zfs load-key` never runs,
-        // and `sysroot.mount` drops the boot to the dracut emergency shell.
-        // `_netdev` reroutes it to `remote-cryptsetup.target`, ordered AFTER
-        // network-online, so clevis waits for the network (incl. a slow DHCP
-        // lease) instead of racing it. Applies in the initramfs too — the
-        // generator runs there under dracut's systemd.
-        let uuid_out = self
-            .runner
-            .execute_with_output(&format!("cryptsetup luksUUID {keystore_dev} 2>/dev/null || true"))
-            .await?;
-        let uuid = uuid_out.trim();
-        let crypttab_entry = if uuid.is_empty() {
-            format!("keystore-rpool {keystore_dev} none luks,_netdev,initramfs")
-        } else {
-            format!("keystore-rpool UUID={uuid} none luks,_netdev,initramfs")
-        };
-        // FATAL: a keystore host with no /etc/crypttab entry has no unlock unit at
-        // all — the initramfs never opens the keystore LUKS, `zfs load-key` never
-        // runs, and the box is unbootable. A swallowed write here is exactly the
-        // "silent killer" that reports success on an unbootable install.
+        // The keystore is opened by the `91uaa-keystore-wait` dracut hook at
+        // pre-mount 89 (D7.3): it runs `clevis luks unlock` directly, mounts the
+        // keystore, and `zfs load-key`s the root key — the exact sequence that
+        // works by hand. A `/etc/crypttab` entry would generate a COMPETING
+        // `systemd-cryptsetup@keystore-rpool.service` that opens the same device
+        // via the systemd ask-password + `clevis-luks-askpass` path. That path
+        // does NOT answer reliably in this dracut initramfs (the boot hangs
+        // silently waiting for a password nobody supplies) and, worse, if that
+        // unit runs before the hook it wins the race and hangs first. Removing
+        // the entry eliminates the fragile path entirely; the hook is the sole
+        // opener, and stock `zfs-load-key.sh` (pre-mount 90) then no-ops because
+        // the key is already loaded. Write an explicit empty crypttab so no unit
+        // is generated. FATAL: a swallowed write could leave a stale entry behind.
+        let _ = keystore_dev; // device path is used by the hook, not crypttab
         self.log_and_execute(
-            "Write keystore crypttab",
-            &format!(
-                "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{crypttab_entry}' > /mnt/targetos/etc/crypttab"
-            ),
+            "Write empty crypttab (keystore unlocked by 91uaa-keystore-wait hook)",
+            "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; printf '# keystore unlocked by the 91uaa-keystore-wait dracut hook (D7.3), not crypttab\\n' > /mnt/targetos/etc/crypttab",
         )
         .await?;
 
