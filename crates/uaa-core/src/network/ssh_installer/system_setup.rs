@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.22.0
+// version: 2.23.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-26
+// last-edited: 2026-07-27
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -707,11 +707,35 @@ impl<'a> SystemConfigurator<'a> {
             "chroot /mnt/targetos bash -lc '[ -d /sys/firmware/efi/efivars ] || mkdir -p /sys/firmware/efi/efivars; mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true'"
         ).await;
 
-        // For dracut + Tang: GRUB must pass rd.neednet=1 ip=dhcp so the network
-        // is available in the initramfs before Tang is queried for the LUKS key.
+        // For dracut + Tang: the initramfs needs the network up before Tang is
+        // queried for the LUKS key, so pass `rd.neednet=1` + an `ip=` config.
+        //
+        // Prefer STATIC over `ip=dhcp`. On Ubuntu 26.04 the systemd-networkd
+        // dracut module drops a default `/run/systemd/network/zzzz-dracut-default
+        // .network` that forces `DHCP=yes` on every interface and never sets up
+        // wait-for-network logic — so `ip=dhcp` yields a late/duplicate lease
+        // (registers the host in DNS under a second address) and network-online
+        // never settles. A static `ip=IP::GW:PREFIX::IFACE:none` on the KERNEL
+        // cmdline is parsed by systemd-network-generator (NOT dracut's own
+        // variables) and, because it generates a *.network file, overrides the
+        // DHCP default. Falls back to `ip=dhcp` only when the host really is DHCP.
         if config.initramfs_type == InitramfsType::Dracut && !config.tang_servers.is_empty() {
-            info!("Dracut+Tang: adding rd.neednet=1 ip=dhcp to GRUB_CMDLINE_LINUX");
-            let grub_extra = "rd.neednet=1 ip=dhcp";
+            let ip_arg = if config.network_address.eq_ignore_ascii_case("dhcp") {
+                "ip=dhcp".to_string()
+            } else {
+                // network_address is "IP/PREFIX" (e.g. "172.16.2.35/23").
+                let (ip, prefix) = config
+                    .network_address
+                    .split_once('/')
+                    .unwrap_or((config.network_address.as_str(), "24"));
+                format!(
+                    "ip={ip}::{gw}:{prefix}::{iface}:none",
+                    gw = config.network_gateway,
+                    iface = config.network_interface
+                )
+            };
+            info!("Dracut+Tang: adding rd.neednet=1 {ip_arg} to GRUB_CMDLINE_LINUX");
+            let grub_extra = format!("rd.neednet=1 {ip_arg}");
             let set_cmdline = format!(
                 r#"chroot /mnt/targetos bash -lc 'grep -q "rd.neednet" /etc/default/grub 2>/dev/null || sed -i "s|^GRUB_CMDLINE_LINUX=\\\"\\(.*\\)\\\"|GRUB_CMDLINE_LINUX=\\\"\\1 {}\\\"| " /etc/default/grub'"#,
                 grub_extra
