@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.19.0
+// version: 2.20.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-24
+// last-edited: 2026-07-26
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -202,6 +202,25 @@ impl<'a> SystemConfigurator<'a> {
         );
         self.log_and_execute("Configuring serial console (grub.d drop-in)", &cmd)
             .await?;
+
+        // Explicitly enable a login getty on BOTH COM ports.
+        //
+        // The GRUB drop-in above only sets the kernel `console=` args (boot +
+        // emergency output). It does NOT guarantee an interactive login prompt on
+        // real root: systemd-getty-generator auto-spawns serial-getty only on the
+        // *last* `console=` (the one that becomes /dev/console), so on this box
+        // that lands on ttyS1 alone and ttyS0 gets no prompt. The generator's
+        // behavior has also shifted across releases — the reliable answer is to
+        // statically enable serial-getty@ on both units so the login prompt shows
+        // regardless of which COM port the operator's SOL is wired to (X10 BMC SOL
+        // = COM2/ttyS1) and regardless of the generator heuristic. This is
+        // real-root only; the dracut initramfs shell uses the kernel console arg,
+        // not a getty.
+        self.log_and_execute(
+            "Enabling serial-getty on ttyS0 + ttyS1",
+            "chroot /mnt/targetos bash -lc 'systemctl enable serial-getty@ttyS0.service serial-getty@ttyS1.service'",
+        )
+        .await?;
         Ok(())
     }
 
@@ -793,15 +812,27 @@ impl<'a> SystemConfigurator<'a> {
 
         // crypttab: unlock the keystore in the initramfs (by LUKS UUID). The
         // clevis dracut module answers the passphrase prompt via Tang+TPM2.
+        //
+        // `_netdev` is LOAD-BEARING for the D2-B (SSS t=2) unlock: the clevis
+        // binding needs ≥1 Tang server, so the keystore cannot unlock until the
+        // network is up. Without `_netdev`, systemd-cryptsetup-generator files
+        // this unit in the LOCAL `cryptsetup.target` phase, which is ordered
+        // BEFORE networking — so clevis-luks-askpass fires while the NIC is still
+        // down, every Tang share fails, t=2 is unmet, `zfs load-key` never runs,
+        // and `sysroot.mount` drops the boot to the dracut emergency shell.
+        // `_netdev` reroutes it to `remote-cryptsetup.target`, ordered AFTER
+        // network-online, so clevis waits for the network (incl. a slow DHCP
+        // lease) instead of racing it. Applies in the initramfs too — the
+        // generator runs there under dracut's systemd.
         let uuid_out = self
             .runner
             .execute_with_output(&format!("cryptsetup luksUUID {keystore_dev} 2>/dev/null || true"))
             .await?;
         let uuid = uuid_out.trim();
         let crypttab_entry = if uuid.is_empty() {
-            format!("keystore-rpool {keystore_dev} none luks,initramfs")
+            format!("keystore-rpool {keystore_dev} none luks,_netdev,initramfs")
         } else {
-            format!("keystore-rpool UUID={uuid} none luks,initramfs")
+            format!("keystore-rpool UUID={uuid} none luks,_netdev,initramfs")
         };
         let _ = self.runner.execute(&format!(
             "[ -d /mnt/targetos/etc ] || mkdir -p /mnt/targetos/etc; echo '{crypttab_entry}' > /mnt/targetos/etc/crypttab"
