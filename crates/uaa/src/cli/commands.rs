@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.13.0
+// version: 2.14.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-24
+// last-edited: 2026-07-27
 
 //! Command implementations for the CLI
 
@@ -782,6 +782,9 @@ fn create_local_installation_config(
         tang_servers: vec![],
         tang_threshold: 2,
         ssh_authorized_keys: vec![],
+        // Interactive live-install path provisions root only; operator accounts
+        // come from the profile/YAML install path, not this ad-hoc command.
+        users: Vec::new(),
         enroll_tpm2: true,
         tpm2_pin: None,
         tpm2_pcr_ids: "7".to_string(),

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/lower.rs
-// version: 1.0.1
+// version: 1.0.2
 // guid: 74997d1d-8349-4aaf-ac8a-b6ec886492a1
-// last-edited: 2026-07-24
+// last-edited: 2026-07-27
 
 //! Pure authoring->flat-wire bridge (PS-LOWER-12).
 //!
@@ -99,6 +99,10 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
         tang_servers,
         tang_threshold,
         ssh_authorized_keys: resolved.ssh_authorized_keys.clone().unwrap_or_default(),
+        // Operator user accounts are not authored through the profile partial
+        // yet (see the direct-YAML install path); always empty when lowered
+        // from a profile so len-serv stays byte-identical.
+        users: Vec::new(),
         enroll_tpm2,
         tpm2_pin,
         tpm2_pcr_ids,

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.4.0
+// version: 1.4.1
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-24
+// last-edited: 2026-07-27
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -397,6 +397,7 @@ mod tests {
             tang_servers: vec![],
             tang_threshold: 2,
             ssh_authorized_keys: vec![],
+            users: Vec::new(),
             enroll_tpm2: true,
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),

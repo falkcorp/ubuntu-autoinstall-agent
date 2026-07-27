@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.23.0
+// version: 2.24.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-27
 
@@ -9,7 +9,9 @@
 //! kernel command line receives `rd.neednet=1 ip=dhcp` so the Tang servers are
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
-use super::config::{Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode};
+use super::config::{
+    Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount,
+};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -571,6 +573,14 @@ impl<'a> SystemConfigurator<'a> {
                 "Fix authorized_keys permissions",
                 "chroot /mnt/targetos bash -lc 'chmod 600 /root/.ssh/authorized_keys || true'",
             ).await;
+        }
+
+        // Operator user accounts. Empty `users` (every pre-existing config)
+        // leaves this a no-op, preserving the root-only prior behavior.
+        for user in &config.users {
+            for (desc, cmd) in build_user_provision_cmds(user) {
+                let _ = self.log_and_execute(&desc, &cmd).await;
+            }
         }
 
         let _ = self.log_and_execute(
@@ -1340,6 +1350,80 @@ impl<'a> SystemConfigurator<'a> {
     }
 }
 
+/// Build the ordered chroot commands that provision one operator user account.
+///
+/// Pure (no I/O) so the command sequence is unit-testable; the caller runs each
+/// `(description, command)` pair through `log_and_execute`. Ordering is
+/// deliberate: create → password → groups → ssh keys. Every step is idempotent
+/// (the `useradd` is guarded by an `id` check) and group additions are guarded
+/// by `getent` so a group the target lacks (e.g. `docker`) is skipped rather
+/// than failing the whole `usermod`.
+fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
+    let name = &user.name;
+    let mut cmds: Vec<(String, String)> = Vec::new();
+
+    // 1. Create the account (idempotent) with home dir + login shell.
+    cmds.push((
+        format!("Create user {name}"),
+        format!(
+            "chroot /mnt/targetos bash -lc 'id {name} >/dev/null 2>&1 || useradd -m -s {shell} {name}'",
+            shell = user.shell,
+        ),
+    ));
+
+    // 2. Password via chpasswd, or lock it (key-only login) when empty.
+    if user.password.is_empty() {
+        cmds.push((
+            format!("Lock password for {name} (SSH-key only)"),
+            format!("chroot /mnt/targetos bash -lc 'passwd -l {name} || true'"),
+        ));
+    } else {
+        cmds.push((
+            format!("Set password for {name}"),
+            format!(
+                "chroot /mnt/targetos bash -lc \"echo '{name}:{pw}' | chpasswd\"",
+                pw = user.password,
+            ),
+        ));
+    }
+
+    // 3. Supplementary groups — each guarded so a missing group is skipped.
+    for group in &user.groups {
+        cmds.push((
+            format!("Add {name} to group {group}"),
+            format!(
+                "chroot /mnt/targetos bash -lc 'getent group {group} >/dev/null && usermod -aG {group} {name} || true'"
+            ),
+        ));
+    }
+
+    // 4. Per-user SSH authorized keys (+ ownership fix, since we write as root).
+    if !user.ssh_authorized_keys.is_empty() {
+        cmds.push((
+            format!("Create {name} .ssh dir"),
+            format!(
+                "chroot /mnt/targetos bash -lc 'mkdir -p /home/{name}/.ssh && chmod 700 /home/{name}/.ssh'"
+            ),
+        ));
+        for key in &user.ssh_authorized_keys {
+            cmds.push((
+                format!("Inject SSH key for {name}"),
+                format!(
+                    "chroot /mnt/targetos bash -lc \"echo '{key}' >> /home/{name}/.ssh/authorized_keys\""
+                ),
+            ));
+        }
+        cmds.push((
+            format!("Fix {name} .ssh ownership/perms"),
+            format!(
+                "chroot /mnt/targetos bash -lc 'chmod 600 /home/{name}/.ssh/authorized_keys && chown -R {name}: /home/{name}/.ssh'"
+            ),
+        ));
+    }
+
+    cmds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1352,6 +1436,63 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingExecutor {
         commands: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn joined_cmds(user: &UserAccount) -> String {
+        build_user_provision_cmds(user)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn test_build_user_provision_cmds_password_sudo_adm() {
+        let user = UserAccount {
+            name: "jdfalk".to_string(),
+            password: "s3cret".to_string(),
+            groups: vec!["adm".to_string(), "sudo".to_string(), "docker".to_string()],
+            shell: "/bin/bash".to_string(),
+            ssh_authorized_keys: vec!["ssh-ed25519 AAAAtest jdfalk@x".to_string()],
+        };
+        let joined = joined_cmds(&user);
+
+        // Idempotent account creation with the requested shell.
+        assert!(joined.contains("id jdfalk >/dev/null 2>&1 || useradd -m -s /bin/bash jdfalk"));
+        // A real password is set — NOT locked.
+        assert!(joined.contains("echo 'jdfalk:s3cret' | chpasswd"));
+        assert!(!joined.contains("passwd -l"));
+        // sudo (escalate) + adm (read logs), each getent-guarded.
+        assert!(joined.contains("getent group sudo >/dev/null && usermod -aG sudo jdfalk"));
+        assert!(joined.contains("getent group adm >/dev/null && usermod -aG adm jdfalk"));
+        // A group the target may lack is still emitted but guarded, not fatal.
+        assert!(joined.contains("getent group docker >/dev/null && usermod -aG docker jdfalk"));
+        // Key seeded and ownership handed back to the user.
+        assert!(joined.contains("/home/jdfalk/.ssh/authorized_keys"));
+        assert!(joined.contains("chown -R jdfalk: /home/jdfalk/.ssh"));
+
+        // Ordering: create → password → groups → keys.
+        let idx = |s: &str| joined.find(s).expect("substring present");
+        assert!(idx("useradd") < idx("chpasswd"));
+        assert!(idx("chpasswd") < idx("usermod -aG adm"));
+        assert!(idx("usermod -aG docker") < idx("authorized_keys"));
+    }
+
+    #[test]
+    fn test_build_user_provision_cmds_empty_password_locks_and_no_keys() {
+        let user = UserAccount {
+            name: "svc".to_string(),
+            password: String::new(),
+            groups: Vec::new(),
+            shell: "/bin/bash".to_string(),
+            ssh_authorized_keys: Vec::new(),
+        };
+        let joined = joined_cmds(&user);
+        // Empty password locks the account (key-only), never runs chpasswd.
+        assert!(joined.contains("passwd -l svc"));
+        assert!(!joined.contains("chpasswd"));
+        // No keys → no .ssh handling emitted.
+        assert!(!joined.contains(".ssh"));
     }
 
     impl RecordingExecutor {
@@ -1579,6 +1720,7 @@ mod tests {
             tang_servers: vec![],
             tang_threshold: 2,
             ssh_authorized_keys: vec![],
+            users: Vec::new(),
             enroll_tpm2: true,
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),

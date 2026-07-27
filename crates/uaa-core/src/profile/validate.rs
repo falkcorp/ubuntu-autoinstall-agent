@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.2.1
+// version: 1.2.2
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
-// last-edited: 2026-07-24
+// last-edited: 2026-07-27
 
 //! Validation logic for `HostGroupProfile` / `HostProfile` (DS-PRF-03).
 //!
@@ -599,6 +599,7 @@ mod tests {
             tang_servers: vec![],
             tang_threshold: 2,
             ssh_authorized_keys: vec![],
+            users: Vec::new(),
             enroll_tpm2: true,
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
