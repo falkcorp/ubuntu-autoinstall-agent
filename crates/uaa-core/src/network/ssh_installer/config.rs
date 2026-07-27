@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.14.0
+// version: 2.15.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-24
+// last-edited: 2026-07-27
 
 //! Configuration structures for SSH/local installation
 
@@ -112,6 +112,59 @@ pub struct TangServerSpec {
     pub key_directory: String,
 }
 
+fn default_user_groups() -> Vec<String> {
+    // Mirrors the len-serv cloud-init operator account (adm=read logs,
+    // sudo=escalate, plus the usual desktop/container groups). Missing groups
+    // are skipped at apply time via a `getent` guard, so listing docker/lxd on
+    // a host that lacks them is harmless.
+    vec![
+        "adm".to_string(),
+        "sudo".to_string(),
+        "cdrom".to_string(),
+        "dip".to_string(),
+        "lxd".to_string(),
+        "docker".to_string(),
+    ]
+}
+
+fn default_user_shell() -> String {
+    // bash is guaranteed present on a freshly-debootstrapped target; zsh (what
+    // len-serv uses) would have to be installed first, so it is not the default.
+    "/bin/bash".to_string()
+}
+
+/// A human operator account to provision on the installed target.
+///
+/// Created in the chroot with a home directory, added to `groups`, given
+/// `password` via `chpasswd`, and seeded with its own `ssh_authorized_keys`.
+/// This is the SSH/native-install analogue of the `users:` block the len-serv
+/// cloud-init path already provisions, so both install paths yield the same
+/// operator account.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct UserAccount {
+    /// Login name, e.g. `jdfalk`.
+    pub name: String,
+    /// Plaintext password, applied via `chpasswd` (same handling as
+    /// `root_password`). An empty string locks the password (`passwd -l`) so
+    /// the account is SSH-key-only. NOTE: like `root_password`, a single quote
+    /// in the value breaks the `echo '<name>:<pw>' | chpasswd` command — avoid
+    /// `'` in passwords set through the installer.
+    #[serde(default)]
+    pub password: String,
+    /// Supplementary groups. Default: adm, sudo, cdrom, dip, lxd, docker.
+    /// Membership in `sudo` grants password-prompted `sudo`; no NOPASSWD
+    /// sudoers entry is written (that is a deliberate choice for this path).
+    #[serde(default = "default_user_groups")]
+    pub groups: Vec<String>,
+    /// Login shell. Default `/bin/bash`.
+    #[serde(default = "default_user_shell")]
+    pub shell: String,
+    /// SSH public keys installed to `~/.ssh/authorized_keys` for this user.
+    #[serde(default)]
+    pub ssh_authorized_keys: Vec<String>,
+}
+
 /// Complete configuration for a machine installation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +197,17 @@ pub struct InstallationConfig {
     /// SSH public keys to install for root.
     #[serde(default)]
     pub ssh_authorized_keys: Vec<String>,
+    /// Human operator accounts to provision on the target. Empty (the default,
+    /// and the shape of every pre-existing config) provisions no login user —
+    /// root + `ssh_authorized_keys` only, exactly as before.
+    ///
+    /// `skip_serializing_if` omits the key entirely for a user-free host, so a
+    /// serialized (registry-resolved) config stays byte-identical to today's
+    /// and parses on an older `uaa` binary whose `InstallationConfig`
+    /// (`deny_unknown_fields`) predates this field — the same forward-compat
+    /// contract `applications` relies on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<UserAccount>,
     /// Enroll a TPM2 + PIN LUKS keyslot on first boot of the installed target.
     ///
     /// TPM2 must bind to the *installed* system's PCR values (not the live
@@ -414,6 +478,9 @@ impl InstallationConfig {
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local".to_string(),
                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820".to_string(),
             ],
+            // No operator user in the committed fallback — real accounts (with
+            // passwords) live only in the uncommitted per-host YAML.
+            users: Vec::new(),
             enroll_tpm2: true,
             // Placeholder — the real PIN is injected per-host from a secret at
             // seed-render time, never committed. None here disables TPM2 in the
