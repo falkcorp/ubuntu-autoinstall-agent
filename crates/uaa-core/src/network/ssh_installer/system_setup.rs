@@ -515,7 +515,10 @@ impl<'a> SystemConfigurator<'a> {
                 initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra
             ),
             "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-generic".to_string(),
-            "DEBIAN_FRONTEND=noninteractive apt install -y openssh-server vim htop curl".to_string(),
+            // `sudo` is load-bearing for provisioned operator accounts (they get
+            // password-prompted sudo via the `sudo` group), so install it
+            // explicitly rather than relying on it being pulled in transitively.
+            "DEBIAN_FRONTEND=noninteractive apt install -y openssh-server sudo vim htop curl".to_string(),
             "DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true".to_string(),
             "addgroup --system lpadmin || true".to_string(),
             "addgroup --system lxd || true".to_string(),
@@ -578,6 +581,20 @@ impl<'a> SystemConfigurator<'a> {
         // Operator user accounts. Empty `users` (every pre-existing config)
         // leaves this a no-op, preserving the root-only prior behavior.
         for user in &config.users {
+            // Identifier fields are interpolated literally into shell commands,
+            // so reject any that aren't safe bare tokens (the free-form password
+            // and keys are base64'd, so they need no such guard). Fail-safe:
+            // skip the whole user rather than run a tainted command.
+            if !is_safe_ident(&user.name)
+                || !is_safe_ident(&user.shell)
+                || user.groups.iter().any(|g| !is_safe_ident(g))
+            {
+                warn!(
+                    "Skipping operator user '{}': name/shell/group contains unsafe characters",
+                    user.name
+                );
+                continue;
+            }
             for (desc, cmd) in build_user_provision_cmds(user) {
                 let _ = self.log_and_execute(&desc, &cmd).await;
             }
@@ -1350,6 +1367,19 @@ impl<'a> SystemConfigurator<'a> {
     }
 }
 
+/// Whether a value is a safe bare identifier to interpolate into a shell
+/// command — a strict whitelist (letters, digits, and `._/@:-`), non-empty.
+/// Used to gate a `UserAccount`'s `name`, `shell`, and group names, which are
+/// interpolated literally (they name paths/accounts, so they can't be
+/// base64-round-tripped like the free-form password/keys are). Anything with
+/// whitespace, quotes, `$`, backtick, `;`, `|`, `&`, `<`, `>`, `(`, `)`, or `\`
+/// is rejected, closing the shell-injection vector for identifier positions.
+fn is_safe_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '@' | ':' | '-'))
+}
+
 /// Build the ordered chroot commands that provision one operator user account.
 ///
 /// Pure (no I/O) so the command sequence is unit-testable; the caller runs each
@@ -1358,6 +1388,14 @@ impl<'a> SystemConfigurator<'a> {
 /// (the `useradd` is guarded by an `id` check) and group additions are guarded
 /// by `getent` so a group the target lacks (e.g. `docker`) is skipped rather
 /// than failing the whole `usermod`.
+///
+/// Injection-safety: the free-form `password` and each SSH key are
+/// **base64-encoded in Rust and decoded inside the chroot** (`base64 -d`), so
+/// no shell metacharacter from those values ever reaches a shell — bulletproof
+/// through the outer `bash -c` + inner `bash -lc` nesting. The identifier
+/// fields (`name`, `shell`, groups) are interpolated literally and MUST be
+/// pre-validated with [`is_safe_ident`] by the caller (which skips any user
+/// that fails), so those positions are safe too.
 fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
     let name = &user.name;
     let mut cmds: Vec<(String, String)> = Vec::new();
@@ -1372,17 +1410,18 @@ fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
     ));
 
     // 2. Password via chpasswd, or lock it (key-only login) when empty.
+    //    The `name:password` pair is base64'd so any character is safe.
     if user.password.is_empty() {
         cmds.push((
             format!("Lock password for {name} (SSH-key only)"),
             format!("chroot /mnt/targetos bash -lc 'passwd -l {name} || true'"),
         ));
     } else {
+        let creds_b64 = BASE64.encode(format!("{name}:{pw}", pw = user.password));
         cmds.push((
             format!("Set password for {name}"),
             format!(
-                "chroot /mnt/targetos bash -lc \"echo '{name}:{pw}' | chpasswd\"",
-                pw = user.password,
+                "chroot /mnt/targetos bash -lc 'echo {creds_b64} | base64 -d | chpasswd'"
             ),
         ));
     }
@@ -1398,6 +1437,7 @@ fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
     }
 
     // 4. Per-user SSH authorized keys (+ ownership fix, since we write as root).
+    //    Each key is base64'd so its content can't break out of the shell.
     if !user.ssh_authorized_keys.is_empty() {
         cmds.push((
             format!("Create {name} .ssh dir"),
@@ -1406,10 +1446,11 @@ fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
             ),
         ));
         for key in &user.ssh_authorized_keys {
+            let key_b64 = BASE64.encode(key);
             cmds.push((
                 format!("Inject SSH key for {name}"),
                 format!(
-                    "chroot /mnt/targetos bash -lc \"echo '{key}' >> /home/{name}/.ssh/authorized_keys\""
+                    "chroot /mnt/targetos bash -lc '{{ echo {key_b64} | base64 -d; echo; }} >> /home/{name}/.ssh/authorized_keys'"
                 ),
             ));
         }
@@ -1459,16 +1500,20 @@ mod tests {
 
         // Idempotent account creation with the requested shell.
         assert!(joined.contains("id jdfalk >/dev/null 2>&1 || useradd -m -s /bin/bash jdfalk"));
-        // A real password is set — NOT locked.
-        assert!(joined.contains("echo 'jdfalk:s3cret' | chpasswd"));
+        // A real password is set (via base64→chpasswd) — NOT locked.
+        assert!(joined.contains("base64 -d | chpasswd"));
         assert!(!joined.contains("passwd -l"));
+        // Security: the raw password NEVER appears in cleartext in the command
+        // stream — it is base64-encoded so no shell can interpret its contents.
+        assert!(!joined.contains("s3cret"));
+        assert!(joined.contains(&BASE64.encode("jdfalk:s3cret")));
         // sudo (escalate) + adm (read logs), each getent-guarded.
         assert!(joined.contains("getent group sudo >/dev/null && usermod -aG sudo jdfalk"));
         assert!(joined.contains("getent group adm >/dev/null && usermod -aG adm jdfalk"));
         // A group the target may lack is still emitted but guarded, not fatal.
         assert!(joined.contains("getent group docker >/dev/null && usermod -aG docker jdfalk"));
-        // Key seeded and ownership handed back to the user.
-        assert!(joined.contains("/home/jdfalk/.ssh/authorized_keys"));
+        // Key seeded (base64) and ownership handed back to the user.
+        assert!(joined.contains("base64 -d; echo; } >> /home/jdfalk/.ssh/authorized_keys"));
         assert!(joined.contains("chown -R jdfalk: /home/jdfalk/.ssh"));
 
         // Ordering: create → password → groups → keys.
@@ -1476,6 +1521,37 @@ mod tests {
         assert!(idx("useradd") < idx("chpasswd"));
         assert!(idx("chpasswd") < idx("usermod -aG adm"));
         assert!(idx("usermod -aG docker") < idx("authorized_keys"));
+    }
+
+    #[test]
+    fn test_build_user_provision_cmds_password_with_shell_metachars_is_base64_safe() {
+        // A password full of shell metacharacters must not appear raw anywhere —
+        // base64 encoding neutralizes the injection through both shell layers.
+        let user = UserAccount {
+            name: "jdfalk".to_string(),
+            password: "p$(rm -rf /)`whoami`'\";".to_string(),
+            groups: vec![],
+            shell: "/bin/bash".to_string(),
+            ssh_authorized_keys: vec![],
+        };
+        let joined = joined_cmds(&user);
+        assert!(joined.contains("base64 -d | chpasswd"));
+        // None of the dangerous fragments survive in the command string.
+        assert!(!joined.contains("rm -rf"));
+        assert!(!joined.contains("$("));
+        assert!(!joined.contains('`'));
+    }
+
+    #[test]
+    fn test_is_safe_ident_rejects_shell_metacharacters() {
+        assert!(is_safe_ident("jdfalk"));
+        assert!(is_safe_ident("/usr/bin/zsh"));
+        assert!(is_safe_ident("lxd"));
+        assert!(!is_safe_ident(""));
+        assert!(!is_safe_ident("bad name")); // space
+        assert!(!is_safe_ident("x;rm -rf /")); // semicolon
+        assert!(!is_safe_ident("x$(id)")); // command sub
+        assert!(!is_safe_ident("x'y")); // quote
     }
 
     #[test]
