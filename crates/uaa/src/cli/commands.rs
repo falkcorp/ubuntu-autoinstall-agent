@@ -375,11 +375,21 @@ pub async fn ssh_install_command(
     // For automation purposes, we'll proceed directly
 
     // Resolve any `!random` password sentinels into freshly generated per-host
-    // passwords BEFORE the install applies them, so the config never has to
-    // carry a cleartext secret. Done here (after the dry-run early return) so we
-    // never generate on a dry run.
-    let generated_credentials =
-        uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config);
+    // passwords BEFORE the install applies them, so the config never carries a
+    // cleartext secret. Only resolve when Phase 5 (which applies passwords) will
+    // actually run — otherwise a phased/partial run would report passwords that
+    // were never set. (dry-run already returned above.)
+    let generated_credentials = if selection.contains(5) {
+        uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config)
+    } else {
+        Vec::new()
+    };
+    let credentials_report =
+        render_credentials_report(&generated_credentials, &config.hostname, host);
+    // Persist to the 0600 driver-host file BEFORE the risky phases (write-ahead):
+    // if the install applies the password and then dies at a later phase, the
+    // password is already on disk and recoverable rather than lost.
+    persist_credentials_report(&credentials_report, &config.hostname);
 
     info!("Starting full ZFS+LUKS Ubuntu installation...");
     installer
@@ -394,11 +404,9 @@ pub async fn ssh_install_command(
     info!("SSH installation completed successfully!");
     info!("Target machine should now be ready to boot from local disk");
 
-    // Surface any generated passwords: print to the operator's terminal AND
-    // persist to a 0600 file on this (driver) host. For the SSH path the driver
-    // is the machine you launched the install from, so this lands on "the
-    // server" with no network transit of the secret.
-    report_generated_credentials(&generated_credentials, &config.hostname, host);
+    // Echo the generated passwords to the terminal on success (the durable copy
+    // was already written above).
+    print_credentials_report(&credentials_report);
 
     Ok(())
 }
@@ -500,14 +508,18 @@ pub async fn local_install_command(
     };
 
     // Resolve `!random` password sentinels into generated per-host passwords
-    // before any install branch applies them. Skipped on dry runs so we don't
-    // generate secrets we'll never apply. On this LOCAL path the driver is the
-    // target itself, so the 0600 report lands on the freshly-installed box.
-    let generated_credentials = if dry_run {
+    // before any install branch applies them. Only when the password-applying
+    // phase actually runs: the in-target branch always runs Phase 5, the full
+    // branch runs it iff selected, and never on a dry run. On this LOCAL path
+    // the driver is the target itself, so the 0600 report lands on the box.
+    let phase5_will_run = in_target || selection.contains(5);
+    let generated_credentials = if dry_run || !phase5_will_run {
         Vec::new()
     } else {
         uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config)
     };
+    let credentials_report =
+        render_credentials_report(&generated_credentials, &config.hostname, &config.network_address);
 
     if in_target {
         if dry_run {
@@ -520,9 +532,10 @@ pub async fn local_install_command(
         if hold_on_failure || pause_after_storage {
             warn!("--hold-on-failure/--pause-after-storage are ignored in in-target mode (no storage phases run)");
         }
+        persist_credentials_report(&credentials_report, &config.hostname);
         installer.perform_in_target_configuration(&config).await?;
         info!("In-target configuration completed for {}", config.hostname);
-        report_generated_credentials(&generated_credentials, &config.hostname, &config.network_address);
+        print_credentials_report(&credentials_report);
         return Ok(());
     }
 
@@ -572,6 +585,10 @@ pub async fn local_install_command(
             .map_err(uaa_core::error::AutoInstallError::IoError)?;
     }
 
+    // Persist the durable 0600 record after the operator's confirmation but
+    // before the risky install phases (write-ahead — see the SSH path).
+    persist_credentials_report(&credentials_report, &config.hostname);
+
     info!("Starting full ZFS+LUKS Ubuntu installation locally...");
     installer
         .perform_installation_with_options_and_pause(
@@ -585,39 +602,57 @@ pub async fn local_install_command(
     info!("Local installation completed successfully!");
     info!("System should now be ready to reboot from local disk");
 
-    report_generated_credentials(&generated_credentials, &config.hostname, &config.network_address);
+    print_credentials_report(&credentials_report);
 
     Ok(())
 }
 
-/// Print any generated per-host passwords to the operator's terminal AND persist
-/// them to a `0600` file on the driver host (see
-/// [`uaa_core::network::ssh_installer::credentials`]).
+/// Render the credential report string (with a single timestamp) for any
+/// generated per-host passwords, or `None` when nothing was generated.
 ///
-/// A no-op when nothing was generated. File-write failures are logged, never
-/// fatal — the passwords are already on stdout, and failing an otherwise-good
-/// install just because a log file couldn't be written would be strictly worse.
-fn report_generated_credentials(
+/// Split from persistence/printing so the SAME rendered text (and timestamp) is
+/// both written to disk BEFORE the install and echoed to the terminal AFTER it.
+fn render_credentials_report(
     generated: &[uaa_core::network::ssh_installer::credentials::GeneratedCredential],
     host_label: &str,
     address: &str,
-) {
-    use uaa_core::network::ssh_installer::credentials::{
-        format_credentials_report, write_credentials_file,
-    };
+) -> Option<String> {
     if generated.is_empty() {
-        return;
+        return None;
     }
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let report = format_credentials_report(host_label, address, &timestamp, generated);
+    Some(
+        uaa_core::network::ssh_installer::credentials::format_credentials_report(
+            host_label, address, &timestamp, generated,
+        ),
+    )
+}
 
-    println!("\n=== GENERATED CREDENTIALS (random per-host — save these now) ===");
-    print!("{report}");
-    println!("================================================================");
-    match write_credentials_file(host_label, &report) {
-        Ok(path) => println!("Saved to {} (0600, root-only)", path.display()),
-        Err(e) => warn!("Could not persist credentials file (passwords are printed above): {e}"),
+/// Write-ahead persist: write the rendered report to the `0600` driver-host file
+/// BEFORE the risky install phases run, so a password that gets applied and then
+/// lost to a later-phase failure is still recoverable from disk.
+///
+/// Best-effort: a write failure is logged, never fatal — the report is still
+/// echoed to stdout on success, and failing an otherwise-good install because a
+/// log file couldn't be written would be strictly worse.
+fn persist_credentials_report(report: &Option<String>, host_label: &str) {
+    let Some(report) = report else { return };
+    match uaa_core::network::ssh_installer::credentials::write_credentials_file(host_label, report) {
+        Ok(path) => info!(
+            "Recorded generated password(s) to {} (0600) before install",
+            path.display()
+        ),
+        Err(e) => warn!("Could not persist credentials file (will still print on success): {e}"),
     }
+}
+
+/// Echo the generated passwords to the operator's terminal on success. The
+/// durable `0600` copy was already written by [`persist_credentials_report`].
+fn print_credentials_report(report: &Option<String>) {
+    let Some(report) = report else { return };
+    println!("\n=== GENERATED CREDENTIALS (random per-host — also saved 0600 on this host) ===");
+    print!("{report}");
+    println!("=============================================================================");
 }
 
 /// Print system investigation results in a consistent format.
