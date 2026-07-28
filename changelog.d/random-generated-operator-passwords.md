@@ -17,6 +17,12 @@ target via the existing base64→`chpasswd` path, and records the generated valu
 in a `0600` file at `/var/lib/uaa/credentials/<host>.txt` on the machine that
 ran the install, as well as printing it to that terminal.
 
+The generated value is written to its `0600` file **before** the risky install
+phases run (write-ahead), so a password that gets applied and then lost to a
+later-phase failure is still recoverable from disk. Resolution only happens when
+the password-applying phase (Phase 5) will actually run, so a partial/phased run
+never reports a password it did not set.
+
 Why: a password in a checked-in/placed config is a secret at rest that can leak,
 and one literal password reused across a fleet means a single leak compromises
 every host. Generating unique per-host passwords whose only at-rest copy is a
