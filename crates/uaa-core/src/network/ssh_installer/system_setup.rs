@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.24.0
+// version: 2.25.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-27
 
@@ -550,14 +550,31 @@ impl<'a> SystemConfigurator<'a> {
         )
         .await?;
 
-        // Root password
-        let _ = self.log_and_execute(
-            "Setting root password",
-            &format!(
-                "chroot /mnt/targetos bash -lc \"echo 'root:{}' | chpasswd\"",
-                config.root_password
-            ),
-        ).await;
+        // Root password. Base64-encode the `root:password` pair in Rust and
+        // decode inside the chroot (`base64 -d`), so no shell metacharacter in
+        // the password can break out of the outer `bash -c` + inner `bash -lc`
+        // nesting — mandatory now that the password may be a *generated random*
+        // string (which contains arbitrary charset bytes) as well as a literal.
+        // An empty root password locks the account (key/console-only) rather
+        // than setting a passwordless root.
+        if config.root_password.is_empty() {
+            let _ = self
+                .log_and_execute(
+                    "Lock root password (empty config → key/console-only)",
+                    "chroot /mnt/targetos bash -lc 'passwd -l root || true'",
+                )
+                .await;
+        } else {
+            let creds_b64 = BASE64.encode(format!("root:{}", config.root_password));
+            let _ = self
+                .log_and_execute(
+                    "Setting root password",
+                    &format!(
+                        "chroot /mnt/targetos bash -lc 'echo {creds_b64} | base64 -d | chpasswd'"
+                    ),
+                )
+                .await;
+        }
 
         // SSH authorized keys for root
         if !config.ssh_authorized_keys.is_empty() {

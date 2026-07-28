@@ -1,5 +1,5 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.14.0
+// version: 2.15.0
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
 // last-edited: 2026-07-27
 
@@ -325,7 +325,7 @@ pub async fn ssh_install_command(
     }
 
     // Load config from file or fall back to built-in default
-    let config = if let Some(ref path) = config_path {
+    let mut config = if let Some(ref path) = config_path {
         info!("Loading installation config from {}", path);
         let cfg = InstallationConfig::from_yaml_file(path)?;
         validate_config_secrets(&cfg)?;
@@ -374,6 +374,13 @@ pub async fn ssh_install_command(
     // In a real implementation, you might want to add a confirmation prompt here
     // For automation purposes, we'll proceed directly
 
+    // Resolve any `!random` password sentinels into freshly generated per-host
+    // passwords BEFORE the install applies them, so the config never has to
+    // carry a cleartext secret. Done here (after the dry-run early return) so we
+    // never generate on a dry run.
+    let generated_credentials =
+        uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config);
+
     info!("Starting full ZFS+LUKS Ubuntu installation...");
     installer
         .perform_installation_with_options_and_pause(
@@ -386,6 +393,12 @@ pub async fn ssh_install_command(
 
     info!("SSH installation completed successfully!");
     info!("Target machine should now be ready to boot from local disk");
+
+    // Surface any generated passwords: print to the operator's terminal AND
+    // persist to a 0600 file on this (driver) host. For the SSH path the driver
+    // is the machine you launched the install from, so this lands on "the
+    // server" with no network transit of the secret.
+    report_generated_credentials(&generated_credentials, &config.hostname, host);
 
     Ok(())
 }
@@ -477,13 +490,23 @@ pub async fn local_install_command(
 
     // Config-driven (non-interactive) or legacy interactive-detect path.
     let config_driven = config_path.is_some();
-    let config = if let Some(ref path) = config_path {
+    let mut config = if let Some(ref path) = config_path {
         info!("Loading installation config from {}", path);
         let cfg = InstallationConfig::from_yaml_file(path)?;
         validate_config_secrets(&cfg)?;
         cfg
     } else {
         create_local_installation_config(&hostname, &system_info)?
+    };
+
+    // Resolve `!random` password sentinels into generated per-host passwords
+    // before any install branch applies them. Skipped on dry runs so we don't
+    // generate secrets we'll never apply. On this LOCAL path the driver is the
+    // target itself, so the 0600 report lands on the freshly-installed box.
+    let generated_credentials = if dry_run {
+        Vec::new()
+    } else {
+        uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config)
     };
 
     if in_target {
@@ -499,6 +522,7 @@ pub async fn local_install_command(
         }
         installer.perform_in_target_configuration(&config).await?;
         info!("In-target configuration completed for {}", config.hostname);
+        report_generated_credentials(&generated_credentials, &config.hostname, &config.network_address);
         return Ok(());
     }
 
@@ -561,7 +585,39 @@ pub async fn local_install_command(
     info!("Local installation completed successfully!");
     info!("System should now be ready to reboot from local disk");
 
+    report_generated_credentials(&generated_credentials, &config.hostname, &config.network_address);
+
     Ok(())
+}
+
+/// Print any generated per-host passwords to the operator's terminal AND persist
+/// them to a `0600` file on the driver host (see
+/// [`uaa_core::network::ssh_installer::credentials`]).
+///
+/// A no-op when nothing was generated. File-write failures are logged, never
+/// fatal — the passwords are already on stdout, and failing an otherwise-good
+/// install just because a log file couldn't be written would be strictly worse.
+fn report_generated_credentials(
+    generated: &[uaa_core::network::ssh_installer::credentials::GeneratedCredential],
+    host_label: &str,
+    address: &str,
+) {
+    use uaa_core::network::ssh_installer::credentials::{
+        format_credentials_report, write_credentials_file,
+    };
+    if generated.is_empty() {
+        return;
+    }
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let report = format_credentials_report(host_label, address, &timestamp, generated);
+
+    println!("\n=== GENERATED CREDENTIALS (random per-host — save these now) ===");
+    print!("{report}");
+    println!("================================================================");
+    match write_credentials_file(host_label, &report) {
+        Ok(path) => println!("Saved to {} (0600, root-only)", path.display()),
+        Err(e) => warn!("Could not persist credentials file (passwords are printed above): {e}"),
+    }
 }
 
 /// Print system investigation results in a consistent format.
