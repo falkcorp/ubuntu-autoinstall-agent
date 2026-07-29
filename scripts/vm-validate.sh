@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.2.0
+# version: 1.3.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
-# last-edited: 2026-07-23
+# last-edited: 2026-07-29
 #
 # QEMU+swtpm VM validation gate. THIS SCRIPT PASSING IS THE GATE — no hardware
 # attempt or len-serv-003 wipe before it passes.
@@ -241,6 +241,15 @@ stage_echo 1 workspace
 WS_LOG="$WORKDIR/logs/01-workspace.log"
 : > "$WS_LOG"
 
+# Serial for the virtio target disk. Giving the disk a serial is what makes the
+# guest publish /dev/disk/by-id/virtio-<serial> (with -part1/-part2/... children).
+# NativeKeystore addresses its roster by *by-id* path and appends `-partN`, so
+# without a serial there is simply no by-id node and a native-keystore config
+# cannot be validated in the VM at all. Plain `/dev/vda` would not do: its
+# partitions are `vda1`, not `vda-part1`. Harmless for the PlainLuks configs,
+# which keep using the kernel name /dev/vda.
+VM_DISK_SERIAL="UAAVMDISK0"
+
 DISK_IMG="$WORKDIR/disk.qcow2"
 qemu-img create -f qcow2 "$DISK_IMG" "$DISK_SIZE" >>"$WS_LOG" 2>&1
 
@@ -293,7 +302,8 @@ QEMU_ISO_ARGS=(
   -m 4096
   -smp 2
   "${FIRMWARE_ARGS[@]}"
-  -drive "file=${DISK_IMG},if=virtio,format=qcow2"
+  -drive "file=${DISK_IMG},if=none,id=uaavd0,format=qcow2"
+  -device "virtio-blk-pci,drive=uaavd0,serial=${VM_DISK_SERIAL}"
   -cdrom "$ISO"
   -boot "order=dc"
   -chardev "socket,id=chrtpm,path=${SWTPM_SOCK}"
@@ -444,7 +454,8 @@ QEMU_DISK_ARGS=(
   -m 4096
   -smp 2
   "${FIRMWARE_ARGS[@]}"
-  -drive "file=${DISK_IMG},if=virtio,format=qcow2"
+  -drive "file=${DISK_IMG},if=none,id=uaavd0,format=qcow2"
+  -device "virtio-blk-pci,drive=uaavd0,serial=${VM_DISK_SERIAL}"
   -boot "order=c"
   -chardev "socket,id=chrtpm,path=${SWTPM_SOCK}"
   -tpmdev "emulator,id=tpm0,chardev=chrtpm"
