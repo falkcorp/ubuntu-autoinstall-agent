@@ -151,8 +151,16 @@ SSH_OPTS=(-p "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/
 ssh_run() {
   local tmo="$1" user="$2" cmd="$3"
   local base=(ssh "${SSH_OPTS[@]}" "${user}@127.0.0.1")
-  if [ "$HAVE_SSHPASS" = 1 ] && [ "$user" = "$SSH_USER" ]; then
-    base=(sshpass -p "$SSH_LIVE_PASSWORD" "${base[@]}")
+  if [ "$user" = "$SSH_USER" ]; then
+    if [ "$HAVE_SSHPASS" = 1 ]; then
+      base=(sshpass -p "$SSH_LIVE_PASSWORD" "${base[@]}")
+    elif [ "$HAVE_ASKPASS" = 1 ]; then
+      # setsid detaches from the controlling TTY so ssh actually consults
+      # SSH_ASKPASS instead of prompting on the terminal.
+      base=(setsid -w env "SSH_ASKPASS=$ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force
+            DISPLAY=  "${base[@]}" -o PreferredAuthentications=password
+            -o PubkeyAuthentication=no)
+    fi
   fi
   if [ "$tmo" -gt 0 ]; then
     timeout "$tmo" "${base[@]}" "$cmd"
@@ -165,8 +173,14 @@ ssh_run() {
 scp_run() {
   local src="$1" dst="$2" user="${3:-$SSH_USER}"
   local base=(scp -P "$SSH_PORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
-  if [ "$HAVE_SSHPASS" = 1 ] && [ "$user" = "$SSH_USER" ]; then
-    base=(sshpass -p "$SSH_LIVE_PASSWORD" "${base[@]}")
+  if [ "$user" = "$SSH_USER" ]; then
+    if [ "$HAVE_SSHPASS" = 1 ]; then
+      base=(sshpass -p "$SSH_LIVE_PASSWORD" "${base[@]}")
+    elif [ "$HAVE_ASKPASS" = 1 ]; then
+      base=(setsid -w env "SSH_ASKPASS=$ASKPASS_HELPER" SSH_ASKPASS_REQUIRE=force
+            DISPLAY= "${base[@]}" -o PreferredAuthentications=password
+            -o PubkeyAuthentication=no)
+    fi
   fi
   "${base[@]}" "$src" "${user}@127.0.0.1:${dst}"
 }
@@ -197,11 +211,28 @@ for bin in qemu-system-x86_64 swtpm qemu-img ssh scp; do
   command -v "$bin" >/dev/null 2>&1 || die "missing required tool '$bin' — install it (e.g. qemu-system-x86, swtpm, openssh-client packages)"
 done
 
+        # Live-session password auth, in preference order:
+#   1. sshpass, when installed;
+#   2. SSH_ASKPASS + SSH_ASKPASS_REQUIRE=force (OpenSSH >= 8.4), which feeds
+#      the password with no TTY and no extra package — sshpass needs root to
+#      install, and the harness must stay runnable as an unprivileged user in
+#      the `kvm` group;
+#   3. key-only, which requires the operator key matching
+#      installer-image/nocloud/user-data to be loaded in an agent.
+# The password is the throwaway live-session one ("default"), never a target
+# secret, so writing it to a 0700 helper inside WORKDIR is not a secret leak.
 HAVE_SSHPASS=0
+HAVE_ASKPASS=0
+ASKPASS_HELPER="$WORKDIR/.askpass.sh"
 if command -v sshpass >/dev/null 2>&1; then
   HAVE_SSHPASS=1
+elif ssh -V 2>&1 | grep -qE 'OpenSSH_(8\.[4-9]|9\.|1[0-9]\.)'; then
+  printf '#!/bin/sh\nprintf %%s %s\n' "$SSH_LIVE_PASSWORD" > "$ASKPASS_HELPER"
+  chmod 700 "$ASKPASS_HELPER"
+  HAVE_ASKPASS=1
+  echo "INFO: sshpass not found — using SSH_ASKPASS_REQUIRE=force for the live-session password login" | tee -a "$PRE_LOG"
 else
-  echo "WARN: sshpass not found — falling back to key-only SSH auth for the live-session login (needs the operator key loaded, e.g. in an ssh-agent)" | tee -a "$PRE_LOG" >&2
+  echo "WARN: sshpass not found and OpenSSH too old for SSH_ASKPASS_REQUIRE — falling back to key-only SSH auth for the live-session login (needs the operator key loaded, e.g. in an ssh-agent)" | tee -a "$PRE_LOG" >&2
 fi
 
 HAVE_SOCAT=0
