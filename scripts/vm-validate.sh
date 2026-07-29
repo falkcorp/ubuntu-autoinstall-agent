@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.4.0
+# version: 1.5.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
 # last-edited: 2026-07-29
 #
@@ -305,9 +305,18 @@ SWTPM_PIDFILE="$WORKDIR/swtpm.pid"
 # a boot hang or a stuck passphrase prompt on a VM that was in fact never
 # started. Hence: a restartable helper, called again before stage 5.
 # The tpmstate dir is REUSED so TPM state (and anything sealed to it) persists.
+# Liveness is the PROCESS, not the socket file: swtpm can die and leave a stale
+# socket inode behind, and a check that only tests `-S` would then report a
+# healthy TPM while qemu fails to connect to it.
+swtpm_alive() {
+  local pid
+  pid="$(cat "$SWTPM_PIDFILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ -S "$SWTPM_SOCK" ]
+}
+
 start_swtpm() {
-  [ -S "$SWTPM_SOCK" ] && return 0
-  rm -f "$SWTPM_PIDFILE"
+  swtpm_alive && return 0
+  rm -f "$SWTPM_PIDFILE" "$SWTPM_SOCK"
   swtpm socket \
     --tpmstate "dir=${WORKDIR}/tpmstate" \
     --ctrl "type=unixio,path=${SWTPM_SOCK}" \
@@ -456,16 +465,6 @@ stage_echo 5 boot-disk
 BOOT_DISK_LOG="$WORKDIR/logs/05-boot-disk.log"
 : > "$BOOT_DISK_LOG"
 
-# The stage-2/4 VM took swtpm down with it when it disconnected; bring it back
-# (same tpmstate) or the disk-boot qemu below silently fails to start.
-start_swtpm
-SWTPM_WAITED=0
-while [ ! -S "$SWTPM_SOCK" ]; do
-  sleep 1
-  SWTPM_WAITED=$((SWTPM_WAITED + 1))
-  [ "$SWTPM_WAITED" -ge 20 ] && fail_stage 5 "swtpm socket never reappeared at $SWTPM_SOCK for the disk boot"
-done
-SWTPM_PID="$(cat "$SWTPM_PIDFILE" 2>/dev/null || echo "$SWTPM_PID")"
 
 if ssh_run 20 "$SSH_USER" "sudo poweroff" >>"$BOOT_DISK_LOG" 2>&1; then
   echo "poweroff issued over ssh" >>"$BOOT_DISK_LOG"
@@ -487,6 +486,23 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
 done
 wait "$QEMU_PID" 2>/dev/null || true
 QEMU_PID=""
+
+# swtpm dies WITH the ISO-boot VM (it exits when its QEMU client disconnects),
+# so it must be restarted HERE — after that VM has actually exited, and before
+# the disk-boot qemu below. Doing it any earlier is useless: the socket still
+# exists while the old VM lives, so the liveness check short-circuits and swtpm
+# is gone again by launch time. Without this the disk-boot qemu fails to start
+# outright, never binds its hostfwd port, and stage 5 reports "SSH did not come
+# up ... check for a stuck LUKS passphrase prompt" for a VM that never ran.
+start_swtpm
+SWTPM_WAITED=0
+while ! swtpm_alive; do
+  sleep 1
+  SWTPM_WAITED=$((SWTPM_WAITED + 1))
+  [ "$SWTPM_WAITED" -ge 20 ] && fail_stage 5 "swtpm did not come back for the disk boot (socket $SWTPM_SOCK)"
+done
+SWTPM_PID="$(cat "$SWTPM_PIDFILE" 2>/dev/null || echo "$SWTPM_PID")"
+echo "swtpm ready for disk boot: pid=$SWTPM_PID" >>"$BOOT_DISK_LOG"
 
 # The first boot of the installed disk may pause at a LUKS passphrase prompt
 # (TPM2+PIN auto-unlock is enrolled by a first-boot oneshot unit — see
