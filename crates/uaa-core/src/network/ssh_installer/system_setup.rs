@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.25.0
+// version: 2.26.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-27
 
@@ -471,7 +471,18 @@ impl<'a> SystemConfigurator<'a> {
         // clevis-tpm2 or the tpm2 share silently fails to unlock in the
         // initramfs (and the clevis-pin-tpm2 / tpm2-tss dracut modules refuse to
         // install for lack of clevis-decrypt-tpm2 + the tpm2 binary).
-        let clevis_pkgs = if !config.tang_servers.is_empty() {
+        // NativeKeystore ALWAYS needs clevis, even with no Tang servers: the
+        // `91uaa-keystore-wait` dracut module is installed unconditionally for
+        // that storage mode and its `depends()` lists clevis (+ the tang/tpm2/sss
+        // pins). Gating clevis on `tang_servers` alone meant a Tang-less
+        // native-keystore install wrote a module that could never be built, and
+        // `dracut --regenerate-all` died mid-Phase-5 with
+        //   "Module 'uaa-keystore-wait' depends on module 'clevis', which can't
+        //    be installed"
+        // after the pools were already created. Caught by the VM gate.
+        let needs_clevis =
+            !config.tang_servers.is_empty() || config.storage_mode == StorageMode::NativeKeystore;
+        let clevis_pkgs = if needs_clevis {
             let base = match config.initramfs_type {
                 InitramfsType::Dracut => " clevis clevis-luks clevis-dracut clevis-systemd",
                 InitramfsType::InitramfsTools => " clevis clevis-luks clevis-initramfs",
