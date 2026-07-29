@@ -1,5 +1,5 @@
 # file: crates/uaa-core/tests/fixtures/components/vm-test.yaml
-# version: 1.0.0
+# version: 1.1.0
 # guid: 8f2b4b2e-7d0e-4c1a-9d3e-1a2b3c4d5e05
 # last-edited: 2026-07-24
 #
@@ -43,7 +43,7 @@ host:
       -----BEGIN CERTIFICATE-----
       VMTESTFAKECERTNOTAREALSECRET
       -----END CERTIFICATE-----
-    network_interface: enp0s3
+    network_interface: ens4
     network_address: 10.0.2.15/24
     network_gateway: 10.0.2.2
     network_search: vm.local
