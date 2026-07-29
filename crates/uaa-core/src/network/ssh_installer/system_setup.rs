@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.26.0
+// version: 2.27.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-07-27
 
@@ -1344,8 +1344,20 @@ impl<'a> SystemConfigurator<'a> {
             // export fails with the pool busy). No-op on PlainLuks (|| true).
             ("Unmounting keystore", "umount /run/keystore/rpool 2>/dev/null || true"),
             ("Closing keystore LUKS mapper", "cryptsetup status keystore-rpool >/dev/null 2>&1 && cryptsetup close keystore-rpool || true"),
-            ("Exporting bpool", "zpool export bpool || true"),
-            ("Exporting rpool", "zpool export rpool || true"),
+            // Closing the mapper is asynchronous: udev still has the zvol node
+            // open for a moment afterwards. Settle before exporting, or the
+            // export blocks on the still-referenced /dev/zvol/rpool/keystore.
+            ("Settle udev before pool export", "udevadm settle --timeout=30 || true"),
+            // Every export is wrapped in `timeout` and falls back to `-f`.
+            // `|| true` alone is NOT enough: a busy pool makes `zpool export`
+            // BLOCK rather than fail, and an unbounded block here hangs the
+            // whole install after every phase has already succeeded (observed
+            // on the VM gate: Phase 6 stuck ~47min on `zpool export rpool`
+            // until the harness timed out and failed an otherwise-good run).
+            // Leaving a pool imported is harmless — /etc/hostid matches the
+            // pool, so the next boot imports it from the cachefile normally.
+            ("Exporting bpool", "timeout 120 zpool export bpool || timeout 60 zpool export -f bpool || true"),
+            ("Exporting rpool", "timeout 120 zpool export rpool || timeout 60 zpool export -f rpool || true"),
             ("Unmounting /mnt/luks if mounted", "mountpoint -q /mnt/luks && umount -lf /mnt/luks || true"),
             ("Closing LUKS mapper if open", "cryptsetup status luks >/dev/null 2>&1 && cryptsetup close luks || true"),
         ] {
