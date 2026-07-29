@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.3.0
+# version: 1.4.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
 # last-edited: 2026-07-29
 #
@@ -296,10 +296,24 @@ fi
 
 SWTPM_SOCK="$WORKDIR/swtpm.sock"
 SWTPM_PIDFILE="$WORKDIR/swtpm.pid"
-swtpm socket \
-  --tpmstate "dir=${WORKDIR}/tpmstate" \
-  --ctrl "type=unixio,path=${SWTPM_SOCK}" \
-  --tpm2 --daemon --pid "file=${SWTPM_PIDFILE}" >>"$WS_LOG" 2>&1
+
+# swtpm exits once its QEMU client disconnects, so it does NOT survive from the
+# ISO-boot VM (stage 2/4) to the disk-boot VM (stage 5). Starting it only once
+# meant stage 5's qemu could not attach a TPM, failed to launch at all, never
+# bound its hostfwd port, and the harness then spent 600s collecting
+# "Connection refused" before reporting "SSH did not come up" — which reads like
+# a boot hang or a stuck passphrase prompt on a VM that was in fact never
+# started. Hence: a restartable helper, called again before stage 5.
+# The tpmstate dir is REUSED so TPM state (and anything sealed to it) persists.
+start_swtpm() {
+  [ -S "$SWTPM_SOCK" ] && return 0
+  rm -f "$SWTPM_PIDFILE"
+  swtpm socket \
+    --tpmstate "dir=${WORKDIR}/tpmstate" \
+    --ctrl "type=unixio,path=${SWTPM_SOCK}" \
+    --tpm2 --daemon --pid "file=${SWTPM_PIDFILE}" >>"$WS_LOG" 2>&1
+}
+start_swtpm
 
 # Read the pidfile as soon as it appears (before waiting on the socket) so
 # `cleanup` can always kill our own swtpm daemon, even if the socket-wait
@@ -441,6 +455,17 @@ echo "install OK: exit=0, ${PHASE_COMPLETED_COUNT} phases completed" | tee -a "$
 stage_echo 5 boot-disk
 BOOT_DISK_LOG="$WORKDIR/logs/05-boot-disk.log"
 : > "$BOOT_DISK_LOG"
+
+# The stage-2/4 VM took swtpm down with it when it disconnected; bring it back
+# (same tpmstate) or the disk-boot qemu below silently fails to start.
+start_swtpm
+SWTPM_WAITED=0
+while [ ! -S "$SWTPM_SOCK" ]; do
+  sleep 1
+  SWTPM_WAITED=$((SWTPM_WAITED + 1))
+  [ "$SWTPM_WAITED" -ge 20 ] && fail_stage 5 "swtpm socket never reappeared at $SWTPM_SOCK for the disk boot"
+done
+SWTPM_PID="$(cat "$SWTPM_PIDFILE" 2>/dev/null || echo "$SWTPM_PID")"
 
 if ssh_run 20 "$SSH_USER" "sudo poweroff" >>"$BOOT_DISK_LOG" 2>&1; then
   echo "poweroff issued over ssh" >>"$BOOT_DISK_LOG"
