@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/zfs_native.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: bca3258c-2a81-4e7d-a50b-50128c83b2cc
-// last-edited: 2026-07-27
+// last-edited: 2026-07-29
 
 //! ZFS **native-encryption** pool + keystore builder for
 //! [`StorageMode::NativeKeystore`] (U1 / the future server profile) — Phase 3's
@@ -69,12 +69,18 @@ impl<'a> ZfsNativeManager<'a> {
             .map_err(|e| crate::error::AutoInstallError::ConfigError(e.to_string()))?;
         let sys: Vec<&str> = plan.system_disks().map(|d| d.id.as_str()).collect();
         let spec: Vec<&str> = plan.special_disks().map(|d| d.id.as_str()).collect();
-        // plan_layout guarantees >=2 of each, so these indexes are safe.
-        // bpool + data live on the bootable SATA SSDs (System p2/p3); the special
-        // metadata mirror lives on the Optanes' half-disk p1.
-        let bpool_members = format!("{}-part2 {}-part2", sys[0], sys[1]);
-        let data_members = format!("{}-part3 {}-part3", sys[0], sys[1]);
-        let special_members = format!("{}-part1 {}-part1", spec[0], spec[1]);
+        // Topology follows the roster (plan_layout guarantees >=1 system and
+        // never exactly 1 special): bpool + data live on the System disks
+        // (p2/p3), the special metadata vdev on the Special disks' half-disk p1.
+        // Two or more members mirror; a lone System disk builds a single vdev,
+        // and an empty Special set omits the special vdev entirely.
+        let bpool_vdev = vdev_spec(&sys, 2);
+        let data_vdev = vdev_spec(&sys, 3);
+        let special_vdev = if spec.is_empty() {
+            String::new()
+        } else {
+            format!(" special {}", vdev_spec(&spec, 1))
+        };
 
         self.log_and_execute("Ensure altroot", "mkdir -p /mnt/targetos")
             .await?;
@@ -82,8 +88,8 @@ impl<'a> ZfsNativeManager<'a> {
         self.variables.insert("UUID".to_string(), uuid.clone());
         info!("NativeKeystore pools: install uuid = {uuid}");
 
-        self.create_bpool(&bpool_members).await?;
-        self.create_rpool(&data_members, &special_members).await?;
+        self.create_bpool(&bpool_vdev).await?;
+        self.create_rpool(&data_vdev, &special_vdev).await?;
         self.create_keystore(config).await?;
         // Load-bearing order (see zfs_ops): rpool ROOT datasets (mount `/`)
         // BEFORE bpool BOOT (mount `/boot`), so /boot lands on top of / and
@@ -95,23 +101,32 @@ impl<'a> ZfsNativeManager<'a> {
         Ok(())
     }
 
-    /// bpool: GRUB-compatible mirror across the two System SSD `p2`s (feature
-    /// set mirrors `zfs_ops::build_bpool_create_command`).
-    async fn create_bpool(&mut self, members: &str) -> Result<()> {
+    /// bpool: GRUB-compatible pool across the System disks' `p2` — a mirror when
+    /// the roster has two or more, a single vdev on a one-disk host (feature set
+    /// mirrors `zfs_ops::build_bpool_create_command`).
+    ///
+    /// `vdev` is the already-rendered spec (e.g. `mirror A-part2 B-part2` or a
+    /// bare `A-part2`), so the mirrored and single-disk paths share one command.
+    async fn create_bpool(&mut self, vdev: &str) -> Result<()> {
         let cmd = format!(
             "zpool create -f -o ashift=12 -o autotrim=on -o cachefile=/etc/zfs/zpool.cache \
              -o compatibility=grub2 -o feature@livelist=enabled -o feature@zpool_checkpoint=enabled \
              -O devices=off -O acltype=posixacl -O xattr=sa -O compression=lz4 \
              -O normalization=formD -O relatime=on -O canmount=off -O mountpoint=none \
-             -m none -R /mnt/targetos bpool mirror {members}"
+             -m none -R /mnt/targetos bpool {vdev}"
         );
-        self.log_and_execute("Creating bpool (mirror of System SSD p2)", &cmd)
+        self.log_and_execute("Creating bpool (System disk p2)", &cmd)
             .await
     }
 
-    /// rpool: data mirror(System SSD p3) + special metadata mirror(Optane p1),
-    /// root UNENCRYPTED (encryption lives on rpool/ROOT + rpool/USERDATA).
-    async fn create_rpool(&mut self, data_members: &str, special_members: &str) -> Result<()> {
+    /// rpool: data vdev (System p3) plus an optional special metadata vdev
+    /// (Special p1), root UNENCRYPTED (encryption lives on rpool/ROOT +
+    /// rpool/USERDATA).
+    ///
+    /// `data_vdev` is a rendered spec (`mirror A-part3 B-part3` or bare
+    /// `A-part3`); `special_vdev` is either empty (single-disk / no Special
+    /// disks) or a leading-space ` special mirror C-part1 D-part1`.
+    async fn create_rpool(&mut self, data_vdev: &str, special_vdev: &str) -> Result<()> {
         // `cachefile=/etc/zfs/zpool.cache` is MANDATORY and was missing — the
         // single most important line in the whole install. Importing with
         // `-R /mnt/targetos` (altroot) defaults `cachefile=none`, so without an
@@ -126,9 +141,9 @@ impl<'a> ZfsNativeManager<'a> {
              -O acltype=posixacl -O xattr=sa -O dnodesize=auto -O compression=lz4 \
              -O normalization=formD -O relatime=on -O special_small_blocks=0 \
              -O canmount=off -O mountpoint=none -m none -R /mnt/targetos \
-             rpool mirror {data_members} special mirror {special_members}"
+             rpool {data_vdev}{special_vdev}"
         );
-        self.log_and_execute("Creating rpool (data mirror + special mirror)", &cmd)
+        self.log_and_execute("Creating rpool (data vdev + optional special)", &cmd)
             .await
     }
 
@@ -309,6 +324,31 @@ fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// Render a `zpool create` vdev spec for `disks`, each addressed by partition
+/// number `part` (`<by-id>-part<N>`).
+///
+/// Two or more disks become a `mirror`; a lone disk is a bare single vdev.
+/// Emitting the `mirror` keyword for one device would be a `zpool` syntax
+/// error, so the distinction is load-bearing, not cosmetic — it is what lets a
+/// single-NVMe host use the same NativeKeystore path as the mirrored U1
+/// roster. Empty input yields an empty string; callers omit the vdev entirely
+/// in that case (see the optional `special` vdev).
+fn vdev_spec(disks: &[&str], part: u32) -> String {
+    if disks.is_empty() {
+        return String::new();
+    }
+    let members = disks
+        .iter()
+        .map(|d| format!("{d}-part{part}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if disks.len() >= 2 {
+        format!("mirror {members}")
+    } else {
+        members
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +357,47 @@ mod tests {
     fn passphrase_escaping_is_single_quote_safe() {
         assert_eq!(shell_single_quote_escape("plain"), "plain");
         assert_eq!(shell_single_quote_escape("a'b"), "a'\\''b");
+    }
+
+    /// The U1 (2-disk) rendering must be EXACTLY what the pre-single-disk code
+    /// emitted — `mirror A-partN B-partN` — or the hardware-validated install
+    /// changes behaviour underneath us.
+    #[test]
+    fn vdev_spec_two_disks_renders_mirror_byte_identical() {
+        let disks = ["/dev/disk/by-id/ata-CRUCIAL_0", "/dev/disk/by-id/ata-CRUCIAL_1"];
+        assert_eq!(
+            vdev_spec(&disks, 2),
+            "mirror /dev/disk/by-id/ata-CRUCIAL_0-part2 /dev/disk/by-id/ata-CRUCIAL_1-part2"
+        );
+        assert_eq!(
+            vdev_spec(&disks, 3),
+            "mirror /dev/disk/by-id/ata-CRUCIAL_0-part3 /dev/disk/by-id/ata-CRUCIAL_1-part3"
+        );
+    }
+
+    /// A lone disk must NOT emit the `mirror` keyword — `zpool create rpool
+    /// mirror /dev/x` is a syntax error, so this is correctness, not style.
+    #[test]
+    fn vdev_spec_single_disk_has_no_mirror_keyword() {
+        let disks = ["/dev/disk/by-id/nvme-WDC_ONLY"];
+        let spec = vdev_spec(&disks, 3);
+        assert_eq!(spec, "/dev/disk/by-id/nvme-WDC_ONLY-part3");
+        assert!(!spec.contains("mirror"), "single vdev must not say 'mirror': {spec}");
+    }
+
+    /// No Special disks → empty spec, so the caller omits the `special` vdev
+    /// entirely rather than emitting a dangling `special` keyword.
+    #[test]
+    fn vdev_spec_empty_roster_is_empty() {
+        let none: [&str; 0] = [];
+        assert_eq!(vdev_spec(&none, 1), "");
+    }
+
+    /// Three or more disks still mirror across every member.
+    #[test]
+    fn vdev_spec_three_disks_mirrors_all_members() {
+        let disks = ["/dev/a", "/dev/b", "/dev/c"];
+        assert_eq!(vdev_spec(&disks, 1), "mirror /dev/a-part1 /dev/b-part1 /dev/c-part1");
     }
 
     #[test]

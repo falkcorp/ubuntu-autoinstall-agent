@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/layout.rs
-// version: 2.0.1
+// version: 2.1.0
 // guid: 95e0d672-e175-4029-b56a-a025267f71d2
-// last-edited: 2026-07-23
+// last-edited: 2026-07-29
 
 //! Pure partition planner for the [`StorageMode::NativeKeystore`] (U1) layout.
 //!
@@ -178,10 +178,17 @@ pub enum LayoutError {
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LayoutError::NotEnoughDisks { role, found } => write!(
-                f,
-                "NativeKeystore needs at least 2 {role:?} disks to mirror, found {found}"
-            ),
+            LayoutError::NotEnoughDisks { role, found } => match role {
+                DiskRole::System => write!(
+                    f,
+                    "NativeKeystore needs at least 1 System disk, found {found}"
+                ),
+                DiskRole::Special => write!(
+                    f,
+                    "NativeKeystore needs 0 or at least 2 Special disks (a lone Special disk \
+                     cannot be mirrored), found {found}"
+                ),
+            },
             LayoutError::DuplicateDisk(id) => write!(f, "duplicate disk id in roster: {id}"),
             LayoutError::EmptyDiskId => write!(f, "roster contains a disk with an empty id"),
         }
@@ -238,9 +245,19 @@ fn special_partitions(disk_index: usize) -> Vec<Partition> {
 /// single half-disk `special` member. Ordering in the output is all system
 /// disks (roster order) then all special disks, each numbered within its role.
 ///
+/// The pool *topology* is derived from the roster size by
+/// [`super::zfs_native`]: one System disk builds single (unmirrored) `bpool`
+/// and `rpool` vdevs, two or more build mirrors; an empty Special set omits the
+/// `special` vdev entirely. That makes a single-disk host (e.g. a Lenovo tiny
+/// with one NVMe) a first-class NativeKeystore target — it still gets ZFS
+/// native encryption and the LUKS keystore zvol, just without redundancy.
+///
 /// # Errors
-/// Returns [`LayoutError`] when the roster has an empty/duplicate id, or cannot
-/// form the mirrors the design mandates (fewer than two disks of either role).
+/// Returns [`LayoutError`] when the roster has an empty/duplicate id, contains
+/// no System disk at all, or contains exactly one Special disk (a lone Special
+/// cannot be mirrored, and an unmirrored metadata vdev would make a single
+/// device failure fatal to the whole pool — so that shape is rejected rather
+/// than silently built).
 pub fn plan_layout(disks: &[DiskSpec]) -> Result<PartitionPlan, LayoutError> {
     // Reject empty and duplicate ids up front — a partitioner that ran against a
     // blank or repeated by-id path would wipe the wrong (or same) device twice.
@@ -257,16 +274,21 @@ pub fn plan_layout(disks: &[DiskSpec]) -> Result<PartitionPlan, LayoutError> {
     let system: Vec<&DiskSpec> = disks.iter().filter(|d| d.role == DiskRole::System).collect();
     let special: Vec<&DiskSpec> = disks.iter().filter(|d| d.role == DiskRole::Special).collect();
 
-    if system.len() < 2 {
+    // At least one System disk is required — it carries ESP + bpool + rpool
+    // data, so with none there is nothing to install onto.
+    if system.is_empty() {
         return Err(LayoutError::NotEnoughDisks {
             role: DiskRole::System,
-            found: system.len(),
+            found: 0,
         });
     }
-    if special.len() < 2 {
+    // Special disks are optional (single-disk hosts have none), but a *lone*
+    // Special is rejected: an unmirrored special vdev makes one device failure
+    // destroy the entire pool, which is never what the operator meant.
+    if special.len() == 1 {
         return Err(LayoutError::NotEnoughDisks {
             role: DiskRole::Special,
-            found: special.len(),
+            found: 1,
         });
     }
 
@@ -407,8 +429,11 @@ mod tests {
         }
     }
 
+    /// One System disk is now a legitimate roster (single-disk hosts like a
+    /// Lenovo tiny with one NVMe) — it plans the same ESP+bpool+data trio, and
+    /// the unmirrored pool topology is applied later by `zfs_native`.
     #[test]
-    fn rejects_single_system_disk() {
+    fn accepts_single_system_disk_with_special_mirror() {
         let roster = vec![
             DiskSpec {
                 id: "/dev/disk/by-id/ssd0".to_string(),
@@ -423,11 +448,52 @@ mod tests {
                 role: DiskRole::Special,
             },
         ];
+        let plan = plan_layout(&roster).expect("one system disk is a valid roster");
+        assert_eq!(plan.system_disks().count(), 1);
+        assert_eq!(plan.special_disks().count(), 2);
+        let sys0: Vec<_> = plan.system_disks().next().unwrap().partitions.iter().collect();
+        assert_eq!(sys0.len(), 3, "ESP + bpool + data even on a lone disk");
+        assert_eq!(sys0[0].label, "ESP1");
+        assert_eq!(sys0[1].label, "bpool-0");
+        assert_eq!(sys0[2].label, "data-0");
+    }
+
+    /// The single-disk NativeKeystore shape used by a one-NVMe host: exactly
+    /// one System disk and NO Special disks at all.
+    #[test]
+    fn accepts_single_disk_roster_with_no_special() {
+        let roster = vec![DiskSpec {
+            id: "/dev/disk/by-id/nvme-ONLY".to_string(),
+            role: DiskRole::System,
+        }];
+        let plan = plan_layout(&roster).expect("single-disk native-keystore roster is valid");
+        assert_eq!(plan.system_disks().count(), 1);
+        assert_eq!(plan.special_disks().count(), 0, "no special vdev on a 1-disk host");
+        let parts: Vec<_> = plan.system_disks().next().unwrap().partitions.iter().collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].kind, PartKind::Esp);
+        assert_eq!(parts[1].kind, PartKind::Bpool);
+        assert_eq!(parts[2].kind, PartKind::Data);
+    }
+
+    /// An empty roster still fails closed — there is nothing to install onto.
+    #[test]
+    fn rejects_roster_with_no_system_disk() {
+        let roster = vec![
+            DiskSpec {
+                id: "/dev/disk/by-id/optane0".to_string(),
+                role: DiskRole::Special,
+            },
+            DiskSpec {
+                id: "/dev/disk/by-id/optane1".to_string(),
+                role: DiskRole::Special,
+            },
+        ];
         assert_eq!(
             plan_layout(&roster),
             Err(LayoutError::NotEnoughDisks {
                 role: DiskRole::System,
-                found: 1,
+                found: 0,
             })
         );
     }
