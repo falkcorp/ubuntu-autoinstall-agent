@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.5.0
+# version: 1.6.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
 # last-edited: 2026-07-29
 #
@@ -577,19 +577,38 @@ stage_echo 6 assert
 ASSERT_LOG="$WORKDIR/logs/06-assert.log"
 : > "$ASSERT_LOG"
 
-# NOTE (PS-VMGATE-19, out of scope here): the LUKS unlock + ZFS pool-import
-# assertions immediately below are storage-mode-specific (they assume the
-# ZfsLuks storage mode this VM gate exercises today). A pure arm64/tang-only
-# config that does not use that storage mode will need role/storage-mode
-# gating added to this block in a future brief before it can fully pass —
-# do not assume these two checks are storage-mode-generic.
-CRYPT_OUT="$(ssh_run 30 root "cryptsetup status luks" 2>&1 || true)"
-echo "$CRYPT_OUT" >>"$ASSERT_LOG"
-if echo "$CRYPT_OUT" | grep -q "is active"; then
-  echo "PASS: LUKS unlocked (cryptsetup status luks: is active)" | tee -a "$ASSERT_LOG"
+# The encryption assertion is storage-mode-specific (the NOTE that used to live
+# here flagged exactly this). The two modes protect the root pool by completely
+# different mechanisms, so asserting one against the other is meaningless:
+#
+#   plain-luks      whole device is LUKS, ZFS sits on the mapper -> assert the
+#                   `luks` mapper is active.
+#   native-keystore encryption is ZFS-NATIVE on rpool/ROOT, keyed from a LUKS
+#                   keystore zvol that the initramfs hook opens and may close
+#                   again once the key is loaded. There is no `luks` mapper at
+#                   all and crypttab is deliberately empty, so `cryptsetup
+#                   status luks` can never say "is active" no matter how
+#                   healthy the system is -> assert the dataset really is
+#                   encrypted and its key is loaded.
+if grep -qE '^[[:space:]]*storage_mode:[[:space:]]*native-keystore' "$CONFIG"; then
+  ENC_OUT="$(ssh_run 30 root "zfs get -H -o value encryption rpool/ROOT" 2>&1 || true)"
+  KEY_OUT="$(ssh_run 30 root "zfs get -H -o value keystatus rpool/ROOT" 2>&1 || true)"
+  echo "encryption=$ENC_OUT keystatus=$KEY_OUT" >>"$ASSERT_LOG"
+  if echo "$ENC_OUT" | grep -qE "^aes-[0-9]+-(gcm|ccm)$" && echo "$KEY_OUT" | grep -q "available"; then
+    echo "PASS: ZFS native encryption active (rpool/ROOT encryption=$ENC_OUT keystatus=$KEY_OUT)" | tee -a "$ASSERT_LOG"
+  else
+    echo "FAIL: rpool/ROOT not natively encrypted with its key loaded — encryption=$ENC_OUT keystatus=$KEY_OUT" | tee -a "$ASSERT_LOG"
+    fail_stage 6 "rpool/ROOT encryption/keystatus wrong (got encryption=$ENC_OUT keystatus=$KEY_OUT)"
+  fi
 else
-  echo "FAIL: LUKS not active — got: $CRYPT_OUT" | tee -a "$ASSERT_LOG"
-  fail_stage 6 "cryptsetup status luks did not report 'is active'"
+  CRYPT_OUT="$(ssh_run 30 root "cryptsetup status luks" 2>&1 || true)"
+  echo "$CRYPT_OUT" >>"$ASSERT_LOG"
+  if echo "$CRYPT_OUT" | grep -q "is active"; then
+    echo "PASS: LUKS unlocked (cryptsetup status luks: is active)" | tee -a "$ASSERT_LOG"
+  else
+    echo "FAIL: LUKS not active — got: $CRYPT_OUT" | tee -a "$ASSERT_LOG"
+    fail_stage 6 "cryptsetup status luks did not report 'is active'"
+  fi
 fi
 
 ZPOOL_OUT="$(ssh_run 30 root "zpool list -H -o name" 2>&1 || true)"
