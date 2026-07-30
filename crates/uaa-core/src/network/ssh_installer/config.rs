@@ -72,6 +72,38 @@ pub struct TangServer {
 pub enum ApplicationSpec {
     Cockroach(CockroachSpec),
     TangServer(TangServerSpec),
+    CockroachRolloutAgent(CockroachRolloutAgentSpec),
+    PrometheusNodeExporter(PrometheusNodeExporterSpec),
+    CanonicalLivepatch(CanonicalLivepatchSpec),
+    ReportStatus(ReportStatusSpec),
+    Zsh(ZshSpec),
+}
+
+impl ApplicationSpec {
+    /// The wire `kind` tag for this variant.
+    ///
+    /// SINGLE SOURCE OF TRUTH. These strings previously lived in three
+    /// unrelated places — `applications.rs`'s `reject_duplicates`,
+    /// `profile/merge.rs`'s `app_kind`, and `scripts/vm-validate.sh` — with
+    /// nothing tying them together, so adding a variant meant remembering
+    /// three edits and a missed one silently degraded duplicate-rejection or
+    /// merge-by-kind. The match below is exhaustive, so adding a variant to
+    /// the enum without adding its tag here is now a COMPILE error.
+    ///
+    /// Must stay byte-identical to serde's `rename_all = "kebab-case"`
+    /// rendering of the variant name — `config.rs`'s `kind_tags_match_serde`
+    /// test asserts that against actual serialization.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            ApplicationSpec::Cockroach(_) => "cockroach",
+            ApplicationSpec::TangServer(_) => "tang-server",
+            ApplicationSpec::CockroachRolloutAgent(_) => "cockroach-rollout-agent",
+            ApplicationSpec::PrometheusNodeExporter(_) => "prometheus-node-exporter",
+            ApplicationSpec::CanonicalLivepatch(_) => "canonical-livepatch",
+            ApplicationSpec::ReportStatus(_) => "report-status",
+            ApplicationSpec::Zsh(_) => "zsh",
+        }
+    }
 }
 
 /// CockroachDB node parameters. `advertise`/`join` are NOT here: they are
@@ -96,6 +128,96 @@ pub struct CockroachSpec {
     pub max_sql_memory: String,
     #[serde(default = "default_cockroach_locality")]
     pub locality: String,
+    /// `--store` value, verbatim.
+    ///
+    /// Default is the **len-serv-001/002** form. The installer previously
+    /// hardcoded `/var/lib/cockroach/data`, which is len-serv-003's DRIFTED
+    /// form — redeploying 003 would have faithfully recreated the outlier the
+    /// pre-wipe inventory says to standardize away from.
+    #[serde(default = "default_cockroach_store")]
+    pub store: String,
+}
+
+/// CockroachDB rollout agent. Binary + env file + unit, running as the
+/// `cockroach` user alongside `cockroach.service`.
+///
+/// The unit shape mirrors the one deployed on len-serv-001/002 (read
+/// 2026-07-30): `After=network-online.target cockroach.service`,
+/// `EnvironmentFile=-` (leading `-` so a missing file is not fatal),
+/// `ProtectSystem=strict` plus explicit `ReadWritePaths`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CockroachRolloutAgentSpec {
+    /// Where to fetch the agent binary. Required — there is no sane default
+    /// and a wrong guess installs the wrong binary silently.
+    pub binary_url: String,
+    #[serde(default = "default_rollout_binary_path")]
+    pub binary_path: String,
+    /// CockroachDB connection string for the agent.
+    ///
+    /// SECRET-BEARING: authored as the `REPLACE_AT_PLACE_TIME` placeholder and
+    /// substituted at place time, never committed. The live env file on
+    /// len-serv-002 is explicitly marked "Host-local; do not commit".
+    #[serde(default = "default_placeholder")]
+    pub database_url: String,
+    #[serde(default = "default_rollout_certs_dir")]
+    pub certs_dir: String,
+    #[serde(default = "default_rollout_artifacts_dir")]
+    pub artifacts_dir: String,
+    #[serde(default = "default_rollout_audit_log")]
+    pub audit_log: String,
+    /// Unit the agent restarts during a rollout.
+    #[serde(default = "default_rollout_service")]
+    pub service: String,
+    /// Enable the unit at install time. len-serv-003 had it installed but
+    /// DISABLED as of 2026-07-28, so this defaults to false to reproduce the
+    /// fleet's actual state rather than an aspirational one.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Prometheus node exporter. Distro package (`prometheus-node-exporter`),
+/// so no version field — apt owns that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PrometheusNodeExporterSpec {
+    /// `--web.listen-address`. Empty string keeps the packaged default.
+    #[serde(default = "default_node_exporter_listen")]
+    pub listen_address: String,
+}
+
+/// Canonical Livepatch. Installed as a snap, then enabled with a token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CanonicalLivepatchSpec {
+    /// Livepatch token.
+    ///
+    /// SECRET-BEARING: authored as `REPLACE_AT_PLACE_TIME`, substituted at
+    /// place time. Never commit a real token.
+    #[serde(default = "default_placeholder")]
+    pub key: String,
+}
+
+/// The `/usr/local/bin/report-status.sh` webhook reporter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ReportStatusSpec {
+    /// Webhook endpoint. Default matches the deployed script on
+    /// len-serv-002 (read 2026-07-30), where it was hardcoded.
+    #[serde(default = "default_report_status_webhook")]
+    pub webhook_url: String,
+}
+
+/// zsh as an operator's login shell, optionally with oh-my-zsh.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ZshSpec {
+    /// Account whose login shell becomes zsh.
+    pub user: String,
+    /// Install oh-my-zsh into that user's home. Requires network at install
+    /// time (the upstream installer is fetched over HTTPS).
+    #[serde(default = "default_true")]
+    pub oh_my_zsh: bool,
 }
 
 /// Tang server workload parameters. Expressibility-only for now (rpi
@@ -432,6 +554,47 @@ fn default_tang_port() -> u16 {
     80
 }
 
+/// len-serv-001/002 form, verified 2026-07-30. NOT len-serv-003's drifted
+/// bare `/var/lib/cockroach/data`.
+fn default_cockroach_store() -> String {
+    "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string()
+}
+
+/// Secret-bearing fields author as this and are substituted at place time.
+fn default_placeholder() -> String {
+    "REPLACE_AT_PLACE_TIME".to_string()
+}
+
+fn default_rollout_binary_path() -> String {
+    "/usr/local/bin/cockroach-rollout-agent".to_string()
+}
+
+fn default_rollout_certs_dir() -> String {
+    "/var/lib/cockroach/certs".to_string()
+}
+
+fn default_rollout_artifacts_dir() -> String {
+    "/var/lib/cockroach-rollout-agent".to_string()
+}
+
+fn default_rollout_audit_log() -> String {
+    "/var/log/cockroach-rollout-agent/audit.log".to_string()
+}
+
+fn default_rollout_service() -> String {
+    "cockroach.service".to_string()
+}
+
+fn default_node_exporter_listen() -> String {
+    ":9100".to_string()
+}
+
+/// Matches the hardcoded URL in the deployed `/usr/local/bin/report-status.sh`
+/// on len-serv-002 (read 2026-07-30).
+fn default_report_status_webhook() -> String {
+    "http://172.16.2.30:25000/api/webhook".to_string()
+}
+
 impl InstallationConfig {
     /// Load configuration from a YAML file.
     pub fn from_yaml_file(path: &str) -> crate::Result<Self> {
@@ -521,6 +684,97 @@ mod tests {
     #[test]
     fn test_initramfs_type_default_is_dracut() {
         assert_eq!(InitramfsType::default(), InitramfsType::Dracut);
+    }
+
+    /// [`ApplicationSpec::kind`] must return exactly what serde writes as the
+    /// `kind` tag. The two are independent code paths — a hand-written match
+    /// versus `rename_all = "kebab-case"` — so nothing but this test stops
+    /// them drifting. Drift is silent and nasty: `reject_duplicates` and
+    /// merge-by-kind would key on a string that never appears on the wire, so
+    /// duplicate detection and host-over-group replacement would both quietly
+    /// stop working for that variant.
+    #[test]
+    fn kind_tags_match_serde() {
+        fn serialized_kind(spec: &ApplicationSpec) -> String {
+            let v = serde_json::to_value(spec).expect("serialize");
+            v.get("kind")
+                .and_then(|k| k.as_str())
+                .expect("tagged enum always emits a `kind` string")
+                .to_string()
+        }
+
+        // One value per variant. Adding a variant without adding it here
+        // leaves it unchecked, so the exhaustive match in `kind()` is the
+        // real backstop; this pins the STRINGS.
+        let samples = vec![
+            ApplicationSpec::Cockroach(CockroachSpec {
+                version: "v25.3.0".into(),
+                port: 36357,
+                sql_port: 36257,
+                http_addr: ":38080".into(),
+                seed_ip: "172.16.3.92".into(),
+                cache: ".25".into(),
+                max_sql_memory: ".25".into(),
+                locality: "region=us".into(),
+                store: default_cockroach_store(),
+            }),
+            ApplicationSpec::TangServer(TangServerSpec {
+                port: 80,
+                key_directory: "/etc/tang/keys".into(),
+            }),
+            ApplicationSpec::CockroachRolloutAgent(CockroachRolloutAgentSpec {
+                binary_url: "http://example/agent".into(),
+                binary_path: default_rollout_binary_path(),
+                database_url: default_placeholder(),
+                certs_dir: default_rollout_certs_dir(),
+                artifacts_dir: default_rollout_artifacts_dir(),
+                audit_log: default_rollout_audit_log(),
+                service: default_rollout_service(),
+                enabled: false,
+            }),
+            ApplicationSpec::PrometheusNodeExporter(PrometheusNodeExporterSpec {
+                listen_address: default_node_exporter_listen(),
+            }),
+            ApplicationSpec::CanonicalLivepatch(CanonicalLivepatchSpec {
+                key: default_placeholder(),
+            }),
+            ApplicationSpec::ReportStatus(ReportStatusSpec {
+                webhook_url: default_report_status_webhook(),
+            }),
+            ApplicationSpec::Zsh(ZshSpec {
+                user: "jdfalk".into(),
+                oh_my_zsh: true,
+            }),
+        ];
+
+        for spec in &samples {
+            assert_eq!(
+                spec.kind(),
+                serialized_kind(spec),
+                "ApplicationSpec::kind() disagrees with the serde `kind` tag"
+            );
+        }
+
+        // Guard the count so a new variant added to the enum without a sample
+        // above fails loudly rather than passing vacuously.
+        assert_eq!(samples.len(), 7, "add the new ApplicationSpec variant here");
+    }
+
+    /// A `--store` value must yield the directory cockroach will actually
+    /// create, in both forms the flag accepts.
+    #[test]
+    fn store_directory_handles_both_forms() {
+        use crate::network::ssh_installer::applications::store_directory;
+        assert_eq!(
+            store_directory("path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5"),
+            "/var/lib/cockroach/cockroach-data",
+            "key=value form (len-serv-001/002)"
+        );
+        assert_eq!(
+            store_directory("/var/lib/cockroach/data"),
+            "/var/lib/cockroach/data",
+            "bare-path form (len-serv-003's drift)"
+        );
     }
 
     #[test]

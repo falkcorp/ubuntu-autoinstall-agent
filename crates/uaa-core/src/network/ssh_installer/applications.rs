@@ -22,7 +22,10 @@
 //! no-op: zero commands are executed and `Ok(())` is returned, so behavior
 //! is byte-identical to before this module existed.
 
-use super::config::{ApplicationSpec, CockroachSpec, InstallationConfig, TangServerSpec};
+use super::config::{
+    ApplicationSpec, CanonicalLivepatchSpec, CockroachRolloutAgentSpec, CockroachSpec,
+    InstallationConfig, PrometheusNodeExporterSpec, ReportStatusSpec, TangServerSpec, ZshSpec,
+};
 use crate::autoinstall::host_spec::HostSpec;
 use crate::error::AutoInstallError;
 use crate::network::CommandExecutor;
@@ -38,6 +41,39 @@ use std::io::Write as _;
 /// this allowlist before ever being used as part of a path — this is what
 /// keeps a key like `../../etc/cron.d/x` from escaping the certs dir.
 const COCKROACH_CERT_FILENAMES: &[&str] = &["ca.crt", "node.crt", "node.key"];
+
+/// Authoring placeholder for secret-bearing fields, substituted at place time.
+/// Kept in sync with `config.rs`'s `default_placeholder`.
+const PLACEHOLDER: &str = "REPLACE_AT_PLACE_TIME";
+
+/// The on-disk directory a CockroachDB `--store` value points at.
+///
+/// Accepts both forms cockroach takes: the bare path
+/// (`/var/lib/cockroach/data`, len-serv-003's drifted form) and the key=value
+/// form used by len-serv-001/002
+/// (`path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5`). Without this,
+/// `mkdir -p` on the raw value would create a directory literally named
+/// `path=...,attrs=ssd,size=.5` and cockroach would then create its real store
+/// as root.
+pub fn store_directory(store: &str) -> &str {
+    for field in store.split(',') {
+        if let Some(path) = field.strip_prefix("path=") {
+            return path;
+        }
+    }
+    store
+}
+
+/// Directory component of a path, for `ReadWritePaths` on a log FILE.
+/// systemd sandboxing grants directories; naming the file itself would leave
+/// the agent unable to rotate or recreate its own log.
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => ".",
+    }
+}
 
 /// Installs every application declared in `InstallationConfig::applications`
 /// into the target. Mirrors `ResetPartitionStager`'s module shape: a
@@ -71,6 +107,21 @@ impl<'a> ApplicationInstaller<'a> {
                 ApplicationSpec::TangServer(spec) => {
                     self.install_tang_server(&config.hostname, spec).await?;
                 }
+                ApplicationSpec::CockroachRolloutAgent(spec) => {
+                    self.install_cockroach_rollout_agent(spec).await?;
+                }
+                ApplicationSpec::PrometheusNodeExporter(spec) => {
+                    self.install_prometheus_node_exporter(spec).await?;
+                }
+                ApplicationSpec::CanonicalLivepatch(spec) => {
+                    self.install_canonical_livepatch(spec).await?;
+                }
+                ApplicationSpec::ReportStatus(spec) => {
+                    self.install_report_status(spec).await?;
+                }
+                ApplicationSpec::Zsh(spec) => {
+                    self.install_zsh(spec).await?;
+                }
             }
         }
         Ok(())
@@ -84,6 +135,246 @@ impl<'a> ApplicationInstaller<'a> {
         tracing::warn!(
             "TangServer application authored but installer not implemented (host={hostname}) — skipping"
         );
+        Ok(())
+    }
+
+    /// CockroachDB rollout agent: binary, env file, unit.
+    ///
+    /// Unit shape is a transcription of the one running on len-serv-001/002
+    /// (read 2026-07-30), including `EnvironmentFile=-` (leading `-` so a
+    /// missing env file is non-fatal) and the `ProtectSystem=strict` +
+    /// explicit `ReadWritePaths` sandbox. `ReadWritePaths` must include the
+    /// cockroach binary path: the agent replaces that binary during a rollout,
+    /// and under `ProtectSystem=strict` it cannot without an explicit grant.
+    async fn install_cockroach_rollout_agent(
+        &mut self,
+        spec: &CockroachRolloutAgentSpec,
+    ) -> Result<()> {
+        let bin = &spec.binary_path;
+        self.chroot_exec(&format!(
+            "curl -fsSL -o {bin} '{}' && chmod 0755 {bin}",
+            spec.binary_url
+        ))
+        .await?;
+
+        self.chroot_exec(&format!(
+            "mkdir -p {} $(dirname {}) && chown -R cockroach:cockroach {} $(dirname {})",
+            spec.artifacts_dir, spec.audit_log, spec.artifacts_dir, spec.audit_log
+        ))
+        .await?;
+
+        // Quoted heredoc: the env file is data, never shell-expanded. A
+        // placeholder secret is written through as-is and substituted at place
+        // time — it is an authoring state, not an install failure.
+        if spec.database_url == PLACEHOLDER {
+            tracing::warn!(
+                "cockroach-rollout-agent database_url is still {PLACEHOLDER} — \
+                 writing env file with the placeholder; substitute it at place time"
+            );
+        }
+        let env = format!(
+            "# file: /etc/cockroach-rollout-agent.env\n\
+             # Written by uaa. Host-local; do not commit.\n\
+             CROACH_ROLLOUT_DATABASE_URL={db}\n\
+             CROACH_ROLLOUT_SSL_ROOT_CERT={certs}/ca.crt\n\
+             CROACH_ROLLOUT_SSL_CLIENT_CERT={certs}/node.crt\n\
+             CROACH_ROLLOUT_SSL_CLIENT_KEY={certs}/node.key\n\
+             CROACH_ROLLOUT_ARTIFACTS_DIR={artifacts}\n\
+             CROACH_ROLLOUT_AUDIT_LOG={audit}\n\
+             CROACH_ROLLOUT_BINARY_PATH=/usr/local/bin/cockroach\n\
+             CROACH_ROLLOUT_SERVICE={service}\n",
+            db = spec.database_url,
+            certs = spec.certs_dir,
+            artifacts = spec.artifacts_dir,
+            audit = spec.audit_log,
+            service = spec.service,
+        );
+        self.runner
+            .execute(&format!(
+                "cat > /mnt/targetos/etc/cockroach-rollout-agent.env \
+                 <<'UAA_CRRA_ENV_EOF'\n{env}UAA_CRRA_ENV_EOF"
+            ))
+            .await?;
+        self.chroot_exec("chmod 0640 /etc/cockroach-rollout-agent.env")
+            .await?;
+        self.chroot_exec("chown root:cockroach /etc/cockroach-rollout-agent.env")
+            .await?;
+
+        let unit = format!(
+            "[Unit]\n\
+             Description=CockroachDB Rollout Agent\n\
+             After=network-online.target cockroach.service\n\
+             Wants=network-online.target\n\
+             [Service]\n\
+             Type=simple\n\
+             User=cockroach\n\
+             Group=cockroach\n\
+             EnvironmentFile=-/etc/cockroach-rollout-agent.env\n\
+             ExecStart={bin} daemon\n\
+             Restart=on-failure\n\
+             RestartSec=10s\n\
+             NoNewPrivileges=true\n\
+             PrivateTmp=true\n\
+             ProtectSystem=strict\n\
+             ReadWritePaths={audit_dir} {artifacts} /usr/local/bin/cockroach\n\
+             [Install]\n\
+             WantedBy=multi-user.target\n",
+            bin = bin,
+            audit_dir = parent_dir(&spec.audit_log),
+            artifacts = spec.artifacts_dir,
+        );
+        self.runner
+            .execute(&format!(
+                "mkdir -p /mnt/targetos/etc/systemd/system && \
+                 cat > /mnt/targetos/etc/systemd/system/cockroach-rollout-agent.service \
+                 <<'UAA_CRRA_UNIT_EOF'\n{unit}UAA_CRRA_UNIT_EOF"
+            ))
+            .await?;
+        self.chroot_exec("systemctl daemon-reload").await?;
+
+        // len-serv-003 carried this unit INSTALLED BUT DISABLED as of
+        // 2026-07-28. Default reproduces that rather than silently enabling a
+        // service the fleet deliberately leaves off.
+        if spec.enabled {
+            self.chroot_exec("systemctl enable cockroach-rollout-agent")
+                .await?;
+        } else {
+            tracing::info!(
+                "cockroach-rollout-agent installed but left disabled (spec.enabled=false)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Prometheus node exporter. Distro package, so apt owns the version.
+    async fn install_prometheus_node_exporter(
+        &mut self,
+        spec: &PrometheusNodeExporterSpec,
+    ) -> Result<()> {
+        self.chroot_exec(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y prometheus-node-exporter",
+        )
+        .await?;
+
+        // The packaged unit reads ARGS from /etc/default/prometheus-node-exporter,
+        // so override there rather than editing the vendor unit.
+        if !spec.listen_address.is_empty() {
+            let defaults = format!(
+                "ARGS=\"--web.listen-address={}\"\n",
+                spec.listen_address
+            );
+            self.runner
+                .execute(&format!(
+                    "cat > /mnt/targetos/etc/default/prometheus-node-exporter \
+                     <<'UAA_NODEEXP_EOF'\n{defaults}UAA_NODEEXP_EOF"
+                ))
+                .await?;
+        }
+        self.chroot_exec("systemctl enable prometheus-node-exporter")
+            .await?;
+        Ok(())
+    }
+
+    /// Canonical Livepatch (snap).
+    ///
+    /// Enabling requires a real token. If the spec still carries the authoring
+    /// placeholder we install the snap and SKIP the enable rather than running
+    /// `canonical-livepatch enable REPLACE_AT_PLACE_TIME`, which would fail
+    /// and abort the whole install for what is an authoring state.
+    async fn install_canonical_livepatch(&mut self, spec: &CanonicalLivepatchSpec) -> Result<()> {
+        self.chroot_exec("snap install canonical-livepatch").await?;
+        if spec.key == PLACEHOLDER {
+            tracing::warn!(
+                "canonical-livepatch key is still {PLACEHOLDER} — snap installed but NOT enabled; \
+                 substitute the token at place time and run `canonical-livepatch enable <key>`"
+            );
+            return Ok(());
+        }
+        // Quoted heredoc keeps the token off the command line.
+        self.runner
+            .execute(&format!(
+                "chroot /mnt/targetos /bin/bash -s <<'UAA_LIVEPATCH_EOF'\n\
+                 canonical-livepatch enable {}\n\
+                 UAA_LIVEPATCH_EOF",
+                spec.key
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// `/usr/local/bin/report-status.sh` — the cloud-init webhook reporter.
+    ///
+    /// Transcribed from the deployed script on len-serv-002 (read 2026-07-30),
+    /// with the previously hardcoded webhook URL lifted into the spec.
+    async fn install_report_status(&mut self, spec: &ReportStatusSpec) -> Result<()> {
+        let script = format!(
+            "#!/bin/bash\n\
+             # Report status script. Written by uaa.\n\
+             WEBHOOK_URL=\"{url}\"\n\
+             HOSTNAME=$(hostname)\n\
+             TIMESTAMP=$(date +%s)\n\
+             SOURCE_IP=$(hostname -I | awk '{{print $1}}')\n\
+             \n\
+             STATUS=$1\n\
+             PROGRESS=$2\n\
+             MESSAGE=$3\n\
+             \n\
+             json_payload=$(jq -n \\\n\
+             \x20   --arg origin \"cloud-init\" \\\n\
+             \x20   --argjson timestamp \"$TIMESTAMP\" \\\n\
+             \x20   --arg event_type \"status_update\" \\\n\
+             \x20   --arg name \"$HOSTNAME\" \\\n\
+             \x20   --arg description \"Cloud-init status update\" \\\n\
+             \x20   --arg source_ip \"$SOURCE_IP\" \\\n\
+             \x20   --arg status \"${{STATUS:-pending}}\" \\\n\
+             \x20   --argjson progress \"${{PROGRESS:-null}}\" \\\n\
+             \x20   --arg message \"${{MESSAGE:-}}\" \\\n\
+             \x20   '{{\"origin\": $origin, \"timestamp\": $timestamp, \
+             \"event_type\": $event_type, \"name\": $name, \
+             \"description\": $description, \"source_ip\": $source_ip, \
+             \"status\": $status, \"progress\": $progress, \"message\": $message}}')\n\
+             \n\
+             curl -X POST \"$WEBHOOK_URL\" -H \"Content-Type: application/json\" -d \"$json_payload\"\n",
+            url = spec.webhook_url,
+        );
+        self.runner
+            .execute(&format!(
+                "mkdir -p /mnt/targetos/usr/local/bin && \
+                 cat > /mnt/targetos/usr/local/bin/report-status.sh \
+                 <<'UAA_REPORTSTATUS_EOF'\n{script}UAA_REPORTSTATUS_EOF"
+            ))
+            .await?;
+        self.chroot_exec("chmod 0755 /usr/local/bin/report-status.sh")
+            .await?;
+        // The script pipes through jq; without it every invocation is a
+        // silent no-op that still exits 0.
+        self.chroot_exec("DEBIAN_FRONTEND=noninteractive apt-get install -y jq curl")
+            .await?;
+        Ok(())
+    }
+
+    /// zsh as an operator login shell, optionally with oh-my-zsh.
+    async fn install_zsh(&mut self, spec: &ZshSpec) -> Result<()> {
+        self.chroot_exec("DEBIAN_FRONTEND=noninteractive apt-get install -y zsh")
+            .await?;
+        // `chsh` against a user that does not exist yet is a hard failure, and
+        // Phase 5 runs after user provisioning, so guard rather than assume.
+        self.chroot_exec(&format!(
+            "getent passwd {user} >/dev/null && chsh -s /usr/bin/zsh {user}",
+            user = spec.user
+        ))
+        .await?;
+
+        if spec.oh_my_zsh {
+            // Unattended install; RUNZSH=no keeps it from exec'ing a shell and
+            // hanging the install, CHSH=no because chsh already ran above.
+            self.chroot_exec(&format!(
+                "su - {user} -c 'RUNZSH=no CHSH=no sh -c \"$(curl -fsSL \
+                 https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)\"'",
+                user = spec.user
+            ))
+            .await?;
+        }
         Ok(())
     }
 
@@ -114,10 +405,13 @@ impl<'a> ApplicationInstaller<'a> {
         // 2. cockroach user + data/certs directories.
         self.chroot_exec("useradd -r -m -d /var/lib/cockroach cockroach 2>/dev/null || true")
             .await?;
-        self.chroot_exec(
-            "mkdir -p /var/lib/cockroach/certs /var/lib/cockroach/data && \
-             chown -R cockroach:cockroach /var/lib/cockroach",
-        )
+        // The data directory must match whatever `--store` actually points at,
+        // or cockroach starts by creating an unowned directory as root.
+        let store_dir = store_directory(&spec.store);
+        self.chroot_exec(&format!(
+            "mkdir -p /var/lib/cockroach/certs {store_dir} && \
+             chown -R cockroach:cockroach /var/lib/cockroach {store_dir}",
+        ))
         .await?;
 
         // 3. Fetch node certs from the install CA endpoint. Fail-closed:
@@ -207,7 +501,16 @@ impl<'a> ApplicationInstaller<'a> {
         // (PS-COCKROACH-16), never a hardcoded constant.
         let (advertise, join) =
             derive_cockroach_endpoints(&config.network_address, &config.cockroach_members, spec);
-        let sql_addr = format!("{self_ip}:{}", spec.sql_port);
+        // len-serv-001/002 leave listen/sql PORT-ONLY and bind advertise to the
+        // IP. len-serv-003 drifted to IP-bound listen/sql, which is why
+        // `cockroach sql --host=127.0.0.1:36257` is refused there and works on
+        // 001/002. Standardize on the 001/002 form.
+        //
+        // NOTE: only listen and sql become port-only. `--advertise-addr` MUST
+        // stay `IP:port` — it is the address peers dial to reach this node, and
+        // a port-only advertise breaks cluster join.
+        let listen_addr = format!(":{}", spec.port);
+        let sql_addr = format!(":{}", spec.sql_port);
 
         // 5. Write the systemd unit directly at its host-visible path
         // (/mnt/targetos/... is the target's own root, already mounted) so
@@ -220,9 +523,9 @@ impl<'a> ApplicationInstaller<'a> {
              [Service]\n\
              User=cockroach\n\
              ExecStart=/usr/local/bin/cockroach start \\\n\
-             \x20 --store=/var/lib/cockroach/data \\\n\
+             \x20 --store={store} \\\n\
              \x20 --certs-dir=/var/lib/cockroach/certs \\\n\
-             \x20 --listen-addr={advertise} \\\n\
+             \x20 --listen-addr={listen_addr} \\\n\
              \x20 --advertise-addr={advertise} \\\n\
              \x20 --sql-addr={sql_addr} \\\n\
              \x20 --join={join} \\\n\
@@ -236,7 +539,9 @@ impl<'a> ApplicationInstaller<'a> {
              [Install]\n\
              WantedBy=multi-user.target\n",
             advertise = advertise,
+            listen_addr = listen_addr,
             sql_addr = sql_addr,
+            store = spec.store,
             join = join,
             cache = spec.cache,
             max_sql = spec.max_sql_memory,
@@ -279,10 +584,7 @@ impl<'a> ApplicationInstaller<'a> {
     fn reject_duplicates(apps: &[ApplicationSpec]) -> Result<()> {
         let mut seen: HashSet<&'static str> = HashSet::new();
         for app in apps {
-            let kind = match app {
-                ApplicationSpec::Cockroach(_) => "cockroach",
-                ApplicationSpec::TangServer(_) => "tang-server",
-            };
+            let kind = app.kind();
             if !seen.insert(kind) {
                 return Err(crate::error::AutoInstallError::ConfigError(format!(
                     "duplicate application kind in config: {kind}"
@@ -424,6 +726,7 @@ mod tests {
             cache: "25%".into(),
             max_sql_memory: "25%".into(),
             locality: "region=default".into(),
+            store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".into(),
         }
     }
 
@@ -842,9 +1145,31 @@ mod tests {
             .iter()
             .find(|c| c.contains("cockroach.service"))
             .expect("unit write recorded");
+        // Port-only, per the len-serv-001/002 form. The original assertion
+        // expected `{ip}:40001`; that was len-serv-003's drifted IP-bound form,
+        // which is exactly why `--host=127.0.0.1:36257` is refused on 003.
+        // The property this test actually guards — sql-addr derives from
+        // spec.sql_port rather than a sed rewrite of the RPC port — is
+        // unchanged and still asserted.
         assert!(
-            unit_cmd.contains(&format!("--sql-addr={}:40001", HostSpec::ip_without_cidr(&sample_config().network_address))),
+            unit_cmd.contains("--sql-addr=:40001"),
             "sql-addr must come from spec.sql_port, not a sed rewrite of the RPC port: {unit_cmd}"
+        );
+        assert!(
+            !unit_cmd.contains(&format!(
+                "--sql-addr={}",
+                HostSpec::ip_without_cidr(&sample_config().network_address)
+            )),
+            "sql-addr must NOT be IP-bound (that is len-serv-003's drift): {unit_cmd}"
+        );
+        // advertise-addr, by contrast, MUST stay IP-bound — it is what peers
+        // dial. A port-only advertise silently breaks cluster join.
+        assert!(
+            unit_cmd.contains(&format!(
+                "--advertise-addr={}:40000",
+                HostSpec::ip_without_cidr(&sample_config().network_address)
+            )),
+            "advertise-addr must stay IP-bound: {unit_cmd}"
         );
         assert!(
             !unit_cmd.contains("36257"),
