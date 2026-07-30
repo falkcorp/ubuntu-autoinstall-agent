@@ -178,13 +178,15 @@ fn resolved_defaults() -> InstallationConfig {
     )
 }
 
-/// The variant tag used to key the application union — mirrors
-/// `ApplicationSpec`'s `#[serde(tag = "kind", rename_all = "kebab-case")]`.
+/// The variant tag used to key the application union.
+///
+/// Delegates to [`ApplicationSpec::kind`] rather than re-matching every
+/// variant. This used to be an independent `match` that had to be kept in
+/// step with the one in `applications.rs::reject_duplicates` by hand; a
+/// variant added to one and missed in the other silently broke merge-by-kind
+/// or duplicate rejection with no compile error.
 fn app_kind(app: &ApplicationSpec) -> &'static str {
-    match app {
-        ApplicationSpec::Cockroach(_) => "cockroach",
-        ApplicationSpec::TangServer(_) => "tang-server",
-    }
+    app.kind()
 }
 
 /// Unions `group` and `host` application lists by kind: a kind present in
@@ -246,6 +248,7 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .locality
             .clone()
             .unwrap_or_else(|| base.locality.clone()),
+        store: overrides.store.clone().unwrap_or_else(|| base.store.clone()),
     }
 }
 
@@ -837,6 +840,7 @@ mod tests {
             cache: ".25".to_string(),
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
+            store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
         }
     }
 

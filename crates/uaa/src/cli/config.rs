@@ -527,6 +527,38 @@ mod tests {
         ))
     }
 
+    /// Every committed install config must deserialize into
+    /// `InstallationConfig`.
+    ///
+    /// `InstallationConfig` and every `ApplicationSpec` variant are
+    /// `deny_unknown_fields`, and the enum is closed, so a typo'd key or an
+    /// unknown `kind` is a hard parse error. Without this, a broken example
+    /// config is only discovered when someone tries to install with it — which
+    /// for these files means at the moment a machine is being rebuilt.
+    #[test]
+    fn every_committed_install_config_parses() {
+        use uaa_core::network::ssh_installer::config::InstallationConfig;
+
+        let dir = committed_src_dir();
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("read committed config dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read config");
+            let parsed: Result<InstallationConfig, _> = serde_yaml::from_str(&text);
+            assert!(
+                parsed.is_ok(),
+                "{} failed to parse as InstallationConfig: {}",
+                path.display(),
+                parsed.unwrap_err()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no committed configs found in {}", dir.display());
+    }
+
     #[test]
     fn test_group_spec_derivation_matches_fleet_convention() {
         let indexed = group_spec_for_host("len-serv-001");
