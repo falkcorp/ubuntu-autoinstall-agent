@@ -1,0 +1,135 @@
+# file: examples/configs/install/vm-test-applications.yaml
+# version: 1.0.0
+# guid: 3a7f9e21-8b04-4c56-9d13-6e2058ba4f7c
+# last-edited: 2026-07-30
+#
+# ============================================================================
+# THROWAWAY VM-ONLY TEST SECRETS — NOT REAL. Never use on hardware.
+# Same contract as vm-test.yaml: every secret here is disposable, committed
+# deliberately because it protects nothing (the VM disk it unlocks is deleted
+# by the next harness run). Never copy these onto len-serv-003 or any host.
+# ============================================================================
+#
+# SINGLE-DISK NativeKeystore gate. This is the companion to vm-test.yaml (which
+# covers the PlainLuks path); this file proves the *other* storage_mode on a
+# one-disk host — the shape len-serv-003 uses (one NVMe, no mirror, no special
+# vdev), which `plan_layout` rejected outright before the single-disk change.
+#
+# What it must prove:
+#   * plan_layout accepts a 1-System / 0-Special roster
+#   * bpool/rpool are created as SINGLE vdevs — no `mirror` keyword (emitting
+#     `mirror` for one device is a zpool syntax error) and no `special` vdev
+#   * the rpool/keystore LUKS2 zvol + ZFS *native* encryption on rpool/ROOT and
+#     rpool/USERDATA still come up, keyed from the keystore
+#   * the installed system boots and imports both pools
+#
+# DISK: addressed BY-ID, not /dev/vda. NativeKeystore rosters are by-id and
+# append `-partN`; scripts/vm-validate.sh gives the virtio disk the serial
+# UAAVMDISK0 precisely so /dev/disk/by-id/virtio-UAAVMDISK0 (+ -part1..-part3)
+# exists in the guest. Keep this id in sync with VM_DISK_SERIAL in that script.
+
+hostname: vm-test-nk
+# Still required by the schema; for native-keystore the `disks` roster below is
+# what actually drives partitioning, but disk_device must name the same device.
+disk_device: /dev/vda
+timezone: America/New_York
+
+storage_mode: native-keystore
+disks:
+  - id: /dev/disk/by-id/virtio-UAAVMDISK0
+    role: system
+# NOTE: no `special` entries. A lone special disk is rejected by design (an
+# unmirrored metadata vdev would make one device failure fatal to the pool);
+# zero special disks is the supported single-disk shape.
+
+# --- secrets: THROWAWAY, VM-only (see header). For native-keystore, luks_key
+# --- is the keystore-zvol LUKS passphrase (the break-glass path; clevis is the
+# --- unattended one) rather than a whole-disk passphrase.
+luks_key: vm-test-throwaway-luks-key-NOT-A-REAL-SECRET
+root_password: vm-test-throwaway-root-pw-NOT-A-REAL-SECRET
+
+install_ca_cert: |
+  -----BEGIN CERTIFICATE-----
+  VMTESTFAKECERTNOTAREALSECRET
+  -----END CERTIFICATE-----
+
+# VERIFIED on a live VM run 2026-07-29: the guest NIC is `ens4` (it comes up
+# with 10.0.2.15 via QEMU's DHCP). This value is load-bearing beyond netplan:
+# the dracut Tang path bakes `ip=10.0.2.15::10.0.2.2:24::<iface>:none` into
+# GRUB_CMDLINE_LINUX, so a wrong name means initramfs has no network, Tang is
+# unreachable, clevis cannot unlock the keystore and the boot hangs forever in
+# initramfs with no console output. That is exactly what a stale `enp0s3` did.
+network_interface: ens4
+network_address: 10.0.2.15/24
+network_gateway: 10.0.2.2
+network_search: vm.local
+network_nameservers:
+  - 10.0.2.3
+
+debootstrap_release: resolute
+debootstrap_mirror: http://archive.ubuntu.com/ubuntu/
+initramfs_type: dracut
+
+# Tang IS required here, unlike vm-test.yaml. NativeKeystore's only unlock path
+# is the `91uaa-keystore-wait` dracut hook, which does a `clevis luks unlock` —
+# there is no crypttab entry to fall back to (the installer writes an empty
+# crypttab on purpose). An empty list therefore produces a system that cannot
+# unlock its own keystore, and dracut refuses to build at all because the hook's
+# depends() lists clevis. So a Tang-less native-keystore VM would not be a
+# weaker test, it would be a meaningless one.
+#
+# Pointing a throwaway VM at the fleet Tang servers is safe: Tang is a stateless
+# key-derivation service, binding to it discloses nothing about the fleet, and
+# this VM's disk is destroyed by the next harness run. (QEMU user-mode NAT
+# routes outbound to the LAN, so 172.16.2.x is reachable from 10.0.2.15.)
+# Threshold 2 of 3 + the swtpm TPM2 pin = the same SSS shape real hosts use.
+tang_servers:
+  - url: http://172.16.2.45
+  - url: http://172.16.2.46
+  - url: http://172.16.2.47
+tang_threshold: 2
+
+# Stage 5 of the gate SSHes into the *installed* system as root, key-only. It
+# therefore needs a key the machine RUNNING the harness actually holds.
+# The operator key below matches installer-image/nocloud/user-data (used for the
+# live session), but its private half lives on the operator's laptop — not on
+# the server, which is the only host that can run the gate (Linux + KVM). With
+# only that key, stage 5 fails with "Permission denied (publickey)" even though
+# the guest booted perfectly and sshd is listening: a false FAIL that looks
+# exactly like a boot hang. Both public keys are listed so the gate authenticates
+# from either host. Public keys are not secrets.
+ssh_authorized_keys:
+  - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDmLM5QkF0hQiebBV/P7ogMXatVKfywwNNpVE5/XRgpm8ipjMpYn8cUBMnAelPyljezUDX4PsXlNobsWZH87lMsXT7X1RVdFP2IXMUbgCJ1nPIGnWzldRSq7NX0wQOkwPXa8crXdgyTuHeDlJzBQ45GurMzh17BuN93WnssrqXAlCIfjszwhN1/BTzOdy/wIBXaSwkSt75dxdgHGz3Yw5qOg8gPUdtvL1vP3hOkNkOFI52NEVg65deJil8+DgH9kIitiPF83+IQ75dGpk6yHgXX7uf4a8ExeJ8agZ1mwr28bdEGtSpfqYOaHM2FOCh6ZOU868tQMVQuItSXCfAmy4jT johnathan.falk@gmail.com"
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOjWe+a1f8A+R1iqXPR0IiJmPiiIEk3CQxqy3wTMMY4l jdfalk@unimatrixzero"
+
+enroll_tpm2: true
+tpm2_pin: "123456"
+tpm2_pcr_ids: "7"
+
+expect_fido2: false
+
+# ---------------------------------------------------------------------------
+# Applications under test
+# ---------------------------------------------------------------------------
+# The VM-testable subset of the new ApplicationSpec variants. Exercises the
+# Phase-5 ApplicationInstaller path end-to-end so the variants are proven by a
+# real install, not only by unit tests.
+#
+# Deliberately EXCLUDED, with reasons:
+#   - cockroach-rollout-agent: binary-url must resolve or the fail-closed
+#     applier aborts the install. There is no artifact endpoint serving that
+#     binary yet, so including it here would test the failure path, not the
+#     agent.
+#   - canonical-livepatch: needs snapd plus a real token; with the placeholder
+#     it installs the snap and skips enable, so the gate would assert little
+#     while adding a slow network-dependent step.
+#   - cockroach: needs certs from the control server and a cluster to join;
+#     already covered by vm-test.yaml.
+applications:
+  - kind: prometheus-node-exporter
+
+  - kind: report-status
+
+  - kind: zsh
+    user: root
+    oh-my-zsh: false
