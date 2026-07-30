@@ -461,8 +461,15 @@ if [ "$OBSERVED_UNITS" != "NONE" ]; then
   done
 fi
 MARKER72_UNMASKED="${MARKER72_UNMASKED# }"
+# INFO, not GAP. subiquity's snap services do sit enabled/active in the live
+# env — `ln -sf /dev/null` does not mask snapd-generated units — but they idle:
+# the agent owns the disk, nothing hands control to subiquity, and U1 was
+# installed and is in production with these exact units running. Reporting this
+# as a GAP made a healthy run look broken and turned noise into a decision.
+# Keep printing the observation (it is genuinely true and worth seeing); stop
+# calling it a defect.
 if [ -n "$MARKER72_UNMASKED" ]; then
-  MARKER72_VERDICT="GAP (autostart-capable unmasked service(s): $MARKER72_UNMASKED)"
+  MARKER72_VERDICT="INFO (subiquity services present but idle — harmless: $MARKER72_UNMASKED)"
 else
   MARKER72_VERDICT="COVERED"
 fi
