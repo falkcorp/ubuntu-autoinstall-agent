@@ -197,6 +197,13 @@ pub enum RefusalReason {
     /// the registry) were flipped/restored best-effort. Names the underlying
     /// web/pxe errors.
     Unreconciled(String),
+    /// The host's clustered workload did not finish draining, so the wipe was
+    /// refused rather than leaving the cluster under-replicated. The boot
+    /// target was flipped back; nothing irreversible ran.
+    DrainIncomplete { replicas_left: u64 },
+    /// The drain itself errored (unreachable node, cert failure, …). Same
+    /// fail-closed treatment as [`RefusalReason::DrainIncomplete`].
+    DrainFailed(String),
 }
 
 /// Timing configuration for [`reinstall_machine`].
@@ -221,10 +228,44 @@ impl Default for ReinstallConfig {
     }
 }
 
+/// Whether a host's clustered workload finished draining off it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainStatus {
+    /// Membership fully drained; the disk is safe to wipe.
+    Drained,
+    /// The drain did not reach zero replicas within its own deadline. Wiping
+    /// now would leave the cluster under-replicated.
+    Incomplete { replicas_left: u64 },
+}
+
+/// Drains clustered workloads off a host before its disk is wiped.
+///
+/// Implemented by U0, never by the host being reinstalled — see the ordering
+/// note in [`reinstall_machine`]. Kept as a narrow local trait in the same
+/// style as [`WebClient`]/[`PxeClient`] so tests inject a mock and no SQL or
+/// cert handling leaks into this module.
+#[async_trait]
+pub trait NodeDrainer {
+    /// Whether `hostname` holds cluster membership needing a drain. `false`
+    /// short-circuits the whole step, so hosts running no clustered workload
+    /// pay nothing. Derived from the host's resolved `applications` (a
+    /// `cockroach` entry means yes) rather than a hardcoded hostname list.
+    async fn needs_drain(&self, hostname: &str) -> anyhow::Result<bool>;
+
+    /// Decommission `hostname` and block until its replica count reaches zero
+    /// or the implementation's own deadline expires.
+    ///
+    /// TERMINAL: a decommissioned CockroachDB node can never rejoin under the
+    /// same node id. It comes back as a new node after reinstall, which is why
+    /// no `--join` list anywhere needs editing.
+    async fn drain(&self, hostname: &str) -> anyhow::Result<DrainStatus>;
+}
+
 /// Bundles every seam [`reinstall_machine`] depends on. All trait objects so
 /// tests inject mocks; `handle_reinstall` is the only caller that constructs
 /// the real [`RuntimePowerControl`].
 pub struct ReinstallDeps<'a> {
+    pub drainer: &'a dyn NodeDrainer,
     pub web: &'a dyn WebClient,
     pub pxe: &'a dyn PxeClient,
     pub power: &'a dyn PowerControl,
@@ -343,6 +384,71 @@ pub async fn reinstall_machine(
         return Ok(ReinstallOutcome::Refused(RefusalReason::Unreconciled(reason)));
     }
 
+    // ── Drain cluster membership BEFORE the disk is wiped ───────────────────
+    //
+    // U0 owns this, not the host. A node cannot reliably watch its own
+    // decommission finish: the drain requires it up and serving while
+    // something polls until its replica count reaches zero, and that something
+    // is about to be power-cycled into an installer. U0 already holds the CA
+    // and issues the node certs, so it is the only party that can both drive
+    // the decommission and observe it complete.
+    //
+    // ORDER IS LOAD-BEARING. Decommission is TERMINAL — a CockroachDB node can
+    // never rejoin under the same node id. So it runs AFTER every reversible
+    // step has already succeeded (registry write + dual projection, both
+    // undoable above) and BEFORE the power cycle (the first genuinely
+    // destructive act). Draining any earlier would mean a projection failure
+    // left a healthy node permanently decommissioned for nothing — which is
+    // exactly the state len-serv-003 sat in: decommissioned, still running,
+    // unable to rejoin.
+    //
+    // Skipped entirely for hosts holding no clustered workload, so a Tang
+    // server or a bare install-target pays nothing for this.
+    if deps.drainer.needs_drain(&machine.hostname).await? {
+        tracing::info!(
+            "reinstall: draining cluster membership from {} before wipe",
+            machine.hostname
+        );
+        let drain = deps.drainer.drain(&machine.hostname).await;
+        let refusal = match drain {
+            Ok(DrainStatus::Drained) => {
+                tracing::info!("reinstall: {} fully drained", machine.hostname);
+                None
+            }
+            // Fail CLOSED. Wiping a node that still holds replicas is how you
+            // get under-replicated ranges — the one outcome this whole step
+            // exists to prevent. A partial drain is a refusal, not a warning.
+            Ok(DrainStatus::Incomplete { replicas_left }) => {
+                Some(RefusalReason::DrainIncomplete { replicas_left })
+            }
+            Err(e) => Some(RefusalReason::DrainFailed(e.to_string())),
+        };
+
+        if let Some(reason) = refusal {
+            // Nothing irreversible has happened yet, so undo the projection
+            // exactly as the reconciliation path above does and leave the host
+            // booting from local disk.
+            let mut flip_back_errors = Vec::new();
+            if let Err(e) = deps.web.flip_boot_target(mac, LOCAL_DISK).await {
+                flip_back_errors.push(format!("web flip-back failed: {e}"));
+            }
+            if let Err(e) = deps.pxe.set_boot_target(mac, LOCAL_DISK).await {
+                flip_back_errors.push(format!("pxe flip-back failed: {e}"));
+            }
+            if let Err(e) = deps.registry.set_boot_target(mac, &prior_boot_target).await {
+                flip_back_errors.push(format!("registry restore failed: {e}"));
+            }
+            for err in &flip_back_errors {
+                tracing::error!("reinstall drain-refusal flip-back: {err}");
+            }
+            tracing::error!(
+                "reinstall REFUSED for {} ({mac}): drain did not complete — {reason:?}",
+                machine.hostname
+            );
+            return Ok(ReinstallOutcome::Refused(reason));
+        }
+    }
+
     // Power cycle: off then on, explicitly — reset/cycle are unrepresentable.
     deps.power.off(&machine.hostname).await?;
     deps.power.on(&machine.hostname).await?;
@@ -458,6 +564,7 @@ pub async fn handle_reinstall(
     web: &dyn WebClient,
     pxe: &dyn PxeClient,
     watch: &dyn InstallWatch,
+    drainer: &dyn NodeDrainer,
     fleet: &FleetConfig,
     clock: &dyn Clock,
     config: ReinstallConfig,
@@ -468,6 +575,7 @@ pub async fn handle_reinstall(
     let deps = ReinstallDeps {
         web,
         pxe,
+        drainer,
         power: &power,
         watch,
         registry,
@@ -583,6 +691,51 @@ mod tests {
         async fn on(&self, host: &str) -> anyhow::Result<()> {
             self.log.push(format!("power:on:{host}"));
             Ok(())
+        }
+    }
+
+    /// Drain mock. `NoDrain` (needs_drain = false) is the default used by every
+    /// pre-existing test, so those keep asserting exactly the behavior they did
+    /// before this seam existed — a host with no clustered workload skips the
+    /// drain entirely and the call sequence is unchanged.
+    struct MockDrainer {
+        log: CallLog,
+        needs: bool,
+        result: Mutex<Option<anyhow::Result<DrainStatus>>>,
+    }
+
+    impl MockDrainer {
+        fn no_drain(log: CallLog) -> Self {
+            Self {
+                log,
+                needs: false,
+                result: Mutex::new(None),
+            }
+        }
+
+        fn drains(log: CallLog, result: anyhow::Result<DrainStatus>) -> Self {
+            Self {
+                log,
+                needs: true,
+                result: Mutex::new(Some(result)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeDrainer for MockDrainer {
+        async fn needs_drain(&self, hostname: &str) -> anyhow::Result<bool> {
+            self.log.push(format!("needs_drain:{hostname}"));
+            Ok(self.needs)
+        }
+
+        async fn drain(&self, hostname: &str) -> anyhow::Result<DrainStatus> {
+            self.log.push(format!("drain:{hostname}"));
+            match self.result.lock().unwrap().take() {
+                Some(Ok(s)) => Ok(s),
+                Some(Err(e)) => Err(e),
+                None => Ok(DrainStatus::Drained),
+            }
         }
     }
 
@@ -716,6 +869,212 @@ mod tests {
         }
     }
 
+    /// A host holding replicas must be drained before it is power-cycled into
+    /// an installer, and the drain must happen AFTER the reversible projection
+    /// (decommission is terminal — see the ordering note in
+    /// `reinstall_machine`).
+    #[tokio::test]
+    async fn test_drain_runs_before_power_and_after_projection() {
+        let fleet = FleetConfig::default();
+        let registry = MockRegistry::new(TEST_MAC, approved_machine());
+        let web = MockWeb::new(CallLog::default());
+        let pxe = MockPxe::new(CallLog::default());
+        let power = MockPower::new(CallLog::default());
+        let watch = MockWatch::always(CallLog::default(), Some(InstallStatus::Success));
+        let clock = TickClock::new(SystemTime::now());
+        let drainer = MockDrainer::drains(CallLog::default(), Ok(DrainStatus::Drained));
+
+        let deps = ReinstallDeps {
+            drainer: &drainer,
+            web: &web,
+            pxe: &pxe,
+            power: &power,
+            watch: &watch,
+            registry: &registry,
+            fleet: &fleet,
+            clock: &clock,
+            config: small_config(),
+        };
+
+        let outcome = reinstall_machine(
+            &deps,
+            ReinstallRequest {
+                mac: TEST_MAC.to_string(),
+                confirm: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ReinstallOutcome::Done);
+        assert!(
+            drainer.log.calls().iter().any(|c| c.starts_with("drain:")),
+            "drain must run for a host that needs it"
+        );
+        // Projection happened before the drain was even consulted.
+        assert!(
+            !web.log.calls().is_empty(),
+            "boot target must be projected before draining"
+        );
+        assert!(
+            !power.log.calls().is_empty(),
+            "power cycle must follow a successful drain"
+        );
+    }
+
+    /// A partial drain is a REFUSAL, not a warning. Wiping a node still holding
+    /// replicas is the exact outcome this step exists to prevent, so power must
+    /// never be invoked and the boot target must be flipped back.
+    #[tokio::test]
+    async fn test_incomplete_drain_refuses_and_never_powers() {
+        let fleet = FleetConfig::default();
+        let registry = MockRegistry::new(TEST_MAC, approved_machine());
+        let web = MockWeb::new(CallLog::default());
+        let pxe = MockPxe::new(CallLog::default());
+        let power = MockPower::new(CallLog::default());
+        let watch = MockWatch::always(CallLog::default(), Some(InstallStatus::Success));
+        let clock = TickClock::new(SystemTime::now());
+        let drainer = MockDrainer::drains(
+            CallLog::default(),
+            Ok(DrainStatus::Incomplete { replicas_left: 17 }),
+        );
+
+        let deps = ReinstallDeps {
+            drainer: &drainer,
+            web: &web,
+            pxe: &pxe,
+            power: &power,
+            watch: &watch,
+            registry: &registry,
+            fleet: &fleet,
+            clock: &clock,
+            config: small_config(),
+        };
+
+        let outcome = reinstall_machine(
+            &deps,
+            ReinstallRequest {
+                mac: TEST_MAC.to_string(),
+                confirm: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReinstallOutcome::Refused(RefusalReason::DrainIncomplete { replicas_left: 17 })
+        );
+        assert!(
+            power.log.calls().is_empty(),
+            "power must NEVER be invoked when the drain did not complete"
+        );
+        // Flipped back so the host still boots its existing install.
+        assert!(
+            web.log.calls().iter().any(|c| c.contains(LOCAL_DISK)),
+            "web layer must be flipped back to local-disk: {:?}",
+            web.log.calls()
+        );
+        assert!(
+            pxe.log.calls().iter().any(|c| c.contains(LOCAL_DISK)),
+            "pxe layer must be flipped back to local-disk: {:?}",
+            pxe.log.calls()
+        );
+    }
+
+    /// A drain that errors outright gets the same fail-closed treatment as a
+    /// partial drain — an unreachable node is not permission to wipe it.
+    #[tokio::test]
+    async fn test_drain_error_refuses_and_never_powers() {
+        let fleet = FleetConfig::default();
+        let registry = MockRegistry::new(TEST_MAC, approved_machine());
+        let web = MockWeb::new(CallLog::default());
+        let pxe = MockPxe::new(CallLog::default());
+        let power = MockPower::new(CallLog::default());
+        let watch = MockWatch::always(CallLog::default(), Some(InstallStatus::Success));
+        let clock = TickClock::new(SystemTime::now());
+        let drainer = MockDrainer::drains(
+            CallLog::default(),
+            Err(anyhow::anyhow!("node unreachable")),
+        );
+
+        let deps = ReinstallDeps {
+            drainer: &drainer,
+            web: &web,
+            pxe: &pxe,
+            power: &power,
+            watch: &watch,
+            registry: &registry,
+            fleet: &fleet,
+            clock: &clock,
+            config: small_config(),
+        };
+
+        let outcome = reinstall_machine(
+            &deps,
+            ReinstallRequest {
+                mac: TEST_MAC.to_string(),
+                confirm: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            ReinstallOutcome::Refused(RefusalReason::DrainFailed(msg)) => {
+                assert!(msg.contains("node unreachable"), "got: {msg}");
+            }
+            other => panic!("expected DrainFailed, got {other:?}"),
+        }
+        assert!(
+            power.log.calls().is_empty(),
+            "power must NEVER be invoked when the drain errored"
+        );
+    }
+
+    /// A host with no clustered workload skips the drain entirely — the flow is
+    /// byte-for-byte what it was before this seam existed.
+    #[tokio::test]
+    async fn test_no_drain_needed_skips_drain_entirely() {
+        let fleet = FleetConfig::default();
+        let registry = MockRegistry::new(TEST_MAC, approved_machine());
+        let web = MockWeb::new(CallLog::default());
+        let pxe = MockPxe::new(CallLog::default());
+        let power = MockPower::new(CallLog::default());
+        let watch = MockWatch::always(CallLog::default(), Some(InstallStatus::Success));
+        let clock = TickClock::new(SystemTime::now());
+        let drainer = MockDrainer::no_drain(CallLog::default());
+
+        let deps = ReinstallDeps {
+            drainer: &drainer,
+            web: &web,
+            pxe: &pxe,
+            power: &power,
+            watch: &watch,
+            registry: &registry,
+            fleet: &fleet,
+            clock: &clock,
+            config: small_config(),
+        };
+
+        let outcome = reinstall_machine(
+            &deps,
+            ReinstallRequest {
+                mac: TEST_MAC.to_string(),
+                confirm: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, ReinstallOutcome::Done);
+        assert!(
+            !drainer.log.calls().iter().any(|c| c.starts_with("drain:")),
+            "drain must not run for a host that does not need it"
+        );
+        assert!(!power.log.calls().is_empty(), "power cycle still happens");
+    }
+
     #[tokio::test]
     async fn test_denylist_refused_zero_side_effects() {
         let fleet = FleetConfig::default(); // includes "unimatrixone" by default.
@@ -735,6 +1094,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -781,6 +1141,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -827,6 +1188,7 @@ mod tests {
         let clock = TickClock::new(start + Duration::from_secs(5 * 60));
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -872,6 +1234,7 @@ mod tests {
         let clock = TickClock::new(start + Duration::from_secs(5 * 60));
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -910,6 +1273,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -962,6 +1326,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -1002,6 +1367,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -1038,6 +1404,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -1087,6 +1454,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
@@ -1134,6 +1502,7 @@ mod tests {
         let clock = TickClock::new(SystemTime::now());
 
         let deps = ReinstallDeps {
+            drainer: &MockDrainer::no_drain(CallLog::default()),
             web: &web,
             pxe: &pxe,
             power: &power,
