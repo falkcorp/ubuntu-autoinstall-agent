@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/vm-validate.sh
-# version: 1.6.0
+# version: 1.7.0
 # guid: 83274dbf-b287-4567-b4d8-2f31fa604974
-# last-edited: 2026-07-29
+# last-edited: 2026-07-30
 #
 # QEMU+swtpm VM validation gate. THIS SCRIPT PASSING IS THE GATE — no hardware
 # attempt or len-serv-003 wipe before it passes.
@@ -94,6 +94,7 @@ FIRST_FAILING_STAGE=""
 OBSERVED_UNITS=""
 MARKER72_VERDICT=""
 declare -A TOOL_STATUS
+declare -A TOOL_STATUS_POST
 
 stage_echo() { echo "==> stage $1 $2"; }
 
@@ -119,10 +120,20 @@ print_report() {
     echo "marker build-installer-image.sh:72 (stock-installer autostart unit):"
     echo "  observed-units: ${OBSERVED_UNITS:-UNKNOWN (stage 3 not reached)}"
     echo "  masked-by-build-script: subiquity-server.service serial-subiquity@.service snap.subiquity.subiquity-server.service"
+    echo "  service-states (enabled/active): ${UNIT_STATE_SUMMARY:-UNKNOWN (stage 3 not reached)}"
     echo "  verdict: ${MARKER72_VERDICT:-UNKNOWN (stage 3 not reached)}"
     echo "marker build-installer-image.sh:81 (live-rootfs tools):"
     for tool in debootstrap sgdisk zpool cryptsetup dracut clevis; do
-      printf '  %-12s %s\n' "${tool}:" "${TOOL_STATUS[$tool]:-UNKNOWN}"
+      # pre-install -> post-install. A tool the agent provisions reads
+      # "MISSING -> present", which is correct behavior, not a gap. Only
+      # "-> MISSING" is a finding.
+      _pre="${TOOL_STATUS[$tool]:-UNKNOWN}"
+      _post="${TOOL_STATUS_POST[$tool]:-UNKNOWN (install not reached)}"
+      if [ "$_pre" = "MISSING" ] && [ "$_post" = "present" ]; then
+        printf '  %-12s %s -> %s (provisioned by agent during install)\n' "${tool}:" "$_pre" "$_post"
+      else
+        printf '  %-12s %s -> %s\n' "${tool}:" "$_pre" "$_post"
+      fi
     done
     if [ "$gate" = "PASS" ]; then
       echo "GATE: PASS"
@@ -398,14 +409,62 @@ echo "$UNITS_RAW" >>"$INTERROGATE_LOG"
 OBSERVED_UNITS="$(echo "$UNITS_RAW" | awk '{print $1}' | sort -u | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
 [ -n "$OBSERVED_UNITS" ] || OBSERVED_UNITS="NONE"
 
-MARKER72_VERDICT="COVERED"
+# Resolve marker :72 properly. `list-units --all` includes INACTIVE units and
+# `list-unit-files` lists units that merely exist on disk, so a name appearing
+# above does NOT mean it autostarts the installer — which is the only question
+# this marker asks. Query real enablement/active state per candidate service.
+UNIT_STATE_SUMMARY=""
+declare -A UNIT_ENABLED UNIT_ACTIVE
 if [ "$OBSERVED_UNITS" != "NONE" ]; then
   for u in $OBSERVED_UNITS; do
-    case " $MASKED_UNITS " in
-      *" $u "*) ;;
-      *) MARKER72_VERDICT="GAP (unit $u not in mask list)" ;;
-    esac
+    case "$u" in *.service) ;; *) continue ;; esac
+    UNIT_ENABLED[$u]="$(ssh_run 15 "$SSH_USER" "systemctl is-enabled '$u' 2>/dev/null || true" \
+      2>>"$INTERROGATE_LOG" | tr -d '\r' | head -1)"
+    UNIT_ACTIVE[$u]="$(ssh_run 15 "$SSH_USER" "systemctl is-active '$u' 2>/dev/null || true" \
+      2>>"$INTERROGATE_LOG" | tr -d '\r' | head -1)"
+    UNIT_STATE_SUMMARY="${UNIT_STATE_SUMMARY} ${u}=${UNIT_ENABLED[$u]:-?}/${UNIT_ACTIVE[$u]:-?}"
   done
+fi
+UNIT_STATE_SUMMARY="${UNIT_STATE_SUMMARY# }"
+[ -n "$UNIT_STATE_SUMMARY" ] || UNIT_STATE_SUMMARY="NONE"
+echo "unit-states (enabled/active): $UNIT_STATE_SUMMARY" >>"$INTERROGATE_LOG"
+
+# Resolve marker :72 — "which unit autostarts the stock installer?".
+#
+# Two bugs fixed here, both of which made this marker report a FALSE gap while
+# discarding the real one:
+#   1. The verdict was ASSIGNED inside the loop, not accumulated, so only the
+#      LAST offending unit survived. A run observing both
+#      `snap.subiquity.subiquity-service.service` (a real unmasked service) and
+#      `subiquity_config.mount` reported only the mount — signal clobbered by
+#      noise.
+#   2. Every observed unit was treated as maskable. Only unit types that can
+#      START something are relevant; .mount/.device units are snap plumbing and
+#      are never "the autostart unit" this marker is about. Masking a .mount
+#      would in fact break the snap.
+#   3. Presence was treated as autostart. `list-units --all` includes inactive
+#      units and `list-unit-files` lists units that only exist on disk. A unit
+#      is only a finding if it is actually ENABLED or ACTIVE — masked units
+#      report `masked`, and `static`/`disabled`/`indirect` cannot autostart.
+MARKER72_UNMASKED=""
+if [ "$OBSERVED_UNITS" != "NONE" ]; then
+  for u in $OBSERVED_UNITS; do
+    case "$u" in *.service) ;; *) continue ;; esac
+    case " $MASKED_UNITS " in
+      *" $u "*) continue ;;
+    esac
+    case "${UNIT_ENABLED[$u]:-}" in
+      enabled|enabled-runtime|alias) ;;
+      *) [ "${UNIT_ACTIVE[$u]:-}" = "active" ] || continue ;;
+    esac
+    MARKER72_UNMASKED="${MARKER72_UNMASKED} ${u}(${UNIT_ENABLED[$u]:-?}/${UNIT_ACTIVE[$u]:-?})"
+  done
+fi
+MARKER72_UNMASKED="${MARKER72_UNMASKED# }"
+if [ -n "$MARKER72_UNMASKED" ]; then
+  MARKER72_VERDICT="GAP (autostart-capable unmasked service(s): $MARKER72_UNMASKED)"
+else
+  MARKER72_VERDICT="COVERED"
 fi
 echo "observed-units: $OBSERVED_UNITS -> verdict: $MARKER72_VERDICT" >>"$INTERROGATE_LOG"
 
@@ -457,6 +516,23 @@ if ! grep -q "Phase 6: Final setup" "$INSTALL_LOG" \
   fail_stage 4 "install log does not show all 7 phases completed (found ${PHASE_COMPLETED_COUNT:-0} 'Phase completed:' lines, or missing the Phase 6 / final-success line) — see $INSTALL_LOG"
 fi
 echo "install OK: exit=0, ${PHASE_COMPLETED_COUNT} phases completed" | tee -a "$INSTALL_LOG"
+
+# Re-interrogate marker :81 while the LIVE env is still up (stage 5 reboots into
+# the installed disk, where these answers would mean something else entirely).
+#
+# The stage-3 snapshot is taken BEFORE the install, but the agent apt-installs
+# what it needs into the live environment during it — see
+# `crates/uaa-core/src/network/ssh_installer/packages.rs:34-55` for clevis /
+# clevis-luks / clevis-tpm2. So a bare pre-install "MISSING" is expected and
+# says nothing; only a tool still missing AFTER the install is a real gap.
+for tool in debootstrap sgdisk zpool cryptsetup dracut clevis; do
+  if ssh_run 15 "$SSH_USER" "command -v $tool >/dev/null 2>&1" >>"$INSTALL_LOG" 2>&1; then
+    TOOL_STATUS_POST[$tool]="present"
+  else
+    TOOL_STATUS_POST[$tool]="MISSING"
+  fi
+  echo "  post-install $tool: ${TOOL_STATUS_POST[$tool]}" >>"$INSTALL_LOG"
+done
 
 # =========================================================================
 # Stage 5: boot-disk (reboot from the installed disk; same swtpm state)
