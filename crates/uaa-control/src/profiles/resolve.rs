@@ -318,6 +318,7 @@ mod tests {
             cache: ".25".to_string(),
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
+            store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
         });
 
         let mut group = group_row(gid, "len-serv", "{name}-{index:03}");

@@ -238,6 +238,9 @@ pub struct CockroachSpecPartial {
     pub cache: Option<String>,
     pub max_sql_memory: Option<String>,
     pub locality: Option<String>,
+    /// `--store`, overridable per host (e.g. a node with different disk
+    /// geometry needing a different `size=` share).
+    pub store: Option<String>,
 }
 
 /// Where a resolved field's value came from. Filled by DS-PRF-02.
@@ -340,6 +343,7 @@ mod tests {
                 cache: ".25".to_string(),
                 max_sql_memory: ".25".to_string(),
                 locality: "region=us,cluster-unit=lenovo".to_string(),
+                store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
             })]),
             ..Default::default()
         };

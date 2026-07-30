@@ -722,7 +722,13 @@ fi
 # (or absent) `applications:` section means "no application-specific
 # probe": the LUKS/ZFS/multi-user assertions above already fully prove
 # readiness for a role-free profile, so that case is a no-op here.
-APP_KIND="$(awk '
+#
+# Probes EVERY declared application, not just the first. This previously read
+# `applications[0].kind` and stopped (`exit` in the awk below), so on a host
+# with several applications — which is the whole point of composable
+# application specs — the gate silently proved only one of them and reported
+# PASS for the rest.
+APP_KINDS="$(awk '
   /^applications:[[:space:]]*(\[\][[:space:]]*)?$/ { inapps=1; next }
   inapps && /^[^[:space:]#]/ { inapps=0 }
   inapps && /kind:/ {
@@ -730,11 +736,13 @@ APP_KIND="$(awk '
     sub(/[[:space:]]*#.*$/, "")
     gsub(/"/, "")
     print
-    exit
   }
-' "$CONFIG")"
-echo "application-kind dispatch: applications[0].kind='${APP_KIND:-<empty>}'" | tee -a "$ASSERT_LOG"
+' "$CONFIG" | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
+echo "application-kind dispatch: kinds='${APP_KINDS:-<empty>}'" | tee -a "$ASSERT_LOG"
 
+# An empty list still has to run the loop body once, so the "no applications"
+# branch below is reached. Quoting keeps that single empty iteration.
+for APP_KIND in ${APP_KINDS:-""}; do
 case "$APP_KIND" in
 cockroach)
   # CockroachDB readiness. Deliberately not a `systemctl is-active` check
@@ -785,13 +793,76 @@ tang-server)
     fail_stage 6 "tang-server never became ready (curl /adv failed for 150s) — see $ASSERT_LOG"
   fi
   ;;
+prometheus-node-exporter)
+  # Readiness = the exporter actually serves metrics. `systemctl is-active`
+  # would pass on a process that bound nothing useful.
+  NODEEXP_READY=""
+  for _ in $(seq 1 12); do
+    if ssh_run 15 root "curl -sf --max-time 5 http://127.0.0.1:9100/metrics -o /dev/null" >>"$ASSERT_LOG" 2>&1; then
+      NODEEXP_READY=yes
+      break
+    fi
+    sleep 5
+  done
+  if [ -n "$NODEEXP_READY" ]; then
+    echo "PASS: prometheus-node-exporter serves /metrics" | tee -a "$ASSERT_LOG"
+  else
+    ssh_run 15 root "systemctl status prometheus-node-exporter --no-pager" >>"$ASSERT_LOG" 2>&1 || true
+    fail_stage 6 "prometheus-node-exporter never served /metrics (60s) — see $ASSERT_LOG"
+  fi
+  ;;
+cockroach-rollout-agent)
+  # Deliberately NOT an is-active check: the fleet ships this unit installed
+  # but DISABLED (len-serv-003, 2026-07-28), so "running" is the wrong bar.
+  # Assert the artifacts exist and the unit parses.
+  if ssh_run 15 root "test -x /usr/local/bin/cockroach-rollout-agent && \
+       test -f /etc/systemd/system/cockroach-rollout-agent.service && \
+       test -f /etc/cockroach-rollout-agent.env && \
+       systemctl cat cockroach-rollout-agent >/dev/null" >>"$ASSERT_LOG" 2>&1; then
+    echo "PASS: cockroach-rollout-agent binary + unit + env installed" | tee -a "$ASSERT_LOG"
+  else
+    fail_stage 6 "cockroach-rollout-agent artifacts missing or unit unparseable — see $ASSERT_LOG"
+  fi
+  ;;
+canonical-livepatch)
+  # With the authoring placeholder key the snap is installed but NOT enabled,
+  # so presence of the snap is the only thing that can be asserted without a
+  # real token. Enablement is verified on the real host, not in the gate.
+  if ssh_run 30 root "snap list canonical-livepatch" >>"$ASSERT_LOG" 2>&1; then
+    echo "PASS: canonical-livepatch snap installed" | tee -a "$ASSERT_LOG"
+  else
+    fail_stage 6 "canonical-livepatch snap not installed — see $ASSERT_LOG"
+  fi
+  ;;
+report-status)
+  # Assert it exists, is executable, and is syntactically valid — a broken
+  # reporter fails silently at first boot, which is the failure mode that
+  # makes a host look healthy while reporting nothing.
+  if ssh_run 15 root "test -x /usr/local/bin/report-status.sh && \
+       bash -n /usr/local/bin/report-status.sh && command -v jq >/dev/null" >>"$ASSERT_LOG" 2>&1; then
+    echo "PASS: report-status.sh installed, executable, parses, jq present" | tee -a "$ASSERT_LOG"
+  else
+    fail_stage 6 "report-status.sh missing/non-executable/unparseable or jq absent — see $ASSERT_LOG"
+  fi
+  ;;
+zsh)
+  # The login shell is the point; installing the package without switching
+  # the shell is the silent half-failure.
+  if ssh_run 15 root "command -v zsh >/dev/null && getent passwd | grep -q ':/usr/bin/zsh$'" >>"$ASSERT_LOG" 2>&1; then
+    echo "PASS: zsh installed and set as a login shell" | tee -a "$ASSERT_LOG"
+  else
+    ssh_run 15 root "getent passwd" >>"$ASSERT_LOG" 2>&1 || true
+    fail_stage 6 "zsh not installed or no account uses it as a login shell — see $ASSERT_LOG"
+  fi
+  ;;
 "")
   echo "PASS: no applications configured — multi-user.target reached is sufficient (already asserted above)" | tee -a "$ASSERT_LOG"
   ;;
 *)
-  fail_stage 6 "unknown applications[0].kind='$APP_KIND' — vm-validate.sh stage 6 has no readiness probe for it; extend the case in scripts/vm-validate.sh before using this kind in a VM-gate config"
+  fail_stage 6 "unknown applications[].kind='$APP_KIND' — vm-validate.sh stage 6 has no readiness probe for it; extend the case in scripts/vm-validate.sh before using this kind in a VM-gate config"
   ;;
 esac
+done
 
 # =========================================================================
 # Stage 7: report — GATE: PASS only if stages 2-6 all passed above.
