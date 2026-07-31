@@ -170,6 +170,21 @@ pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
             }
         }
         HostRole::InstallTarget => {
+            // (rule 6) An application claiming it must be drained before a
+            // wipe, but naming no way to drain, is the worst possible state:
+            // `needs_drain` says yes, the drain does nothing, and the reinstall
+            // proceeds to wipe a node still holding replicas. Fail authoring
+            // rather than discover it during a rebuild.
+            for app in &cfg.applications {
+                if let Some(policy) = app.decommission() {
+                    if policy.enabled && policy.steps.is_empty() {
+                        violations.push(format!(
+                            "application {:?} sets decommission.enabled but declares no steps",
+                            app.kind()
+                        ));
+                    }
+                }
+            }
             let has_disk_plan = !cfg.disk_device.is_empty() || !cfg.disks.is_empty();
             if !has_disk_plan {
                 violations.push(
@@ -754,6 +769,59 @@ mod tests {
         cfg.applications = vec![ApplicationSpec::TangServer(TangServerSpec {
             port: 80,
             key_directory: "/etc/tang/keys".into(),
+        })];
+        assert!(validate_resolved(&cfg).is_ok());
+    }
+
+    /// An application that claims it needs draining but names no steps would
+    /// make `needs_drain` say yes while the drain is a no-op — the reinstall
+    /// would then wipe a node still holding replicas.
+    #[test]
+    fn test_rule6_decommission_enabled_without_steps_fails() {
+        use crate::network::ssh_installer::config::{CockroachSpec, DecommissionPolicy};
+
+        let mut cfg = base_config();
+        let mut spec = CockroachSpec {
+            version: "v25.3.0".into(),
+            port: 36357,
+            sql_port: 36257,
+            http_addr: ":38080".into(),
+            seed_ip: "172.16.3.92".into(),
+            cache: ".25".into(),
+            max_sql_memory: ".25".into(),
+            locality: "region=us".into(),
+            store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".into(),
+            decommission: DecommissionPolicy::cockroach_default(),
+        };
+        spec.decommission.steps.clear();
+        cfg.applications = vec![ApplicationSpec::Cockroach(spec)];
+
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sets decommission.enabled but declares no steps"),
+            "got: {err}"
+        );
+    }
+
+    /// The shipped cockroach default must itself be legal — otherwise every
+    /// cockroach host fails validation out of the box.
+    #[test]
+    fn test_rule6_cockroach_default_policy_is_valid() {
+        use crate::network::ssh_installer::config::{CockroachSpec, DecommissionPolicy};
+
+        let mut cfg = base_config();
+        cfg.applications = vec![ApplicationSpec::Cockroach(CockroachSpec {
+            version: "v25.3.0".into(),
+            port: 36357,
+            sql_port: 36257,
+            http_addr: ":38080".into(),
+            seed_ip: "172.16.3.92".into(),
+            cache: ".25".into(),
+            max_sql_memory: ".25".into(),
+            locality: "region=us".into(),
+            store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".into(),
+            decommission: DecommissionPolicy::cockroach_default(),
         })];
         assert!(validate_resolved(&cfg).is_ok());
     }

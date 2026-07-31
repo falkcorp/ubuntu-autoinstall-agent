@@ -727,6 +727,7 @@ mod tests {
             max_sql_memory: "25%".into(),
             locality: "region=default".into(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".into(),
+            decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         }
     }
 
