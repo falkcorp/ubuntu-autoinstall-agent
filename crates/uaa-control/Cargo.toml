@@ -75,3 +75,6 @@ uaa-core = { path = "../uaa-core" }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+# Drain tests build ApplicationSpec fixtures from YAML rather than struct
+# literals, so adding a field to a spec does not cascade into this crate.
+serde_yaml = { workspace = true }

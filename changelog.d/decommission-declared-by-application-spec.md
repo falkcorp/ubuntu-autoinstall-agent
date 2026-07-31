@@ -17,10 +17,10 @@
   decommission:
     enabled: true
     steps:
-      - step: stop-unit
-        unit: cockroach.service
       - step: cockroach-decommission
       - step: wait-for-zero-replicas
+      - step: stop-unit
+        unit: cockroach.service
     timeout-secs: 3600
     poll-interval-secs: 30
 ```
@@ -38,8 +38,14 @@ headed for a wipe. Letting a registry profile blob execute arbitrary commands
 on U0 is a far larger promise, and closed-but-growing enums are how every other
 component here is modelled (Decision 15).
 
-The cockroach default is `enabled: true` with stop-unit → decommission →
-wait-for-zero-replicas. The `decommission` key is deliberately **not**
+The cockroach default is `enabled: true` with decommission →
+wait-for-zero-replicas → stop-unit. That order is load-bearing and it is the
+opposite of the intuitive one: CockroachDB moves replicas off a node *while
+that node is still running and serving*, so stopping `cockroach.service` first
+would leave the ranges to re-replicate only via the dead-node timeout — the
+exact under-replication window the policy exists to close. The unit is stopped
+last, once the node is provably holding nothing. The `decommission` key is
+deliberately **not**
 `skip_serializing_if`: a policy governing a terminal, destructive operation
 should be visible in the placed artifact rather than implied by its absence.
 
