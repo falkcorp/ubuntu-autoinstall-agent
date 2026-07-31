@@ -199,11 +199,16 @@ pub struct CockroachSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DecommissionStep {
-    /// Stop a systemd unit on the host before draining, so it stops taking new
-    /// work while its replicas move.
+    /// Stop a systemd unit on the host over SSH.
+    ///
+    /// For CockroachDB this belongs AFTER the drain, not before — see the
+    /// ordering note on [`DecommissionPolicy::cockroach_default`].
     StopUnit { unit: String },
     /// `cockroach node decommission` for this host's node id, using U0's
     /// certs. TERMINAL — the node can never rejoin under that id.
+    ///
+    /// Started with `--wait=none` so the deadline that governs the drain is
+    /// the authored `timeout_secs`, not `cockroach`'s own internal wait.
     CockroachDecommission,
     /// Poll the node's replica count until it reaches zero. This is the step
     /// that actually makes the wipe safe; `CockroachDecommission` only starts
@@ -257,17 +262,25 @@ impl DecommissionPolicy {
         *self == Self::default()
     }
 
-    /// The policy a CockroachDB node gets unless overridden: stop the unit so
-    /// it takes no new work, decommission, then wait for replicas to hit zero.
+    /// The policy a CockroachDB node gets unless overridden: decommission,
+    /// wait for replicas to hit zero, and only THEN stop the unit.
+    ///
+    /// ORDER IS LOAD-BEARING, and it is the opposite of the intuitive one.
+    /// CockroachDB moves replicas off a node *while that node is still running
+    /// and serving* — `cockroach node decommission` asks a live node to hand
+    /// its ranges away. Stopping `cockroach.service` first would leave the
+    /// ranges to re-replicate only via the dead-node timeout, which is the
+    /// under-replication window this whole policy exists to close. Stop the
+    /// unit last, once the node is provably holding nothing.
     pub fn cockroach_default() -> Self {
         Self {
             enabled: true,
             steps: vec![
+                DecommissionStep::CockroachDecommission,
+                DecommissionStep::WaitForZeroReplicas,
                 DecommissionStep::StopUnit {
                     unit: "cockroach.service".to_string(),
                 },
-                DecommissionStep::CockroachDecommission,
-                DecommissionStep::WaitForZeroReplicas,
             ],
             timeout_secs: default_decommission_timeout_secs(),
             poll_interval_secs: default_decommission_poll_secs(),
