@@ -238,6 +238,9 @@ pub struct CockroachSpecPartial {
     pub cache: Option<String>,
     pub max_sql_memory: Option<String>,
     pub locality: Option<String>,
+    /// Drain policy, overridable per host (e.g. a longer timeout on a node
+    /// holding more ranges).
+    pub decommission: Option<crate::network::ssh_installer::config::DecommissionPolicy>,
     /// `--store`, overridable per host (e.g. a node with different disk
     /// geometry needing a different `size=` share).
     pub store: Option<String>,
@@ -344,6 +347,7 @@ mod tests {
                 max_sql_memory: ".25".to_string(),
                 locality: "region=us,cluster-unit=lenovo".to_string(),
                 store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
+                decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
             })]),
             ..Default::default()
         };

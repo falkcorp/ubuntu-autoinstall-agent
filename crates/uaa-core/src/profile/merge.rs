@@ -249,6 +249,10 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .clone()
             .unwrap_or_else(|| base.locality.clone()),
         store: overrides.store.clone().unwrap_or_else(|| base.store.clone()),
+        decommission: overrides
+            .decommission
+            .clone()
+            .unwrap_or_else(|| base.decommission.clone()),
     }
 }
 
@@ -841,6 +845,7 @@ mod tests {
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
+            decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         }
     }
 
