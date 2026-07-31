@@ -104,6 +104,48 @@ impl ApplicationSpec {
             ApplicationSpec::Zsh(_) => "zsh",
         }
     }
+
+    /// This application's drain policy, if it declares one.
+    ///
+    /// Lets U0 ask "does any application on this host need draining?" instead
+    /// of "is this host one I remember runs a database?". A new clustered
+    /// workload becomes safe to reinstall by authoring a `decommission` block
+    /// on its variant — the reinstall driver never changes.
+    ///
+    /// `None` for stateless applications, which is most of them: a
+    /// node-exporter or a login shell has nothing to drain.
+    pub fn decommission(&self) -> Option<&DecommissionPolicy> {
+        match self {
+            ApplicationSpec::Cockroach(s) => Some(&s.decommission),
+            ApplicationSpec::TangServer(_)
+            | ApplicationSpec::CockroachRolloutAgent(_)
+            | ApplicationSpec::PrometheusNodeExporter(_)
+            | ApplicationSpec::CanonicalLivepatch(_)
+            | ApplicationSpec::ReportStatus(_)
+            | ApplicationSpec::Zsh(_) => None,
+        }
+    }
+}
+
+/// Whether any application on this host must be drained before its disk is
+/// wiped. This is the whole of `NodeDrainer::needs_drain`'s logic — the
+/// decision lives in the authored specs, not in the reinstall driver.
+pub fn requires_drain(applications: &[ApplicationSpec]) -> bool {
+    applications
+        .iter()
+        .filter_map(|a| a.decommission())
+        .any(|d| d.enabled)
+}
+
+/// Every drain step declared across a host's applications, in application
+/// order then step order.
+pub fn drain_steps(applications: &[ApplicationSpec]) -> Vec<&DecommissionStep> {
+    applications
+        .iter()
+        .filter_map(|a| a.decommission())
+        .filter(|d| d.enabled)
+        .flat_map(|d| d.steps.iter())
+        .collect()
 }
 
 /// CockroachDB node parameters. `advertise`/`join` are NOT here: they are
@@ -136,6 +178,101 @@ pub struct CockroachSpec {
     /// pre-wipe inventory says to standardize away from.
     #[serde(default = "default_cockroach_store")]
     pub store: String,
+    /// How U0 drains this node before a reinstall wipes it.
+    ///
+    /// Deliberately NOT `skip_serializing_if` — a policy governing a
+    /// destructive, terminal operation should be visible in the placed
+    /// artifact rather than implied by its absence.
+    #[serde(default = "DecommissionPolicy::cockroach_default")]
+    pub decommission: DecommissionPolicy,
+}
+
+/// A single step U0 runs to drain a host before its disk is wiped.
+///
+/// Closed enum, NOT free-form shell. These steps execute on **U0**, the fleet
+/// control plane — unlike [`HookStep`](super::components::hooks::HookStep),
+/// which runs on the target being installed and whose blast radius is a
+/// machine already headed for a wipe. Making a registry profile blob able to
+/// run arbitrary commands on U0 is a far larger promise, and a closed enum is
+/// what every other component here uses (Decision 15: closed-but-growing
+/// enums, not a plugin framework). Add a variant to support a new workload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "step", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum DecommissionStep {
+    /// Stop a systemd unit on the host before draining, so it stops taking new
+    /// work while its replicas move.
+    StopUnit { unit: String },
+    /// `cockroach node decommission` for this host's node id, using U0's
+    /// certs. TERMINAL — the node can never rejoin under that id.
+    CockroachDecommission,
+    /// Poll the node's replica count until it reaches zero. This is the step
+    /// that actually makes the wipe safe; `CockroachDecommission` only starts
+    /// the drain.
+    WaitForZeroReplicas,
+}
+
+/// Whether and how a host must be drained before a reinstall wipes it.
+///
+/// Declared BY THE APPLICATION rather than hardcoded in U0, so
+/// `NodeDrainer::needs_drain` is "does any application declare
+/// `decommission.enabled`?" instead of "is the hostname one we remember runs a
+/// database?". A new clustered workload gets safe reinstalls by authoring this
+/// block, with no change to the reinstall driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DecommissionPolicy {
+    /// `false` means a reinstall goes straight to the power cycle for this
+    /// application — correct for anything stateless.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ordered steps U0 runs. Empty with `enabled: true` is a config error
+    /// (caught in validation), not a silent no-op — a host that claims it
+    /// needs draining and specifies no way to drain is the worst case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<DecommissionStep>,
+    /// Hard deadline for the whole drain. On expiry the reinstall is REFUSED,
+    /// never forced — see `RefusalReason::DrainIncomplete`.
+    #[serde(default = "default_decommission_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Delay between replica-count polls.
+    #[serde(default = "default_decommission_poll_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for DecommissionPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            steps: Vec::new(),
+            timeout_secs: default_decommission_timeout_secs(),
+            poll_interval_secs: default_decommission_poll_secs(),
+        }
+    }
+}
+
+impl DecommissionPolicy {
+    /// The `skip_serializing_if` predicate: a stateless application omits the
+    /// key entirely rather than serializing an all-defaults block.
+    pub fn is_disabled_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The policy a CockroachDB node gets unless overridden: stop the unit so
+    /// it takes no new work, decommission, then wait for replicas to hit zero.
+    pub fn cockroach_default() -> Self {
+        Self {
+            enabled: true,
+            steps: vec![
+                DecommissionStep::StopUnit {
+                    unit: "cockroach.service".to_string(),
+                },
+                DecommissionStep::CockroachDecommission,
+                DecommissionStep::WaitForZeroReplicas,
+            ],
+            timeout_secs: default_decommission_timeout_secs(),
+            poll_interval_secs: default_decommission_poll_secs(),
+        }
+    }
 }
 
 /// CockroachDB rollout agent. Binary + env file + unit, running as the
@@ -554,6 +691,17 @@ fn default_tang_port() -> u16 {
     80
 }
 
+/// One hour. A drain moving hundreds of replicas off a node is not fast, and
+/// the failure mode of a too-short deadline is a REFUSED reinstall, not a
+/// forced one — so err long.
+fn default_decommission_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_decommission_poll_secs() -> u64 {
+    30
+}
+
 /// len-serv-001/002 form, verified 2026-07-30. NOT len-serv-003's drifted
 /// bare `/var/lib/cockroach/data`.
 fn default_cockroach_store() -> String {
@@ -717,6 +865,7 @@ mod tests {
                 max_sql_memory: ".25".into(),
                 locality: "region=us".into(),
                 store: default_cockroach_store(),
+                decommission: DecommissionPolicy::cockroach_default(),
             }),
             ApplicationSpec::TangServer(TangServerSpec {
                 port: 80,
@@ -758,6 +907,52 @@ mod tests {
         // Guard the count so a new variant added to the enum without a sample
         // above fails loudly rather than passing vacuously.
         assert_eq!(samples.len(), 7, "add the new ApplicationSpec variant here");
+    }
+
+    /// `requires_drain` is the whole of U0's `needs_drain` decision, so it must
+    /// key off the authored spec — never off a hostname or a variant name.
+    #[test]
+    fn requires_drain_is_declared_by_the_spec() {
+        let stateless = vec![
+            ApplicationSpec::PrometheusNodeExporter(PrometheusNodeExporterSpec {
+                listen_address: default_node_exporter_listen(),
+            }),
+            ApplicationSpec::Zsh(ZshSpec {
+                user: "jdfalk".into(),
+                oh_my_zsh: false,
+            }),
+        ];
+        assert!(
+            !requires_drain(&stateless),
+            "a host running nothing clustered must not be drained"
+        );
+        assert!(drain_steps(&stateless).is_empty());
+
+        let mut crdb = CockroachSpec {
+            version: "v25.3.0".into(),
+            port: 36357,
+            sql_port: 36257,
+            http_addr: ":38080".into(),
+            seed_ip: "172.16.3.92".into(),
+            cache: ".25".into(),
+            max_sql_memory: ".25".into(),
+            locality: "region=us".into(),
+            store: default_cockroach_store(),
+            decommission: DecommissionPolicy::cockroach_default(),
+        };
+
+        let with_crdb = vec![ApplicationSpec::Cockroach(crdb.clone())];
+        assert!(requires_drain(&with_crdb));
+        assert_eq!(
+            drain_steps(&with_crdb).len(),
+            3,
+            "stop unit, decommission, wait for zero replicas"
+        );
+
+        // Turning the policy off is honored — the decision is authored, not
+        // inferred from the fact that it is a database.
+        crdb.decommission.enabled = false;
+        assert!(!requires_drain(&[ApplicationSpec::Cockroach(crdb)]));
     }
 
     /// A `--store` value must yield the directory cockroach will actually
