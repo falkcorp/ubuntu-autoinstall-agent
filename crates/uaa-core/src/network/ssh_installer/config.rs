@@ -1,12 +1,13 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.15.0
+// version: 2.16.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Configuration structures for SSH/local installation
 
 use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
 use crate::network::ssh_installer::components::hooks::Hooks;
+use crate::network::ssh_installer::unlock_sss::SssPolicy;
 use serde::{Deserialize, Serialize};
 
 /// Which initramfs generator is in use on the target.
@@ -580,6 +581,21 @@ pub struct InstallationConfig {
     /// consumes this yet.
     #[serde(default, skip_serializing_if = "Hooks::is_empty")]
     pub hooks: Hooks,
+    /// EXPLICIT clevis SSS unlock policy tree, when the host authors one.
+    ///
+    /// `None` — every committed host config today — means the installer keeps
+    /// building the flat policy from `tang_servers`/`tang_threshold` exactly as
+    /// before, so len-serv-001/002 stay byte-identical. `Some(tree)` REPLACES
+    /// that derivation wholesale, which is the only way to express a true AND:
+    /// the flat shape's `"tang":[a,b,c]` is three shares, so `t=2` there is
+    /// satisfiable by Tang alone. See [`super::unlock_sss`] for the full
+    /// arithmetic and the nesting that fixes it.
+    ///
+    /// `skip_serializing_if` omits the key for a tree-free host, so a
+    /// registry-resolved config serializes exactly as before this field
+    /// existed — same cross-version-rollback safety as `applications`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlock_sss: Option<SssPolicy>,
 }
 
 /// Which encryption/storage layout the installer builds.
@@ -821,6 +837,7 @@ impl InstallationConfig {
             role: HostRole::InstallTarget,
             firmware_quirks: Vec::new(),
             hooks: Hooks::default(),
+            unlock_sss: None,
         }
     }
 }

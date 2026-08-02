@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.4.1
+// version: 1.4.2
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -713,6 +713,7 @@ mod tests {
             role: Default::default(),
             firmware_quirks: Vec::new(),
             hooks: Default::default(),
+            unlock_sss: None,
         }
     }
 

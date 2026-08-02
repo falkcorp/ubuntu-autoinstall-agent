@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/lower.rs
-// version: 1.0.2
+// version: 1.1.0
 // guid: 74997d1d-8349-4aaf-ac8a-b6ec886492a1
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Pure authoring->flat-wire bridge (PS-LOWER-12).
 //!
@@ -33,6 +33,7 @@
 //! | `unlock_policy.tpm2_pin.pcr_ids`                 | `tpm2_pcr_ids`                                |
 //! | `unlock_policy.tpm2_pin.enroll`                  | `enroll_tpm2`                                 |
 //! | `unlock_policy.fido2_expected`                   | `expect_fido2`                                |
+//! | `unlock_policy.sss`                              | `unlock_sss`                                  |
 //! | `disk_layout = SingleLuks(spec)`                 | `storage_mode=PlainLuks`, `disk_device=spec.disk_device` |
 //! | `disk_layout = ZfsNativeKeystore(spec)`          | `storage_mode=NativeKeystore`, `disks=spec.disks` |
 //! | `arch`/`role`/`firmware_quirks`/`hooks`          | copy through unchanged                        |
@@ -61,6 +62,7 @@ use super::{DiskLayoutPartial, InstallationConfigPartial};
 use crate::network::ssh_installer::config::{
     DiskSpec, InitramfsType, InstallationConfig, StorageMode, TangServer,
 };
+use crate::network::ssh_installer::unlock_sss::SssPolicy;
 
 /// Lowers a RESOLVED authoring-time partial to the flat wire config the
 /// installer pipeline consumes. Pure and total.
@@ -122,7 +124,29 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
         role: resolved.role.unwrap_or_default(),
         firmware_quirks: resolved.firmware_quirks.clone().unwrap_or_default(),
         hooks: resolved.hooks.clone().unwrap_or_default(),
+        unlock_sss: lower_unlock_sss(resolved),
     }
+}
+
+/// Lowers `unlock_policy.sss` — the EXPLICIT clevis SSS policy tree — to
+/// `InstallationConfig::unlock_sss`.
+///
+/// There is deliberately NO flat-field fallback and NO synthesis: `None` means
+/// "this host authored no tree", and the installer then derives its policy from
+/// `tang_servers`/`tang_threshold` exactly as it always has. That is what keeps
+/// len-serv-001/002 byte-identical — synthesizing an equivalent tree here would
+/// have handed the installer a new input to interpret on hosts that never asked
+/// for one.
+///
+/// Precedence when a host authors BOTH `sss` and `tang`: the tree wins for
+/// `unlock_sss` while `tang` still lowers to the flat fields. `lower` is pure
+/// and total, so a disagreement between the two is a validate-layer concern
+/// (PS-VALIDATE-14), not an error here.
+fn lower_unlock_sss(resolved: &InstallationConfigPartial) -> Option<SssPolicy> {
+    resolved
+        .unlock_policy
+        .as_ref()
+        .and_then(|u| u.sss.clone())
 }
 
 /// Lowers the `network` component (falling back to the flat
@@ -378,6 +402,7 @@ mod tests {
                 }),
                 tpm2_clevis_peer: Some(true),
                 fido2_expected: Some(false),
+                sss: None,
             }),
             disk_layout: Some(DiskLayoutPartial::SingleLuks(SingleLuksSpecPartial {
                 esp_size: Some("1G".to_string()),
@@ -578,6 +603,136 @@ mod tests {
             lower(&inherit_with_flat_value).tpm2_pin,
             Some("4321".to_string())
         );
+    }
+
+    /// REGRESSION GUARD for len-serv-001/002: a flat-authored host — the
+    /// entire committed fleet — must lower to `unlock_sss: None` and to the
+    /// SAME flat unlock fields as before this field existed, and must not gain
+    /// an `unlock-sss` key when serialized.
+    #[test]
+    fn test_legacy_flat_tang_lowers_with_no_policy_tree() {
+        let flat_via_component = InstallationConfigPartial {
+            unlock_policy: Some(UnlockPolicyPartial {
+                tang: Some(TangSssPartial {
+                    servers: Some(vec![
+                        TangServer {
+                            url: "http://tang1.example.internal".to_string(),
+                        },
+                        TangServer {
+                            url: "http://tang2.example.internal".to_string(),
+                        },
+                        TangServer {
+                            url: "http://tang3.example.internal".to_string(),
+                        },
+                    ]),
+                    threshold: Some(2),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let flat_via_wire_fields = InstallationConfigPartial {
+            tang_servers: Some(vec![
+                TangServer {
+                    url: "http://tang1.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang2.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang3.example.internal".to_string(),
+                },
+            ]),
+            tang_threshold: Some(2),
+            ..Default::default()
+        };
+
+        for resolved in [&flat_via_component, &flat_via_wire_fields] {
+            let config = lower(resolved);
+            assert_eq!(
+                config.unlock_sss, None,
+                "a host that authored no tree must not acquire one"
+            );
+            assert_eq!(config.tang_servers.len(), 3);
+            assert_eq!(config.tang_threshold, 2);
+
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            assert!(
+                !yaml.contains("unlock_sss"),
+                "a tree-free config must serialize without the key, got:\n{yaml}"
+            );
+        }
+    }
+
+    /// An authored tree lowers through verbatim — including the share
+    /// arithmetic that makes it an AND rather than the flat shape's OR.
+    #[test]
+    fn test_authored_policy_tree_lowers_verbatim() {
+        let servers = vec![
+            TangServer {
+                url: "http://tang1.example.internal".to_string(),
+            },
+            TangServer {
+                url: "http://tang2.example.internal".to_string(),
+            },
+            TangServer {
+                url: "http://tang3.example.internal".to_string(),
+            },
+        ];
+        let tree = SssPolicy::tpm2_and_tang("7", &servers, 2);
+        let resolved = InstallationConfigPartial {
+            unlock_policy: Some(UnlockPolicyPartial {
+                sss: Some(tree.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = lower(&resolved);
+        assert_eq!(config.unlock_sss.as_ref(), Some(&tree), "lowered verbatim");
+        assert_eq!(
+            config.unlock_sss.as_ref().unwrap().share_count(),
+            2,
+            "AND(tpm2, tang-group) is 2-of-2 — the flat shape would be 2-of-4"
+        );
+        // The lowered config survives a serde round-trip with the tree intact.
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let back: InstallationConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.unlock_sss, Some(tree));
+    }
+
+    /// Documented precedence: when a host authors BOTH, the tree drives
+    /// `unlock_sss` and `tang` still drives the flat fields. `lower` is pure
+    /// and total, so this is a rule, not an error.
+    #[test]
+    fn test_tree_and_flat_tang_coexist_without_either_clobbering_the_other() {
+        let tree = SssPolicy::any_pkcs11(&["pkcs11:token=yubi-a"]);
+        let resolved = InstallationConfigPartial {
+            unlock_policy: Some(UnlockPolicyPartial {
+                tang: Some(TangSssPartial {
+                    servers: Some(vec![TangServer {
+                        url: "http://tang1.example.internal".to_string(),
+                    }]),
+                    threshold: Some(1),
+                }),
+                sss: Some(tree.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = lower(&resolved);
+        assert_eq!(
+            config.unlock_sss,
+            Some(tree),
+            "the tree wins for unlock_sss"
+        );
+        assert_eq!(
+            config.tang_servers.len(),
+            1,
+            "flat tang fields are still lowered — other consumers read them"
+        );
+        assert_eq!(config.tang_threshold, 1);
     }
 
     #[test]

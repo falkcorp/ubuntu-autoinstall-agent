@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
-// last-edited: 2026-07-24
+// last-edited: 2026-08-02
 
 //! Merge logic for `InstallationConfigPartial` -> `InstallationConfig` (DS-PRF-02).
 //!
@@ -410,6 +410,12 @@ fn resolve_unlock_policy(
     Some(UnlockPolicyPartial {
         tang,
         tpm2_pin,
+        // WHOLE-VALUE, not leaf-by-leaf: an SSS policy is a recursive tree
+        // whose share arithmetic only means anything as one unit. A host that
+        // authors a tree replaces the group's outright — half-inheriting a
+        // threshold from one tier and pins from another would silently
+        // manufacture a policy nobody authored.
+        sss: resolve_component_leaf(&h.sss, &g.sss, "unlock-policy.sss", provenance),
         tpm2_clevis_peer: resolve_component_leaf(
             &h.tpm2_clevis_peer,
             &g.tpm2_clevis_peer,
@@ -1128,5 +1134,69 @@ mod tests {
             Some(&Source::Host)
         );
         assert_eq!(provenance.0.get("disk-layout"), Some(&Source::Host));
+    }
+
+    /// The `sss` policy tree resolves WHOLE-VALUE: a host tree replaces the
+    /// group's outright rather than merging leaf-by-leaf, because half of one
+    /// threshold group grafted onto half of another is a policy nobody
+    /// authored — and a wrong share count is a machine that cannot unlock.
+    #[test]
+    fn test_sss_policy_tree_resolves_whole_value_host_wins() {
+        use crate::network::ssh_installer::config::TangServer;
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        let group_tree = SssPolicy::flat_tang(
+            &[
+                TangServer {
+                    url: "http://tang1.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang2.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang3.example.internal".to_string(),
+                },
+            ],
+            2,
+        );
+        let host_tree = SssPolicy::tpm2_and_tang(
+            "7",
+            &[TangServer {
+                url: "http://tang9.example.internal".to_string(),
+            }],
+            1,
+        );
+
+        // Group only -> inherited.
+        let mut group = base_group();
+        group.defaults.unlock_policy = Some(UnlockPolicyPartial {
+            sss: Some(group_tree.clone()),
+            ..Default::default()
+        });
+        let (config, provenance) = merge(&group, &base_host()).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, Some(group_tree));
+        assert_eq!(provenance.0.get("unlock-policy.sss"), Some(&Source::Group));
+
+        // Host tree present -> replaces the group's entirely, including its
+        // threshold and every pin: no leaf-level blending.
+        let mut host = base_host();
+        host.overrides.unlock_policy = Some(UnlockPolicyPartial {
+            sss: Some(host_tree.clone()),
+            ..Default::default()
+        });
+        let (config, provenance) = merge(&group, &host).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, Some(host_tree));
+        assert_eq!(provenance.0.get("unlock-policy.sss"), Some(&Source::Host));
+        assert_eq!(
+            config.unlock_sss.as_ref().unwrap().tang_urls(),
+            vec!["http://tang9.example.internal"],
+            "no pin from the group's tree may survive"
+        );
+
+        // Neither tier authors one -> today's fleet: no tree at all.
+        let (config, provenance) =
+            merge(&base_group(), &base_host()).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, None);
+        assert_eq!(provenance.0.get("unlock-policy.sss"), None);
     }
 }

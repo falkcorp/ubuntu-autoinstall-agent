@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.15.0
+// version: 2.15.1
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Command implementations for the CLI
 
@@ -894,6 +894,7 @@ fn create_local_installation_config(
         role: Default::default(),
         firmware_quirks: Vec::new(),
         hooks: Default::default(),
+        unlock_sss: None,
     })
 }
 
