@@ -1540,7 +1540,19 @@ impl<'a> SystemConfigurator<'a> {
         if uses_tang {
             info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
         }
-        let conf = Self::build_dracut_crypt_conf(uses_tang, nic_driver);
+        // The `clevis` DRACUT MODULE must be gated on the same predicate as the
+        // `clevis luks bind` call sites, not on `uses_tang`. Those two were the
+        // identical expression before authored trees existed, so they could not
+        // diverge; now they can. A Tang-LESS tree (tpm2-only, or the pkcs11 OR
+        // that `SssPolicy::any_pkcs11` exists to build) gets clevis installed and
+        // bound but would ship an initramfs with no clevis module — a green
+        // install that boots to a LUKS prompt, the same bricking class this
+        // change exists to close, in a new shape.
+        //
+        // This pulls the `network` module in for a Tang-less tree too. Wasteful,
+        // not harmful, and much cheaper than splitting the helper's signature.
+        let needs_clevis_module = !config.tang_servers.is_empty() || config.unlock_sss.is_some();
+        let conf = Self::build_dracut_crypt_conf(needs_clevis_module, nic_driver);
         let cmd = format!(
             "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
             conf
@@ -2687,11 +2699,67 @@ mod tests {
             .await
             .expect("dracut config must succeed");
 
-        let joined = log.lock().unwrap().join("\n");
+        // Assert on the add_dracutmodules+= LINE, never on the whole command:
+        // the conf's static comment block mentions both "clevis" and "network",
+        // so a substring search over the full text passes even when the modules
+        // are absent.
+        let modules = dracut_modules_line(&log.lock().unwrap().join("\n"));
         assert!(
-            joined.contains("network"),
-            "tree-only Tang host needs the dracut network module: {joined}"
+            modules.contains("network"),
+            "tree-only Tang host needs the dracut network module: {modules}"
         );
+        assert!(
+            modules.contains("clevis"),
+            "tree-only Tang host needs the dracut clevis module: {modules}"
+        );
+    }
+
+    /// A TANG-LESS tree still gets the clevis dracut module. The bind happens
+    /// for any authored tree, so the module must too — gating the module on
+    /// "uses Tang" while gating the bind on "has a tree" lets the two diverge
+    /// into an installed-and-bound host whose initramfs cannot run clevis.
+    #[tokio::test]
+    async fn test_tang_less_tree_still_gets_the_clevis_dracut_module() {
+        for tree in [
+            // tpm2 only.
+            SssPolicy {
+                threshold: 1,
+                pins: vec![tpm2_pin()],
+            },
+            // pkcs11 OR — the shape `SssPolicy::any_pkcs11` builds.
+            SssPolicy {
+                threshold: 1,
+                pins: vec![
+                    UnlockPin::Pkcs11(Pkcs11Pin {
+                        uri: "pkcs11:slot-id=0".to_string(),
+                    }),
+                    UnlockPin::Pkcs11(Pkcs11Pin {
+                        uri: "pkcs11:slot-id=1".to_string(),
+                    }),
+                ],
+            },
+        ] {
+            let mut cfg = tree_only_config();
+            cfg.unlock_sss = Some(tree);
+            assert!(
+                cfg.unlock_sss.as_ref().unwrap().tang_urls().is_empty(),
+                "fixture must be Tang-LESS"
+            );
+
+            let mut runner = RecordingExecutor::default();
+            let log = runner.commands.clone();
+            SystemConfigurator::new(&mut runner)
+                .configure_dracut_crypt_modules(&cfg)
+                .await
+                .expect("dracut config must succeed");
+
+            let modules = dracut_modules_line(&log.lock().unwrap().join("\n"));
+            assert!(
+                modules.contains("clevis"),
+                "a Tang-less tree is still bound with clevis, so the module is \
+                 required: {modules}"
+            );
+        }
     }
 
     #[test]

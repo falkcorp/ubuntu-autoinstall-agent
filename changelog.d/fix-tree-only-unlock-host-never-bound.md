@@ -1,5 +1,5 @@
 <!-- file: changelog.d/fix-tree-only-unlock-host-never-bound.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 343af6c3-2fd1-4b0e-8bc7-699cb83bc4c2 -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -26,6 +26,13 @@ to satisfy is no better than no bind. `clevis-tpm2` is now installed whenever th
 tree carries a tpm2 pin at any depth, not only on NativeKeystore: that pin's
 decrypter ships in a separate package and its absence surfaces only in the
 initramfs, at first boot, on an encrypted host.
+
+The `clevis` dracut module is gated on the same predicate as the bind, not on
+"uses Tang". Those were one expression before authored trees existed and so could
+not diverge; now they can, and a Tang-less tree (tpm2-only, or the PKCS#11 OR
+that `SssPolicy::any_pkcs11` builds) would otherwise be bound with clevis while
+shipping an initramfs that cannot run it — the same bricking class in a new
+shape.
 
 The Tang advertisement pre-fetch walks `SssPolicy::tang_urls()` depth-first
 instead of iterating the flat roster, so nested Tang entries get an `adv`. This
