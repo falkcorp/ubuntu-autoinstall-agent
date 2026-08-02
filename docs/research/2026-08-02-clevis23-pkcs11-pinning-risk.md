@@ -1,15 +1,16 @@
 <!-- file: docs/research/2026-08-02-clevis23-pkcs11-pinning-risk.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 2.0.0 -->
 <!-- guid: 9c2d41ab-7f38-4e05-b6a1-0d5e83c47f92 -->
 <!-- last-edited: 2026-08-02 -->
 
-# clevis 23 / pkcs11 pin on Ubuntu 26.04: pinning design and the `openssl-provider-legacy` collision
+# clevis 23 / pkcs11 pin on Ubuntu 26.04: pinning design, and why the `openssl-provider-legacy` collision turned out not to exist
 
-**Status: the feature is implemented and OFF BY DEFAULT. The dependency
-collision described in [The unresolved collision](#the-unresolved-collision) is
-NOT solved. Do not flip `clevis_pkcs11_pin: true` on any host that matters
-until the three checks in [Settling it](#settling-it) have been run on a
-scratch 26.04 host.**
+**Status: RESOLVED (2026-08-02). The `openssl-provider-legacy` collision DOES
+NOT OCCUR** — it was an artifact of reading the dependency metadata of the
+wrong build of clevis 23. Measured end to end in a stock Ubuntu 26.04
+container; see [Resolution](#resolution). The flag remains off by default
+because it changes apt state and should be opted into per host, not because the
+risk is open.
 
 ## Why any of this exists
 
@@ -88,7 +89,64 @@ from the installed `.so.3`, so it **co-installs**.
 `clevis` only *Recommends* opensc. They are installed at their stock 26.04
 versions and are deliberately **excluded** from the pin.
 
-## The unresolved collision
+## Resolution: release pocket vs `-proposed`
+
+**The non-obvious fact, which someone will otherwise rediscover the hard way:
+26.10 carries TWO builds of clevis 23, and they have different OpenSSL
+dependencies.**
+
+| Build | Pocket | Linked against | Depends |
+|---|---|---|---|
+| `23-1` | `stonking` (**release**) | OpenSSL 3 | satisfied by 26.04's own `libssl3t64` |
+| `23-1build1` | `stonking-proposed` | OpenSSL 4 | `libssl4 (>= 4.0.0)` → 26.10 `openssl-provider-legacy` |
+
+The original dependency analysis below read `23-1build1` — the **proposed**
+build. That is where `Depends: libssl4` comes from, and therefore where the
+entire `openssl-provider-legacy` displacement scenario comes from. It does not
+apply to the build we actually install.
+
+`Suites: stonking` names the release pocket only, so the candidate resolves to
+`23-1` and `libssl4` is never a consideration.
+
+### Measured on stock Ubuntu 26.04
+
+| Observation | Result |
+|---|---|
+| `clevis`, `clevis-luks`, `clevis-tpm2` | installed at `23-1` |
+| `libssl4` | **never pulled** — absent |
+| `openssl-provider-legacy` | **unchanged** at the 26.04 `3.5.5-1ubuntu3.2` |
+| `libssl3t64` | intact at `3.5.5-1ubuntu3.3` |
+| `opensc` + `opensc-pkcs11` | `0.27.0~rc1-1`, auto-installed via clevis 23's *Recommends* |
+| `/usr/bin/clevis-encrypt-pkcs11`, `clevis-decrypt-pkcs11` | present |
+| `openssl version`, `openssl list -providers`, `openssl dgst`, a TLS handshake, `apt update` | all OK |
+
+And, separately measured: on stock 26.04 the legacy provider is **not active**
+anyway. `openssl list -providers` shows only `default`, and `/etc/ssl/openssl.cnf`
+has `# activate = 1` commented out. So even the displacement scenario, had it
+been real, would have been inert — which is precisely what check (2) and (3) of
+[Settling it](#settling-it) were written to determine.
+
+### What changed in the code
+
+- `CLEVIS23_PINNED_PACKAGES` no longer lists `libssl4` or
+  `openssl-provider-legacy`. Keeping them would have been harmless but
+  misleading — it would imply the OpenSSL 4 path is expected.
+- `sources_never_enable_the_proposed_pocket` asserts the generated deb822
+  sources file contains no `proposed`. That single word is the difference
+  between a clean install and an OpenSSL 4 migration, and it is exactly the kind
+  of "get the newest build" edit a future author would make in good faith.
+- `opensc` is still installed explicitly. It arrives as a *Recommends* of
+  clevis 23, so this is belt-and-braces: it survives `--no-install-recommends`
+  and makes the dependency explicit rather than incidental. `pcscd` is
+  recommended by nothing and **must** stay explicit.
+
+## HISTORICAL: the collision as originally analysed
+
+*Everything from here to the end of this section describes `23-1build1` from
+`-proposed` and is retained only so the reasoning is auditable. It does not
+describe what the installer does.*
+
+### The collision
 
 `openssl-provider-legacy` is a **single package name**. It is installed at
 `3.5.5-1ubuntu3.3` (part of the 26.04 OpenSSL 3.5 stack), and the 26.10 version
@@ -113,7 +171,7 @@ gated. Not green. The co-install of `libssl.so.4` alongside `.so.3` is proven
 safe by soname; the single-name displacement of the provider package is not,
 and it cannot be verified from the repo.
 
-### Settling it
+### Settling it (historical — these checks were run, see Resolution)
 
 Run these on a **scratch** 26.04 host — never on the fleet. `rdepends` alone is
 not the discriminator; the question is whether the provider is *activated*, not
@@ -144,6 +202,7 @@ against 26.04's OpenSSL 3.5, or wait for a real backport.
 
 ## What the flag does
 
+
 `InstallationConfig.clevis_pkcs11_pin` — bool, `#[serde(default)]`, **false**,
 and `skip_serializing_if` so an off flag never even appears in a resolved
 config (rollback safety, same reasoning as `applications`). Profile-lowered
@@ -166,9 +225,13 @@ pre-change apt line.
 
 ## Known gaps
 
-- Nothing yet *uses* the pin: this change makes clevis 23 installable and
-  provides the PIV userspace. Authoring a `pkcs11` share into the clevis SSS
-  binding is separate work (the sss JSON builder in `system_setup.rs`).
+- ~~Nothing yet *uses* the pin~~ — **closed.** `UnlockPin::Pkcs11` shares now
+  emit through `build_clevis_policy_from_tree` at arbitrary nesting depth, and
+  `SssPolicy::fleet_three_group` builds the settled fleet policy. See
+  `docs/research/2026-08-02-pkcs11-share-binding-hazard.md`, which carries the
+  **mandatory** post-bind verification matrix — binding this policy needs all
+  three tokens plugged in at once, which is exactly when clevis's `head -1`
+  public-key lookup can silently encrypt every share to the same token.
 - The suite name `stonking` is a single `const` in `packages.rs`
   (`CLEVIS23_SUITE`); if 26.10's suite string turns out to differ, that is a
   one-line fix.

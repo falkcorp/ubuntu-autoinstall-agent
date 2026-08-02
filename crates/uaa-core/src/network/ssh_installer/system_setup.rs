@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.30.0
+// version: 2.31.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-08-02
 
@@ -9,9 +9,7 @@
 //! kernel command line receives `rd.neednet=1 ip=dhcp` so the Tang servers are
 //! reachable during initramfs boot for clevis-based LUKS unlock.
 
-use super::config::{
-    Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount,
-};
+use super::config::{Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount};
 use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix};
 use super::partitions::partition_path;
 use super::unlock_sss::{SssPolicy, UnlockPin};
@@ -272,7 +270,10 @@ impl<'a> SystemConfigurator<'a> {
     /// silently stop applying; gating on the real `arch` axis avoids that trap.
     async fn configure_serial_console(&mut self, config: &InstallationConfig) -> Result<()> {
         if config.arch != Arch::Amd64 {
-            info!("Skipping serial console (arch={:?}, amd64-only default)", config.arch);
+            info!(
+                "Skipping serial console (arch={:?}, amd64-only default)",
+                config.arch
+            );
             return Ok(());
         }
         let b64 = BASE64.encode(SERIAL_CONSOLE_DROPIN);
@@ -445,10 +446,12 @@ impl<'a> SystemConfigurator<'a> {
             "Bind /dev (rbind)",
             "[ -d /mnt/targetos/dev ] || mkdir -p /mnt/targetos/dev; mountpoint -q /mnt/targetos/dev || mount --rbind /dev /mnt/targetos/dev"
         ).await;
-        let _ = self.log_and_execute(
-            "Make /dev private",
-            "mount --make-private /mnt/targetos/dev || true",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Make /dev private",
+                "mount --make-private /mnt/targetos/dev || true",
+            )
+            .await;
         let _ = self.log_and_execute(
             "Ensuring /dev/pts",
             "[ -d /mnt/targetos/dev/pts ] || mkdir -p /mnt/targetos/dev/pts; mountpoint -q /mnt/targetos/dev/pts || mount -t devpts devpts /mnt/targetos/dev/pts || true"
@@ -457,26 +460,32 @@ impl<'a> SystemConfigurator<'a> {
             "Bind /proc (rbind)",
             "[ -d /mnt/targetos/proc ] || mkdir -p /mnt/targetos/proc; mountpoint -q /mnt/targetos/proc || mount --rbind /proc /mnt/targetos/proc"
         ).await;
-        let _ = self.log_and_execute(
-            "Make /proc private",
-            "mount --make-private /mnt/targetos/proc || true",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Make /proc private",
+                "mount --make-private /mnt/targetos/proc || true",
+            )
+            .await;
         let _ = self.log_and_execute(
             "Bind /sys (rbind)",
             "[ -d /mnt/targetos/sys ] || mkdir -p /mnt/targetos/sys; mountpoint -q /mnt/targetos/sys || mount --rbind /sys /mnt/targetos/sys"
         ).await;
-        let _ = self.log_and_execute(
-            "Make /sys private",
-            "mount --make-private /mnt/targetos/sys || true",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Make /sys private",
+                "mount --make-private /mnt/targetos/sys || true",
+            )
+            .await;
         let _ = self.log_and_execute(
             "Bind /run (rbind)",
             "[ -d /mnt/targetos/run ] || mkdir -p /mnt/targetos/run; mountpoint -q /mnt/targetos/run || mount --rbind /run /mnt/targetos/run"
         ).await;
-        let _ = self.log_and_execute(
-            "Make /run private",
-            "mount --make-private /mnt/targetos/run || true",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Make /run private",
+                "mount --make-private /mnt/targetos/run || true",
+            )
+            .await;
 
         // DNS in chroot
         let _ = self.log_and_execute(
@@ -485,18 +494,22 @@ impl<'a> SystemConfigurator<'a> {
         ).await;
 
         // ESP
-        let _ = self.log_and_execute(
-            "Ensure ESP mountpoint",
-            "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Ensure ESP mountpoint",
+                "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
+            )
+            .await;
         let esp_part = self.detect_esp_partition_path(config).await?;
-        let _ = self.log_and_execute(
-            "Mount ESP if not mounted",
-            &format!(
+        let _ = self
+            .log_and_execute(
+                "Mount ESP if not mounted",
+                &format!(
                 "mountpoint -q /mnt/targetos/boot/efi || mount {} /mnt/targetos/boot/efi || true",
                 esp_part
             ),
-        ).await;
+            )
+            .await;
 
         // fstab entry for ESP (UUID-based)
         let esp_part = self.detect_esp_partition_path(config).await?;
@@ -705,21 +718,27 @@ impl<'a> SystemConfigurator<'a> {
 
         // SSH authorized keys for root
         if !config.ssh_authorized_keys.is_empty() {
-            let _ = self.log_and_execute(
-                "Create root .ssh dir",
-                "chroot /mnt/targetos bash -lc 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'",
-            ).await;
+            let _ = self
+                .log_and_execute(
+                    "Create root .ssh dir",
+                    "chroot /mnt/targetos bash -lc 'mkdir -p /root/.ssh && chmod 700 /root/.ssh'",
+                )
+                .await;
             for key in &config.ssh_authorized_keys {
                 let cmd = format!(
                     "chroot /mnt/targetos bash -lc \"echo '{}' >> /root/.ssh/authorized_keys\"",
                     key
                 );
-                let _ = self.log_and_execute("Inject SSH authorized key", &cmd).await;
+                let _ = self
+                    .log_and_execute("Inject SSH authorized key", &cmd)
+                    .await;
             }
-            let _ = self.log_and_execute(
-                "Fix authorized_keys permissions",
-                "chroot /mnt/targetos bash -lc 'chmod 600 /root/.ssh/authorized_keys || true'",
-            ).await;
+            let _ = self
+                .log_and_execute(
+                    "Fix authorized_keys permissions",
+                    "chroot /mnt/targetos bash -lc 'chmod 600 /root/.ssh/authorized_keys || true'",
+                )
+                .await;
         }
 
         // Operator user accounts. Empty `users` (every pre-existing config)
@@ -744,10 +763,12 @@ impl<'a> SystemConfigurator<'a> {
             }
         }
 
-        let _ = self.log_and_execute(
-            "Enabling SSH",
-            "chroot /mnt/targetos bash -lc 'systemctl enable ssh'",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Enabling SSH",
+                "chroot /mnt/targetos bash -lc 'systemctl enable ssh'",
+            )
+            .await;
 
         Ok(())
     }
@@ -763,25 +784,33 @@ impl<'a> SystemConfigurator<'a> {
         ];
 
         for cmd in zfs_commands {
-            let _ = self.log_and_execute(
-                &format!("ZFS: {}", cmd),
-                &format!("chroot /mnt/targetos bash -lc '{}'", cmd),
-            ).await;
+            let _ = self
+                .log_and_execute(
+                    &format!("ZFS: {}", cmd),
+                    &format!("chroot /mnt/targetos bash -lc '{}'", cmd),
+                )
+                .await;
         }
 
         // Seed ZFS cache
-        let _ = self.log_and_execute(
-            "Ensure /etc/zfs in target",
-            "mkdir -p /mnt/targetos/etc/zfs",
-        ).await;
-        let _ = self.log_and_execute(
-            "Copy zpool.cache",
-            "cp -f /etc/zfs/zpool.cache /mnt/targetos/etc/zfs/ 2>/dev/null || true",
-        ).await;
-        let _ = self.log_and_execute(
-            "Ensure zfs-list.cache dir",
-            "mkdir -p /mnt/targetos/etc/zfs/zfs-list.cache",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Ensure /etc/zfs in target",
+                "mkdir -p /mnt/targetos/etc/zfs",
+            )
+            .await;
+        let _ = self
+            .log_and_execute(
+                "Copy zpool.cache",
+                "cp -f /etc/zfs/zpool.cache /mnt/targetos/etc/zfs/ 2>/dev/null || true",
+            )
+            .await;
+        let _ = self
+            .log_and_execute(
+                "Ensure zfs-list.cache dir",
+                "mkdir -p /mnt/targetos/etc/zfs/zfs-list.cache",
+            )
+            .await;
         let _ = self.log_and_execute(
             "Touch zfs-list.cache files",
             "bash -lc 'touch /mnt/targetos/etc/zfs/zfs-list.cache/bpool /mnt/targetos/etc/zfs/zfs-list.cache/rpool'",
@@ -806,17 +835,21 @@ impl<'a> SystemConfigurator<'a> {
             ).await;
         }
         // Fix mountpoint paths — run on host so sed can see the file directly
-        let _ = self.log_and_execute(
-            "Fix zfs-list paths",
-            "sed -Ei 's|/mnt/targetos/?|/|' /mnt/targetos/etc/zfs/zfs-list.cache/* || true",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Fix zfs-list paths",
+                "sed -Ei 's|/mnt/targetos/?|/|' /mnt/targetos/etc/zfs/zfs-list.cache/* || true",
+            )
+            .await;
 
         // Regenerate initramfs (dracut or initramfs-tools)
         let regen_cmd = config.initramfs_type.regenerate_cmd();
-        let _ = self.log_and_execute(
-            "Regenerate initramfs (post-ZFS)",
-            &format!("chroot /mnt/targetos bash -lc '{}'", regen_cmd),
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Regenerate initramfs (post-ZFS)",
+                &format!("chroot /mnt/targetos bash -lc '{}'", regen_cmd),
+            )
+            .await;
 
         Ok(())
     }
@@ -860,18 +893,22 @@ impl<'a> SystemConfigurator<'a> {
             "bash -lc '[ -d /mnt/targetos/run/udev ] && [ -d /mnt/targetos/dev/disk/by-id ] && echo udev-ok || echo udev-missing'",
         ).await;
 
-        let _ = self.log_and_execute(
-            "Ensure ESP mountpoint",
-            "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Ensure ESP mountpoint",
+                "[ -d /mnt/targetos/boot/efi ] || mkdir -p /mnt/targetos/boot/efi",
+            )
+            .await;
         let esp_part = self.detect_esp_partition_path(config).await?;
-        let _ = self.log_and_execute(
-            "Mount ESP if not mounted",
-            &format!(
+        let _ = self
+            .log_and_execute(
+                "Mount ESP if not mounted",
+                &format!(
                 "mountpoint -q /mnt/targetos/boot/efi || mount {} /mnt/targetos/boot/efi || true",
                 esp_part
             ),
-        ).await;
+            )
+            .await;
 
         let _ = self.log_and_execute(
             "Ensure efivarfs",
@@ -911,7 +948,9 @@ impl<'a> SystemConfigurator<'a> {
                 r#"chroot /mnt/targetos bash -lc 'grep -q "rd.neednet" /etc/default/grub 2>/dev/null || sed -i "s|^GRUB_CMDLINE_LINUX=\\\"\\(.*\\)\\\"|GRUB_CMDLINE_LINUX=\\\"\\1 {}\\\"| " /etc/default/grub'"#,
                 grub_extra
             );
-            let _ = self.log_and_execute("Set GRUB_CMDLINE_LINUX for dracut+Tang", &set_cmdline).await;
+            let _ = self
+                .log_and_execute("Set GRUB_CMDLINE_LINUX for dracut+Tang", &set_cmdline)
+                .await;
         }
 
         // GRUB install with fallbacks.
@@ -944,7 +983,8 @@ impl<'a> SystemConfigurator<'a> {
         self.log_and_execute(
             "Updating GRUB config",
             "chroot /mnt/targetos bash -lc 'update-grub'",
-        ).await?;
+        )
+        .await?;
 
         // Best-effort: order NVRAM entries network-first, ubuntu-second. Mirrors
         // set_boot_order() in uaa-usb-bootstrap.sh. MUST stay non-fatal (let _ =):
@@ -957,7 +997,10 @@ impl<'a> SystemConfigurator<'a> {
 
     /// Configure LUKS crypttab and optionally enroll Tang via Clevis SSS.
     pub async fn setup_luks_key_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
-        info!("Configuring LUKS crypttab in chroot (storage_mode = {:?})", config.storage_mode);
+        info!(
+            "Configuring LUKS crypttab in chroot (storage_mode = {:?})",
+            config.storage_mode
+        );
 
         // NativeKeystore (U1 / server profile) binds clevis + crypttab to the
         // keystore-zvol LUKS, not a root p4 — a wholly different device path.
@@ -1007,15 +1050,21 @@ impl<'a> SystemConfigurator<'a> {
         // system's PCRs, which the live installer cannot produce). FIDO2/YubiKey
         // is enrolled manually post-install via register-fido2-luks.sh.
         if config.enroll_tpm2 && config.tpm2_pin.as_deref().is_some_and(|p| !p.is_empty()) {
-            self.setup_tpm2_firstboot_enrollment(config, if uuid.is_empty() { None } else { Some(uuid) }).await?;
+            self.setup_tpm2_firstboot_enrollment(
+                config,
+                if uuid.is_empty() { None } else { Some(uuid) },
+            )
+            .await?;
         }
 
         // Regenerate initramfs after crypttab + Tang enrollment
         let regen_cmd = config.initramfs_type.regenerate_cmd();
-        let _ = self.log_and_execute(
-            "Regenerate initramfs (post-crypttab)",
-            &format!("chroot /mnt/targetos bash -lc '{}'", regen_cmd),
-        ).await;
+        let _ = self
+            .log_and_execute(
+                "Regenerate initramfs (post-crypttab)",
+                &format!("chroot /mnt/targetos bash -lc '{}'", regen_cmd),
+            )
+            .await;
 
         Ok(())
     }
@@ -1122,7 +1171,10 @@ impl<'a> SystemConfigurator<'a> {
     /// silently granting trust.
     pub async fn install_ca_cert_in_chroot(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Installing CA trust anchor in chroot");
-        if config.install_ca_cert.contains(crate::config_place::PLACEHOLDER) {
+        if config
+            .install_ca_cert
+            .contains(crate::config_place::PLACEHOLDER)
+        {
             warn!(
                 "install_ca_cert still contains {} — uaa enroll on this host will fail closed \
                  until the config is re-placed with the install CA reachable",
@@ -1441,7 +1493,13 @@ impl<'a> SystemConfigurator<'a> {
             tmp_key_path
         );
         if let Err(e) = self.runner.execute(&write_key).await {
-            let _ = self.runner.execute(&format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)).await;
+            let _ = self
+                .runner
+                .execute(&format!(
+                    "shred -u {} 2>/dev/null || rm -f {}",
+                    tmp_key_path, tmp_key_path
+                ))
+                .await;
             return Err(crate::error::AutoInstallError::SystemError(format!(
                 "Clevis enrollment: could not write key to tempfile ({e}) — keystore would have no unattended-unlock binding"
             )));
@@ -1456,9 +1514,13 @@ impl<'a> SystemConfigurator<'a> {
         let bind_result = self.runner.execute(&bind_cmd).await;
 
         // Always shred the tempfile regardless of outcome
-        let _ = self.runner.execute(
-            &format!("shred -u {} 2>/dev/null || rm -f {}", tmp_key_path, tmp_key_path)
-        ).await;
+        let _ = self
+            .runner
+            .execute(&format!(
+                "shred -u {} 2>/dev/null || rm -f {}",
+                tmp_key_path, tmp_key_path
+            ))
+            .await;
 
         // Clean up the pre-fetched advertisements regardless of outcome.
         let _ = self.runner.execute("rm -f /run/uaa-tang-*.adv").await;
@@ -1493,7 +1555,11 @@ impl<'a> SystemConfigurator<'a> {
         // in the initramfs, so the network stack must be present. Without it the
         // initramfs "fails to start the network", clevis can't reach Tang, LUKS
         // never opens, and the zfs import (rpool on /dev/mapper/luks) fails.
-        let clevis = if include_clevis { " clevis network" } else { "" };
+        let clevis = if include_clevis {
+            " clevis network"
+        } else {
+            ""
+        };
         // Force the boot NIC's kernel driver into the initramfs for Tang unlock —
         // dracut hostonly omits it because the NIC isn't needed to reach a LOCAL
         // root, so `rd.neednet=1 ip=dhcp` has no device to bring up otherwise.
@@ -1553,7 +1619,10 @@ impl<'a> SystemConfigurator<'a> {
                 String::new()
             }
         } else {
-            warn!("network_interface '{}' failed validation; not forcing a NIC driver into initramfs", iface);
+            warn!(
+                "network_interface '{}' failed validation; not forcing a NIC driver into initramfs",
+                iface
+            );
             String::new()
         };
         let nic_driver = nic_driver.as_str();
@@ -1562,7 +1631,10 @@ impl<'a> SystemConfigurator<'a> {
         // unsatisfiable at boot.
         let uses_tang = Self::uses_tang(config);
         if uses_tang {
-            info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
+            info!(
+                "Tang unlock: forcing NIC driver '{}' into initramfs",
+                nic_driver
+            );
         }
         // The `clevis` DRACUT MODULE must be gated on the same predicate as the
         // `clevis luks bind` call sites, not on `uses_tang`. Those two were the
@@ -1651,13 +1723,17 @@ impl<'a> SystemConfigurator<'a> {
 
         // Seed contains the passphrase + PIN — write via unlogged execute + a
         // quoted heredoc so the secrets are neither logged nor interpolated.
-        let seed = Self::build_tpm2_enroll_seed(&config.luks_key, pin, &config.tpm2_pcr_ids, &luksdev);
+        let seed =
+            Self::build_tpm2_enroll_seed(&config.luks_key, pin, &config.tpm2_pcr_ids, &luksdev);
         let write_seed = format!(
             "install -m 0600 /dev/null /mnt/targetos/etc/uaa-tpm2-enroll.env && cat > /mnt/targetos/etc/uaa-tpm2-enroll.env <<'UAA_TPM2_SEED_EOF'\n{}UAA_TPM2_SEED_EOF",
             seed
         );
         if let Err(e) = self.runner.execute(&write_seed).await {
-            warn!("TPM2 enrollment: could not write seed ({}); skipping TPM2 slot", e);
+            warn!(
+                "TPM2 enrollment: could not write seed ({}); skipping TPM2 slot",
+                e
+            );
             return Ok(());
         }
 
@@ -1667,11 +1743,15 @@ impl<'a> SystemConfigurator<'a> {
             "cat > /mnt/targetos/etc/systemd/system/uaa-tpm2-enroll.service <<'UAA_TPM2_UNIT_EOF'\n{}UAA_TPM2_UNIT_EOF",
             unit
         );
-        let _ = self.log_and_execute("Write first-boot TPM2 enrollment unit", &write_unit).await;
-        let _ = self.log_and_execute(
-            "Enable first-boot TPM2 enrollment unit",
-            "chroot /mnt/targetos bash -lc 'systemctl enable uaa-tpm2-enroll.service'",
-        ).await;
+        let _ = self
+            .log_and_execute("Write first-boot TPM2 enrollment unit", &write_unit)
+            .await;
+        let _ = self
+            .log_and_execute(
+                "Enable first-boot TPM2 enrollment unit",
+                "chroot /mnt/targetos bash -lc 'systemctl enable uaa-tpm2-enroll.service'",
+            )
+            .await;
 
         Ok(())
     }
@@ -1807,9 +1887,7 @@ fn build_user_provision_cmds(user: &UserAccount) -> Vec<(String, String)> {
         let creds_b64 = BASE64.encode(format!("{name}:{pw}", pw = user.password));
         cmds.push((
             format!("Set password for {name}"),
-            format!(
-                "chroot /mnt/targetos bash -lc 'echo {creds_b64} | base64 -d | chpasswd'"
-            ),
+            format!("chroot /mnt/targetos bash -lc 'echo {creds_b64} | base64 -d | chpasswd'"),
         ));
     }
 
@@ -2052,8 +2130,12 @@ mod tests {
             .find(|l| l.starts_with("GRUB_CMDLINE_LINUX="))
             .expect("drop-in has a GRUB_CMDLINE_LINUX line");
         let tty0 = cmdline.find("console=tty0").expect("tty0 present");
-        let ttys0 = cmdline.find("console=ttyS0,115200n8").expect("ttyS0 present");
-        let ttys1 = cmdline.find("console=ttyS1,115200n8").expect("ttyS1 present");
+        let ttys0 = cmdline
+            .find("console=ttyS0,115200n8")
+            .expect("ttyS0 present");
+        let ttys1 = cmdline
+            .find("console=ttyS1,115200n8")
+            .expect("ttyS1 present");
         // ttyS1 (Supermicro X10 BMC SOL = COM2) must be LAST so it wins the
         // primary /dev/console — the one SOL watches on a headless box.
         assert!(
@@ -2062,8 +2144,9 @@ mod tests {
         );
         // GRUB's own menu on serial too (COM2 / unit 1), at a matching baud.
         assert!(SERIAL_CONSOLE_DROPIN.contains("GRUB_TERMINAL=\"console serial\""));
-        assert!(SERIAL_CONSOLE_DROPIN
-            .contains("GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=1"));
+        assert!(
+            SERIAL_CONSOLE_DROPIN.contains("GRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=1")
+        );
     }
 
     #[test]
@@ -2073,7 +2156,10 @@ mod tests {
         assert!(cmd.starts_with("bash -lc '"));
         // `-P` not `-rP`: --raw/--pairs are mutually exclusive on Ubuntu 26.04.
         assert!(cmd.contains("lsblk -P -o PATH,PARTTYPE"));
-        assert!(!cmd.contains("lsblk -rP"), "must not use -rP (breaks on 26.04)");
+        assert!(
+            !cmd.contains("lsblk -rP"),
+            "must not use -rP (breaks on 26.04)"
+        );
         assert!(cmd.contains("grep -i \"PARTTYPE=\\\""));
         assert!(cmd.contains(guid));
         assert!(cmd.ends_with("'"));
@@ -2430,10 +2516,10 @@ mod tests {
             threshold: 2,
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:slot-id=0".to_string(),
+                    uri: "pkcs11:serial=YK0000001".to_string(),
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:slot-id=1".to_string(),
+                    uri: "pkcs11:serial=YK0000002".to_string(),
                 }),
                 tang_pin("http://172.16.2.40"),
             ],
@@ -2444,9 +2530,213 @@ mod tests {
         );
         assert_eq!(
             got,
-            r#"{"t":2,"pins":{"pkcs11":[{"uri":"pkcs11:slot-id=0"},{"uri":"pkcs11:slot-id=1"}],"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
+            r#"{"t":2,"pins":{"pkcs11":[{"uri":"pkcs11:serial=YK0000001"},{"uri":"pkcs11:serial=YK0000002"}],"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
         );
         serde_json::from_str::<serde_json::Value>(&got).expect("valid JSON");
+    }
+
+    // ---- golden: the settled fleet policies ------------------------------
+
+    const PEER_A: &str = "http://172.16.2.45";
+    const PEER_B: &str = "http://172.16.2.46";
+    const NANO: &str = "pkcs11:serial=NANO0001";
+    const CARRIED_A: &str = "pkcs11:serial=CARRIED0A";
+    const CARRIED_B: &str = "pkcs11:serial=CARRIED0B";
+
+    /// Emit the settled fleet policy, parsed to a `Value`.
+    ///
+    /// Deliberately parsed, never substring-matched: substring assertions on
+    /// clevis JSON have produced three separate false-passes in this repo, and
+    /// they will keep doing so, because every group in this policy is a
+    /// *superstring* of a weaker group. `"tang":[peerA,peerB]` appears inside
+    /// the correct policy AND inside a broken one that flattened group 3, so any
+    /// `contains()` on it passes either way. Structure is the only assertion
+    /// that discriminates.
+    fn emit_fleet_policy(tpm2_pcr_ids: Option<&str>) -> serde_json::Value {
+        let policy = SssPolicy::fleet_three_group(
+            &[PEER_A, PEER_B],
+            2,
+            NANO,
+            &[CARRIED_A, CARRIED_B],
+            2,
+            tpm2_pcr_ids,
+        );
+        // The policy must be emittable in the first place — a golden test on an
+        // invalid policy documents a shape we would refuse to install.
+        policy.validate().expect("fleet policy must validate");
+        let json = SystemConfigurator::build_clevis_policy_from_tree(
+            &policy,
+            &adv_pairs(&[PEER_A, PEER_B]),
+        );
+        serde_json::from_str(&json).expect("emitter must produce valid JSON")
+    }
+
+    /// `{"url":…,"adv":…}` for one Tang peer, as `adv_pairs` numbers them.
+    fn tang_entry(url: &str, index: usize) -> serde_json::Value {
+        serde_json::json!({"url": url, "adv": format!("/run/uaa-tang-{index}.adv")})
+    }
+
+    fn pkcs11_entry(uri: &str) -> serde_json::Value {
+        serde_json::json!({"uri": uri})
+    }
+
+    /// The two peer Tang servers as a `t`-of-2 group.
+    fn tang_group(t: u8) -> serde_json::Value {
+        serde_json::json!({
+            "t": t,
+            "pins": {"tang": [tang_entry(PEER_A, 0), tang_entry(PEER_B, 1)]}
+        })
+    }
+
+    /// Group 2 (any 2 of 3 tokens) and group 3 ((any Tang) AND (either CARRIED
+    /// key)) are identical between the RPi and lenserv policies; only group 1
+    /// differs, by ANDing tpm2.
+    fn group_two() -> serde_json::Value {
+        serde_json::json!({
+            "t": 2,
+            "pins": {"pkcs11": [
+                pkcs11_entry(NANO),
+                pkcs11_entry(CARRIED_A),
+                pkcs11_entry(CARRIED_B),
+            ]}
+        })
+    }
+
+    fn group_three() -> serde_json::Value {
+        serde_json::json!({
+            "t": 2,
+            "pins": {"sss": [
+                tang_group(1),
+                {"t": 1, "pins": {"pkcs11": [
+                    pkcs11_entry(CARRIED_A),
+                    pkcs11_entry(CARRIED_B),
+                ]}},
+            ]}
+        })
+    }
+
+    /// GOLDEN — the RPi Tang-server policy, whole, asserted as one structure.
+    #[test]
+    fn test_golden_rpi_fleet_policy() {
+        let got = emit_fleet_policy(None);
+        let want = serde_json::json!({
+            "t": 1,
+            "pins": {"sss": [
+                // group 1 — automatic unlock while both peers are up. NO tpm2:
+                // the RPis have no TPM and deliberately get none anywhere.
+                tang_group(2),
+                // group 2 — any 2 of the 3 tokens.
+                group_two(),
+                // group 3 — (any one Tang) AND (either CARRIED key).
+                group_three(),
+            ]}
+        });
+        assert_eq!(got, want);
+
+        // The RPis have no TPM: assert the ABSENCE of tpm2 anywhere in the tree,
+        // not just at the top level, since a stray tpm2 share would make the
+        // policy unsatisfiable on hardware that cannot provide it.
+        assert!(
+            !got.to_string().contains("pcr_ids"),
+            "the RPi policy must carry no tpm2 pin at any depth: {got}"
+        );
+    }
+
+    /// GOLDEN — the lenserv variant: identical, except group 1 ANDs tpm2.
+    #[test]
+    fn test_golden_lenserv_fleet_policy() {
+        let got = emit_fleet_policy(Some("7"));
+        let want = serde_json::json!({
+            "t": 1,
+            "pins": {"sss": [
+                // group 1 — tpm2 AND (both peers). Outer t=2 over exactly TWO
+                // shares (the tpm2 pin, and the whole Tang group collapsed to
+                // one by nesting), so BOTH are required. Flattening this into
+                // {"t":2,"pins":{"tpm2":…,"tang":[a,b]}} would be 2-of-3 and
+                // satisfiable by Tang alone.
+                {
+                    "t": 2,
+                    "pins": {
+                        "tpm2": [{"pcr_ids": "7", "pcr_bank": "sha256"}],
+                        "sss": [tang_group(2)],
+                    }
+                },
+                group_two(),
+                group_three(),
+            ]}
+        });
+        assert_eq!(got, want);
+
+        // The ONLY difference from the RPi policy is group 1 — assert it, so a
+        // future edit cannot quietly diverge groups 2 and 3 between platforms.
+        let rpi = emit_fleet_policy(None);
+        assert_eq!(got["pins"]["sss"][1], rpi["pins"]["sss"][1]);
+        assert_eq!(got["pins"]["sss"][2], rpi["pins"]["sss"][2]);
+        assert_ne!(got["pins"]["sss"][0], rpi["pins"]["sss"][0]);
+    }
+
+    /// SECURITY PROPERTY — the nano is not a group-3 factor, in the EMITTED
+    /// JSON.
+    ///
+    /// The nano lives in the chassis, so a thief who steals the server already
+    /// holds it. Group 3 is (any one Tang) AND (either carried key); if the nano
+    /// counted, that thief would need only to reach ONE Tang — trivial while the
+    /// box is still on the LAN — and the disk would open. This test fails if
+    /// someone "helpfully" adds it.
+    #[test]
+    fn test_nano_is_excluded_from_group_three() {
+        for tpm2 in [None, Some("7")] {
+            let got = emit_fleet_policy(tpm2);
+            let group_three = &got["pins"]["sss"][2];
+
+            // Collect every pkcs11 uri ANYWHERE under group 3, so nesting the
+            // nano one level deeper does not smuggle it past this test.
+            let mut uris = Vec::new();
+            collect_pkcs11_uris(group_three, &mut uris);
+
+            // BOTH directions. An absence assertion on a path navigated wrong
+            // passes vacuously — so first prove the carried keys ARE here.
+            assert_eq!(
+                uris,
+                vec![CARRIED_A, CARRIED_B],
+                "group 3's token factor must be exactly the two CARRIED keys"
+            );
+            assert!(
+                !uris.contains(&NANO.to_string()),
+                "the chassis-resident nano must NEVER be a group-3 factor"
+            );
+
+            // ...and it is present in group 2, so the above is a deliberate
+            // exclusion rather than the nano being missing from the policy.
+            let mut group_two_uris = Vec::new();
+            collect_pkcs11_uris(&got["pins"]["sss"][1], &mut group_two_uris);
+            assert!(
+                group_two_uris.contains(&NANO.to_string()),
+                "the nano must still be one of group 2's three tokens"
+            );
+        }
+    }
+
+    /// Every `pins.pkcs11[].uri` at any depth under `node`, in document order.
+    fn collect_pkcs11_uris(node: &serde_json::Value, out: &mut Vec<String>) {
+        let Some(pins) = node.get("pins") else {
+            return;
+        };
+        if let Some(tokens) = pins.get("pkcs11").and_then(|p| p.as_array()) {
+            for token in tokens {
+                out.push(
+                    token["uri"]
+                        .as_str()
+                        .expect("a pkcs11 share must carry a uri")
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(nested) = pins.get("sss").and_then(|p| p.as_array()) {
+            for child in nested {
+                collect_pkcs11_uris(child, out);
+            }
+        }
     }
 
     // ---- the bricking regression ---------------------------------------
@@ -2755,10 +3045,10 @@ mod tests {
                 threshold: 1,
                 pins: vec![
                     UnlockPin::Pkcs11(Pkcs11Pin {
-                        uri: "pkcs11:slot-id=0".to_string(),
+                        uri: "pkcs11:serial=YK0000001".to_string(),
                     }),
                     UnlockPin::Pkcs11(Pkcs11Pin {
-                        uri: "pkcs11:slot-id=1".to_string(),
+                        uri: "pkcs11:serial=YK0000002".to_string(),
                     }),
                 ],
             },
@@ -2915,7 +3205,10 @@ mod tests {
         assert!(apt.ends_with("opensc pcscd\'"), "{apt}");
         // The pkcs11 pin IS a clevis pin: a Tang-less PlainLuks host must still
         // get clevis, or the flag installs a token stack with nothing to use it.
-        assert!(apt.contains(" clevis clevis-luks clevis-dracut clevis-systemd"), "{apt}");
+        assert!(
+            apt.contains(" clevis clevis-luks clevis-dracut clevis-systemd"),
+            "{apt}"
+        );
         assert_ne!(apt.as_str(), BASELINE_CHROOT_APT_LINE);
     }
 
@@ -2972,13 +3265,25 @@ mod tests {
         let modules = dracut_modules_line(&conf);
         // The clevis (Tang) and crypt/tpm2 unlock subsystems must both be
         // enabled in the initramfs module list.
-        assert!(modules.contains("clevis"), "Tang unlock (clevis) missing: {modules}");
-        assert!(modules.contains("crypt"), "systemd-cryptsetup (crypt) missing: {modules}");
-        assert!(modules.contains("tpm2-tss"), "TPM2 support missing: {modules}");
+        assert!(
+            modules.contains("clevis"),
+            "Tang unlock (clevis) missing: {modules}"
+        );
+        assert!(
+            modules.contains("crypt"),
+            "systemd-cryptsetup (crypt) missing: {modules}"
+        );
+        assert!(
+            modules.contains("tpm2-tss"),
+            "TPM2 support missing: {modules}"
+        );
         // zfs module must be present so rpool/bpool import in the initramfs.
         assert!(modules.contains("zfs"), "zfs module missing: {modules}");
         // Tang unlock needs the network stack + the NIC driver in the initramfs.
-        assert!(modules.contains("network"), "network module missing for Tang: {modules}");
+        assert!(
+            modules.contains("network"),
+            "network module missing for Tang: {modules}"
+        );
         assert!(
             conf.contains("add_drivers+=\" ixgbe \""),
             "NIC driver not forced into initramfs for Tang: {conf}"

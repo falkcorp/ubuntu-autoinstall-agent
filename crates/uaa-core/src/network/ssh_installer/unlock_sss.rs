@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
 // last-edited: 2026-08-02
 
@@ -257,6 +257,264 @@ impl SssPolicy {
                 })
                 .collect(),
         }
+    }
+
+    /// The settled fleet policy: an outer `t=1` OR over three groups, so ANY
+    /// ONE group unlocks the host.
+    ///
+    /// ```json
+    /// {"t":1,"pins":{"sss":[
+    ///   {"t":<peer_threshold>,"pins":{"tang":[peers…]}},
+    ///   {"t":<token_threshold>,"pins":{"pkcs11":[nano, carried…]}},
+    ///   {"t":2,"pins":{"sss":[
+    ///       {"t":1,"pins":{"tang":[peers…]}},
+    ///       {"t":1,"pins":{"pkcs11":[carried…]}}
+    ///   ]}}
+    /// ]}}
+    /// ```
+    ///
+    /// * **group 1** — automatic, hands-off unlock while the peer Tang servers
+    ///   are up. With `tpm2_pcr_ids = Some(..)` (the lenserv variant) it
+    ///   additionally ANDs a TPM2 share, so the disk only unlocks unattended in
+    ///   *this* chassis with *this* Secure Boot state. The RPis have no TPM and
+    ///   deliberately get no `tpm2` pin anywhere.
+    /// * **group 2** — `token_threshold` of the three PKCS#11 tokens: the nano
+    ///   that lives permanently in the chassis, plus the two carried keys (main
+    ///   and offsite spare). The break-glass path when Tang is down.
+    /// * **group 3** — (any one Tang) AND (either CARRIED key).
+    ///
+    /// # The nano is deliberately EXCLUDED from group 3
+    ///
+    /// This is a security property, not an oversight, and it is load-bearing.
+    /// The nano lives in the chassis; anyone who steals the server is already
+    /// holding it. If the nano were a member of group 3, that thief would only
+    /// need to reach ONE Tang server — trivially satisfied while the box is
+    /// still on the LAN, or by any single compromised/rehosted Tang — and the
+    /// disk would open. Restricting group 3 to the CARRIED keys means physical
+    /// possession of the chassis is never, by itself, one of the two factors.
+    /// `test_nano_is_excluded_from_group_three` in `system_setup.rs` fails if
+    /// someone "helpfully" adds it back.
+    ///
+    /// The caller is expected to run [`Self::validate`] on the result; this
+    /// constructor is total and performs no checking of its own.
+    pub fn fleet_three_group(
+        peers: &[&str],
+        peer_threshold: u8,
+        nano_uri: &str,
+        carried_uris: &[&str],
+        token_threshold: u8,
+        tpm2_pcr_ids: Option<&str>,
+    ) -> Self {
+        let tang_group = |threshold: u8| SssPolicy {
+            threshold,
+            pins: peers
+                .iter()
+                .map(|u| {
+                    UnlockPin::Tang(TangPin {
+                        url: (*u).to_string(),
+                    })
+                })
+                .collect(),
+        };
+
+        // Group 1: peers, optionally ANDed with tpm2 (lenserv only).
+        let group_one = match tpm2_pcr_ids {
+            None => tang_group(peer_threshold),
+            Some(pcr_ids) => SssPolicy {
+                threshold: 2,
+                pins: vec![
+                    UnlockPin::Tpm2(Tpm2Pin {
+                        pcr_ids: pcr_ids.to_string(),
+                        pcr_bank: default_pcr_bank(),
+                    }),
+                    UnlockPin::Sss(tang_group(peer_threshold)),
+                ],
+            },
+        };
+
+        // Group 2: nano + both carried keys.
+        let mut token_uris: Vec<&str> = vec![nano_uri];
+        token_uris.extend_from_slice(carried_uris);
+        let group_two = SssPolicy::any_pkcs11(&token_uris);
+        let group_two = SssPolicy {
+            threshold: token_threshold,
+            ..group_two
+        };
+
+        // Group 3: (any one Tang) AND (either CARRIED key). NO NANO — see above.
+        let group_three = SssPolicy {
+            threshold: 2,
+            pins: vec![
+                UnlockPin::Sss(tang_group(1)),
+                UnlockPin::Sss(SssPolicy::any_pkcs11(carried_uris)),
+            ],
+        };
+
+        SssPolicy {
+            threshold: 1,
+            pins: vec![
+                UnlockPin::Sss(group_one),
+                UnlockPin::Sss(group_two),
+                UnlockPin::Sss(group_three),
+            ],
+        }
+    }
+
+    /// Validate the whole tree, recursively.
+    ///
+    /// `Ok(warnings)` — the policy is emittable; any strings returned are
+    /// non-fatal smells worth logging. `Err(messages)` — the policy MUST NOT be
+    /// bound; every rule it broke is reported at once (not just the first), so
+    /// an author fixes one round of YAML rather than N.
+    ///
+    /// See [`PolicyLint`] for the rules and why each one exists.
+    pub fn validate(&self) -> std::result::Result<Vec<String>, Vec<String>> {
+        let lint = self.lint();
+        if lint.errors.is_empty() {
+            Ok(lint.warnings)
+        } else {
+            Err(lint.errors)
+        }
+    }
+
+    /// Collect every rule violation in the tree without deciding fatality.
+    pub fn lint(&self) -> PolicyLint {
+        let mut lint = PolicyLint::default();
+        self.lint_level("policy", &mut lint);
+        lint
+    }
+
+    fn lint_level(&self, path: &str, lint: &mut PolicyLint) {
+        // --- rule: threshold must be legal AT THIS LEVEL --------------------
+        // clevis enforces `1 <= t <= <shares>` per level and errors out with
+        // `Invalid threshold (required: 1 <= t <= n)`. Catching it here means
+        // the failure lands on the author's terminal instead of half-way
+        // through a bind, on a host whose pools are already created.
+        let shares = self.share_count();
+        if shares == 0 {
+            lint.errors.push(format!(
+                "{path}: has no shares — an empty `pins` can never be satisfied"
+            ));
+        } else if self.threshold < 1 || usize::from(self.threshold) > shares {
+            lint.errors.push(format!(
+                "{path}: threshold {} is illegal for {shares} share(s) — clevis \
+                 requires 1 <= t <= {shares} at EVERY level",
+                self.threshold
+            ));
+        }
+
+        // --- rule: no duplicate share identity WITHIN one level -------------
+        // Two shares that resolve to the same secret-holder are one share
+        // wearing two hats: a `t=2` group holding the same token twice reads as
+        // 2-of-3 and is satisfiable by one token. This is the static analogue of
+        // the `head -1` bind hazard (see
+        // docs/research/2026-08-02-pkcs11-share-binding-hazard.md).
+        //
+        // Deliberately PER LEVEL, never global: the settled fleet policy names
+        // the same Tang peer in group 1 and again inside group 3, and the same
+        // carried key in group 2 and again inside group 3. Those repeats are the
+        // whole point of an OR over groups. Only a repeat inside ONE `pins`
+        // array corrupts that level's arithmetic.
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for pin in &self.pins {
+            let identity = match pin {
+                UnlockPin::Tang(t) => Some(("tang", t.url.as_str())),
+                UnlockPin::Pkcs11(p) => Some(("pkcs11", p.uri.as_str())),
+                // A tpm2 pin has no identity beyond the host's own TPM, and a
+                // nested group's identity is its subtree — neither is compared.
+                UnlockPin::Tpm2(_) | UnlockPin::Sss(_) => None,
+            };
+            if let Some(id) = identity {
+                if seen.contains(&id) {
+                    lint.errors.push(format!(
+                        "{path}: duplicate {} share `{}` at the same level — it \
+                         counts twice toward t but can only be satisfied once, \
+                         so this group is weaker than it looks",
+                        id.0, id.1
+                    ));
+                } else {
+                    seen.push(id);
+                }
+            }
+        }
+
+        // --- per-pin rules and recursion ------------------------------------
+        for (i, pin) in self.pins.iter().enumerate() {
+            let child = format!("{path}.pins[{i}]");
+            match pin {
+                UnlockPin::Pkcs11(p) => lint_pkcs11_uri(&child, &p.uri, lint),
+                UnlockPin::Sss(nested) => {
+                    // --- rule (warn): a 1-of-1 wrapper is a no-op nesting.
+                    // Harmless to clevis, but it is almost always a half-edited
+                    // group — the author deleted a share and left the wrapper,
+                    // or meant to add one and did not.
+                    if nested.share_count() == 1 {
+                        lint.warnings.push(format!(
+                            "{child}: nested group wraps a single share, which \
+                             collapses to that share — either add the shares \
+                             this group was meant to hold, or drop the wrapper"
+                        ));
+                    }
+                    nested.lint_level(&child, lint);
+                }
+                UnlockPin::Tang(_) | UnlockPin::Tpm2(_) => {}
+            }
+        }
+    }
+}
+
+/// The result of [`SssPolicy::lint`]: fatal violations and non-fatal smells.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PolicyLint {
+    /// Rules whose violation makes the policy unbindable or silently weaker
+    /// than authored. Refuse the install.
+    pub errors: Vec<String>,
+    /// Shapes that are legal but suspicious. Log loudly; do not block.
+    pub warnings: Vec<String>,
+}
+
+/// Rules that apply to a single PKCS#11 token URI.
+fn lint_pkcs11_uri(path: &str, uri: &str, lint: &mut PolicyLint) {
+    let lowered = uri.to_ascii_lowercase();
+
+    if !lowered.starts_with("pkcs11:") {
+        lint.errors.push(format!(
+            "{path}: pkcs11 uri `{uri}` is not an RFC 7512 URI — it must begin \
+             with `pkcs11:`"
+        ));
+    }
+
+    // --- rule: never store the PIN in the binding -------------------------
+    // clevis's pkcs11 pin takes the PIN at UNLOCK time, from
+    // /run/systemd/clevis-pkcs11.pin (fed by clevis-luks-pkcs11-askpass.socket)
+    // — or, if the URI carries `pin-value=`, straight out of the URI. But the
+    // URI is stored IN THE LUKS HEADER, in the clear, on the disk the token is
+    // supposed to protect. A `pin-value=` binding therefore reduces a
+    // something-you-have-AND-something-you-know factor to something-you-have,
+    // and does it invisibly: the policy still unlocks, so nothing ever fails to
+    // reveal it. This is the single most damaging thing an author can type here.
+    if lowered.contains("pin-value=") {
+        lint.errors.push(format!(
+            "{path}: pkcs11 uri carries `pin-value=` — the PIN would be written \
+             into the LUKS header in the clear, defeating the entire factor. \
+             Let clevis-luks-pkcs11-askpass supply the PIN at unlock time."
+        ));
+    }
+
+    // --- rule: key on `serial=`, not `slot-id=` ---------------------------
+    // PKCS#11 slot IDs are assigned by the module at enumeration time and shift
+    // between insertions, reboots, and whenever another token is plugged in
+    // first. A binding keyed on `slot-id=` resolves to a DIFFERENT token — or
+    // to nothing — the next time the host boots, which surfaces as an unlock
+    // failure in the initramfs on an encrypted, unreachable machine. `serial=`
+    // is a property of the token itself and is stable.
+    if lowered.contains("slot-id=") && !lowered.contains("serial=") {
+        lint.errors.push(format!(
+            "{path}: pkcs11 uri `{uri}` is keyed on `slot-id=` with no \
+             `serial=` — slot IDs are reassigned between insertions, so this \
+             binding will address the wrong token (or none) at the next boot. \
+             Key on `serial=`."
+        ));
     }
 }
 
@@ -525,6 +783,344 @@ pins:
         assert!(flat.contains_kind("tang"));
         assert!(!flat.contains_kind("tpm2"));
         assert!(!flat.contains_kind("sss"));
+    }
+
+    // ---- validation ----------------------------------------------------
+
+    /// The settled RPi fleet policy, built by the production constructor.
+    fn rpi_policy() -> SssPolicy {
+        SssPolicy::fleet_three_group(
+            &["http://172.16.2.45", "http://172.16.2.46"],
+            2,
+            "pkcs11:serial=NANO0001",
+            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            2,
+            None,
+        )
+    }
+
+    fn errors_of(policy: &SssPolicy) -> Vec<String> {
+        policy.validate().expect_err("policy must be rejected")
+    }
+
+    #[test]
+    fn test_settled_fleet_policies_validate_clean() {
+        // The deliverable itself must pass every rule — including the ones that
+        // exist to catch shapes that superficially resemble it. A validator that
+        // rejects the policy it was written for is worse than none.
+        let warnings = rpi_policy()
+            .validate()
+            .expect("the settled RPi policy must be valid");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        let lenserv = SssPolicy::fleet_three_group(
+            &["http://172.16.2.45", "http://172.16.2.46"],
+            2,
+            "pkcs11:serial=NANO0001",
+            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            2,
+            Some("7"),
+        );
+        let warnings = lenserv
+            .validate()
+            .expect("the settled lenserv policy must be valid");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn test_reject_pkcs11_uri_with_pin_value() {
+        // Storing the PIN in the LUKS header reduces the factor to
+        // something-you-have and never fails visibly.
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        assert!(
+            errors[0].contains("pin-value="),
+            "error must name the offending parameter: {errors:?}"
+        );
+
+        // Case must not be an escape hatch — RFC 7512 attribute names are
+        // matched case-insensitively by the tooling that parses them.
+        let shouty = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "PKCS11:SERIAL=YK1;PIN-VALUE=123456".to_string(),
+            })],
+        };
+        assert!(
+            errors_of(&shouty).iter().any(|e| e.contains("pin-value=")),
+            "uppercase pin-value must be rejected too"
+        );
+    }
+
+    #[test]
+    fn test_reject_pkcs11_uri_keyed_on_slot_id_without_serial() {
+        // slot IDs are reassigned between insertions; the binding addresses the
+        // wrong token at the next boot.
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:slot-id=0".to_string(),
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        assert!(
+            errors[0].contains("slot-id="),
+            "error must name the offending parameter: {errors:?}"
+        );
+
+        // A slot-id used only as a HINT alongside a stable serial is fine —
+        // that is how a multi-slot token is addressed, and rejecting it would
+        // push authors back to serial-less URIs.
+        let hinted = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001;slot-id=0".to_string(),
+            })],
+        };
+        assert!(
+            hinted.validate().is_ok(),
+            "serial= plus a slot-id hint must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_reject_illegal_threshold_at_every_level() {
+        // t > shares at the ROOT.
+        let too_high = SssPolicy {
+            threshold: 3,
+            pins: vec![
+                UnlockPin::Tang(TangPin {
+                    url: "http://a".to_string(),
+                }),
+                UnlockPin::Tang(TangPin {
+                    url: "http://b".to_string(),
+                }),
+            ],
+        };
+        assert!(
+            errors_of(&too_high)[0].contains("threshold 3"),
+            "root t=3 of 2 must be rejected"
+        );
+
+        // t = 0 anywhere.
+        let zero = SssPolicy {
+            threshold: 0,
+            pins: vec![UnlockPin::Tang(TangPin {
+                url: "http://a".to_string(),
+            })],
+        };
+        assert!(
+            errors_of(&zero)[0].contains("threshold 0"),
+            "t=0 must be rejected"
+        );
+
+        // And — the point of the recursion — t > shares THREE LEVELS DOWN,
+        // under two legal levels. A root-only check passes this happily and
+        // clevis then dies mid-bind.
+        let deep = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Sss(SssPolicy {
+                threshold: 1,
+                pins: vec![
+                    UnlockPin::Sss(SssPolicy {
+                        threshold: 9,
+                        pins: vec![UnlockPin::Tang(TangPin {
+                            url: "http://a".to_string(),
+                        })],
+                    }),
+                    UnlockPin::Tang(TangPin {
+                        url: "http://b".to_string(),
+                    }),
+                ],
+            })],
+        };
+        let errors = errors_of(&deep);
+        assert!(
+            errors.iter().any(|e| e.contains("threshold 9")),
+            "a bad threshold at depth 2 must still be caught: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("policy.pins[0].pins[0]")),
+            "the error must locate the offending level: {errors:?}"
+        );
+
+        // An empty group is unsatisfiable at any threshold.
+        let empty = SssPolicy {
+            threshold: 1,
+            pins: vec![],
+        };
+        assert!(
+            errors_of(&empty)[0].contains("no shares"),
+            "an empty group must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_reject_duplicate_share_identity_within_one_level() {
+        // A t=2 group holding the same token twice reads as 2-of-3 and is
+        // satisfiable by ONE token — the static analogue of the head -1 bind
+        // hazard.
+        let dup_token = SssPolicy {
+            threshold: 2,
+            pins: vec![
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000001".to_string(),
+                }),
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000001".to_string(),
+                }),
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000002".to_string(),
+                }),
+            ],
+        };
+        let errors = errors_of(&dup_token);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate pkcs11") && e.contains("YK0000001")),
+            "the repeated token must be named: {errors:?}"
+        );
+
+        // Same for Tang.
+        let dup_tang = SssPolicy {
+            threshold: 2,
+            pins: vec![
+                UnlockPin::Tang(TangPin {
+                    url: "http://172.16.2.45".to_string(),
+                }),
+                UnlockPin::Tang(TangPin {
+                    url: "http://172.16.2.45".to_string(),
+                }),
+            ],
+        };
+        assert!(
+            errors_of(&dup_tang)
+                .iter()
+                .any(|e| e.contains("duplicate tang")),
+            "a repeated Tang URL must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_check_is_per_level_not_global() {
+        // THE constraint that keeps rule 4 from rejecting its own deliverable:
+        // the settled policy names peerA in group 1 AND again inside group 3,
+        // and carriedA in group 2 AND again inside group 3. A global scan fails
+        // the exact JSON we are required to emit.
+        let policy = rpi_policy();
+        assert!(
+            policy.validate().is_ok(),
+            "cross-group repeats are the point of an OR over groups"
+        );
+
+        // Prove the fixture really does repeat, so the assertion above is not
+        // vacuous.
+        let tang = policy.tang_urls();
+        assert_eq!(
+            tang.iter().filter(|u| **u == "http://172.16.2.45").count(),
+            2,
+            "peerA must appear in two different groups for this test to mean \
+             anything: {tang:?}"
+        );
+    }
+
+    #[test]
+    fn test_warn_on_redundant_single_share_wrapper() {
+        // Legal, but almost always a half-edited group. Warn, do not block.
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Sss(SssPolicy {
+                threshold: 1,
+                pins: vec![UnlockPin::Tang(TangPin {
+                    url: "http://a".to_string(),
+                })],
+            })],
+        };
+        let warnings = policy
+            .validate()
+            .expect("a no-op wrapper is legal clevis, not an error");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("single share"),
+            "warning must say what is wrong: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_reports_every_violation_not_just_the_first() {
+        // An author fixing YAML should get one round of errors, not N rounds.
+        let policy = SssPolicy {
+            threshold: 5,
+            pins: vec![
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:slot-id=0".to_string(),
+                }),
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK1;pin-value=1234".to_string(),
+                }),
+            ],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(
+            errors.len(),
+            3,
+            "bad threshold + slot-id + pin-value: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_fleet_constructor_excludes_the_nano_from_group_three() {
+        // The security property, asserted on the TYPE (the JSON-level twin of
+        // this test lives in system_setup.rs). A chassis thief already holds the
+        // nano; if it counted toward group 3 they would need only ONE Tang.
+        let policy = rpi_policy();
+        let group_three = match &policy.pins[2] {
+            UnlockPin::Sss(g) => g,
+            other => panic!("group 3 must be a nested group, got {}", other.kind()),
+        };
+        let token_group = match &group_three.pins[1] {
+            UnlockPin::Sss(g) => g,
+            other => panic!(
+                "group 3's second share must be the token group, got {}",
+                other.kind()
+            ),
+        };
+        let uris: Vec<&str> = token_group
+            .pins
+            .iter()
+            .map(|p| match p {
+                UnlockPin::Pkcs11(k) => k.uri.as_str(),
+                other => panic!("expected a pkcs11 share, got {}", other.kind()),
+            })
+            .collect();
+        // Both directions: the carried keys ARE there (so a mis-navigated path
+        // cannot pass vacuously) and the nano is NOT.
+        assert_eq!(
+            uris,
+            vec!["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"]
+        );
+        assert!(
+            !uris.contains(&"pkcs11:serial=NANO0001"),
+            "the nano must NEVER be a group-3 factor: {uris:?}"
+        );
+        // ...and it IS in group 2, so its absence above is an exclusion, not an
+        // omission from the whole policy.
+        let group_two = match &policy.pins[1] {
+            UnlockPin::Sss(g) => g,
+            other => panic!("group 2 must be a nested group, got {}", other.kind()),
+        };
+        assert!(group_two.pins.iter().any(|p| matches!(
+            p,
+            UnlockPin::Pkcs11(k) if k.uri == "pkcs11:serial=NANO0001"
+        )));
     }
 
     #[test]

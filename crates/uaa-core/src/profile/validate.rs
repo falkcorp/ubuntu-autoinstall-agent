@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
 // last-edited: 2026-08-02
 
@@ -208,6 +208,29 @@ pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
                      factor is required"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    // The unlock policy tree is validated for EVERY role, not just
+    // install-target: a tree that cannot be bound is a defect wherever it is
+    // authored, and the cost of catching it here is a terminal message instead
+    // of a half-bound LUKS header on a host that is by then encrypted and
+    // unreachable. `SssPolicy::validate` walks the whole tree recursively — see
+    // its rules and the reasoning for each one.
+    if let Some(policy) = cfg.unlock_sss.as_ref() {
+        match policy.validate() {
+            Ok(warnings) => {
+                // Legal but suspicious. Loud, and NOT fatal: a warning that
+                // blocks is just an error with a confusing name.
+                for warning in warnings {
+                    tracing::warn!(target: "uaa::unlock", "unlock_sss policy: {warning}");
+                }
+            }
+            Err(errors) => {
+                for error in errors {
+                    violations.push(format!("unlock_sss policy: {error}"));
+                }
             }
         }
     }
@@ -906,6 +929,66 @@ mod tests {
             err.to_string()
                 .contains("role is install-target but unlock is empty"),
             "got: {err}"
+        );
+    }
+
+    /// The unlock-policy rules are only worth anything if they GATE an install.
+    /// `SssPolicy::validate` has its own exhaustive unit tests; this asserts the
+    /// wiring — that a policy those rules reject cannot get past
+    /// `validate_resolved`, and that the settled fleet policy sails through.
+    #[test]
+    fn test_resolved_config_is_gated_on_the_unlock_policy_rules() {
+        use crate::network::ssh_installer::unlock_sss::{Pkcs11Pin, SssPolicy, UnlockPin};
+
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+
+        // A PIN stored in the LUKS header, reached through a resolved config.
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+            })],
+        });
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("unlock_sss policy") && err.to_string().contains("pin-value="),
+            "the pkcs11 rules must gate a resolved config: {err}"
+        );
+
+        // An illegal threshold buried in a nested group, likewise.
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Sss(SssPolicy {
+                threshold: 4,
+                pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000001".to_string(),
+                })],
+            })],
+        });
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold 4"),
+            "nested threshold rule must gate a resolved config: {err}"
+        );
+
+        // Positive control: the settled fleet policy is accepted, so the two
+        // rejections above are the rules firing and not a blanket refusal of
+        // every tree.
+        cfg.unlock_sss = Some(SssPolicy::fleet_three_group(
+            &["http://172.16.2.45", "http://172.16.2.46"],
+            2,
+            "pkcs11:serial=NANO0001",
+            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            2,
+            None,
+        ));
+        assert!(
+            validate_resolved(&cfg).is_ok(),
+            "the settled fleet policy must pass the gate"
         );
     }
 

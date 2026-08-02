@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/packages.rs
-// version: 2.3.0
+// version: 3.0.0
 // guid: sshpkg01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-08-02
 
@@ -44,9 +44,28 @@ pub const LIVE_BASE_PACKAGES: &[&str] = &[
     "mdadm",
 ];
 
-/// Suite (Ubuntu 26.10 "Stonking Stingray") that ships `clevis 23-1build1`,
-/// the first clevis with a pkcs11 pin. 26.04 "resolute" only has `20-1ubuntu2`
+/// Suite (Ubuntu 26.10 "Stonking Stingray") that ships clevis 23, the first
+/// clevis with a pkcs11 pin. 26.04 "resolute" only has `20-1ubuntu2`
 /// (universe), and `resolute-backports` does NOT carry clevis.
+///
+/// # RELEASE ONLY — never `stonking-proposed`
+///
+/// There are TWO builds of clevis 23 in 26.10 and the difference is the whole
+/// ballgame:
+///
+/// * `23-1` in the **release** pocket — linked against OpenSSL 3, which 26.04
+///   already has. `libssl4` is never pulled.
+/// * `23-1build1` in **stonking-proposed** — rebuilt against OpenSSL 4,
+///   `Depends: libssl4 (>= 4.0.0)`, which drags in the 26.10
+///   `openssl-provider-legacy` over the 26.04 one.
+///
+/// Measured on a stock 26.04 container: pinning the release suite installs
+/// `clevis`/`clevis-luks`/`clevis-tpm2` `23-1`, leaves `libssl4` absent,
+/// `openssl-provider-legacy` at the 26.04 `3.5.5-1ubuntu3.2` and `libssl3t64`
+/// intact, and `openssl list -providers` / `dgst` / a TLS handshake / `apt
+/// update` all keep working. Adding `-proposed` to this string is the single
+/// edit that turns that clean install into an OpenSSL 4 migration, so
+/// [`clevis23_sources_content`] has a test asserting the word never appears.
 pub const CLEVIS23_SUITE: &str = "stonking";
 
 /// Mirror the clevis-23 pocket is fetched from. Same archive as the base
@@ -72,33 +91,42 @@ pub const CLEVIS23_PREFERENCES_PATH: &str = "/etc/apt/preferences.d/99-uaa-clevi
 /// module `50clevis-pin-pkcs11` is in `clevis-dracut` and
 /// `clevis-luks-pkcs11-askpass.service` is in `clevis-systemd`.
 ///
-/// `libssl4` is here because clevis 23 `Depends: libssl4 (>= 4.0.0)`, which
-/// does not exist in 26.04. It co-installs with the installed `libssl3t64`
-/// (distinct sonames `libssl.so.4`/`libcrypto.so.4`), so there is no glibc
-/// cascade. `openssl-provider-legacy` is here because the 26.10 `libssl4
-/// 4.0.1-1ubuntu1 Depends: openssl-provider-legacy (>= 4.0.0)` and that is a
-/// single package name — see the risk doc; this is the unresolved edge.
+/// `libssl4` and `openssl-provider-legacy` were once on this list and have been
+/// REMOVED. They were only ever needed by `23-1build1` from
+/// **stonking-proposed**, which is rebuilt against OpenSSL 4; the release-pocket
+/// `23-1` this list actually resolves is linked against OpenSSL 3 and satisfies
+/// itself from 26.04's own `libssl3t64`. Measured: after installing clevis 23-1
+/// on stock 26.04, `libssl4` is absent and `openssl-provider-legacy` is
+/// untouched at the 26.04 version. See [`CLEVIS23_SUITE`] for the
+/// release-vs-proposed distinction, which is the non-obvious part.
 pub const CLEVIS23_PINNED_PACKAGES: &[&str] = &[
     "clevis",
     "clevis-luks",
     "clevis-dracut",
     "clevis-systemd",
     "clevis-tpm2",
-    "libssl4",
-    "openssl-provider-legacy",
 ];
 
-/// PKCS#11 / PIV token userspace. `clevis` only *Recommends* opensc, and
-/// nothing pulls `pcscd`, so without these the pkcs11 pin has no token to talk
-/// to. Deliberately NOT in `CLEVIS23_PINNED_PACKAGES`: these install from plain
-/// 26.04 universe at their stock versions.
+/// PKCS#11 / PIV token userspace. Deliberately NOT in
+/// `CLEVIS23_PINNED_PACKAGES`: these install from plain 26.04 universe at their
+/// stock versions.
+///
+/// `opensc`/`opensc-pkcs11` are in fact pulled automatically as a *Recommends*
+/// of clevis 23 (measured: `0.27.0~rc1-1` arrives unasked), so naming `opensc`
+/// here is belt-and-braces — it survives `--no-install-recommends` and makes the
+/// dependency explicit rather than incidental. `pcscd` is NOT recommended by
+/// anything and must be installed explicitly, or the pkcs11 pin has no daemon to
+/// reach the token through.
 pub const PKCS11_TOKEN_PACKAGES: &[&str] = &["opensc", "pcscd"];
 
 /// Render the deb822 source for the clevis-23 pocket.
 ///
-/// `Components: main universe` is load-bearing — clevis lives in *universe*,
-/// while `libssl4` / `openssl-provider-legacy` live in *main*. Dropping either
-/// component makes the whole thing a silent no-op that resolves clevis 20.
+/// `Components: main universe` — clevis lives in *universe*; *main* is kept so
+/// an ordinary library dependency of the clevis binaries can still resolve from
+/// the same suite. Dropping *universe* makes the whole thing a silent no-op that
+/// resolves clevis 20.
+///
+/// `Suites` is the RELEASE pocket and nothing else — see [`CLEVIS23_SUITE`].
 pub fn clevis23_sources_content(suite: &str, mirror: &str) -> String {
     format!(
         "# Managed by ubuntu-autoinstall-agent. Enabled by clevis_pkcs11_pin.\n\
@@ -143,11 +171,13 @@ pub fn clevis23_preferences_content(suite: &str) -> String {
          # catch-all below zero for everything else in the same release.\n\
          #\n\
          # The clevis binaries are lockstep-versioned (clevis-luks Depends:\n\
-         # clevis (= 23-1build1), and so on down the chain), so the allowlist\n\
-         # must name the whole set - pinning one package alone is unresolvable.\n\
-         # libssl4 is a clevis 23 dependency absent from 26.04; it co-installs\n\
-         # with libssl3t64 because the sonames differ. openssl-provider-legacy\n\
-         # is a libssl4 dependency and is NOT co-installable - see\n\
+         # clevis (= 23-1), and so on down the chain), so the allowlist must\n\
+         # name the whole set - pinning one package alone is unresolvable.\n\
+         #\n\
+         # libssl4 / openssl-provider-legacy are deliberately NOT listed. They\n\
+         # are needed only by 23-1build1 in {suite}-PROPOSED, which is rebuilt\n\
+         # against OpenSSL 4. The release-pocket 23-1 pinned here links against\n\
+         # OpenSSL 3 and is satisfied by the libssl3t64 in 26.04 - measured, see\n\
          # docs/research/2026-08-02-clevis23-pkcs11-pinning-risk.md.\n\
          #\n\
          # opensc / pcscd are intentionally ABSENT: they install from plain\n\
@@ -358,7 +388,7 @@ mod tests {
     fn sources_content_names_suite_components_and_keyring() {
         let s = clevis23_sources_content("stonking", "http://archive.ubuntu.com/ubuntu/");
         assert!(s.contains("Suites: stonking"), "{s}");
-        // universe (clevis) AND main (libssl4) are both required.
+        // clevis is in universe; main stays for ordinary library deps.
         assert!(s.contains("Components: main universe"), "{s}");
         assert!(
             s.contains("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg"),
@@ -367,6 +397,62 @@ mod tests {
         assert!(s.contains("Types: deb"), "{s}");
         // Must survive `bash -lc '…'` wrapping.
         assert!(!s.contains('\''), "no single quotes in generated content");
+    }
+
+    /// The ONE word that separates a clean install from an OpenSSL 4 migration.
+    ///
+    /// 26.10 carries two builds of clevis 23: `23-1` in the release pocket,
+    /// linked against OpenSSL 3 (which 26.04 already has), and `23-1build1` in
+    /// `-proposed`, rebuilt against OpenSSL 4 and therefore `Depends: libssl4
+    /// (>= 4.0.0)`, which drags the 26.10 `openssl-provider-legacy` in over the
+    /// 26.04 one. Measured on stock 26.04: pinning the release pocket installs
+    /// clevis 23-1 with `libssl4` never pulled and `openssl-provider-legacy`
+    /// untouched. Adding `-proposed` here — a plausible-looking "get the newest
+    /// build" edit — silently reverses all of that, and nothing else in the
+    /// suite would fail to reveal it.
+    #[test]
+    fn sources_never_enable_the_proposed_pocket() {
+        let s = clevis23_sources_content(CLEVIS23_SUITE, CLEVIS23_MIRROR);
+        assert!(
+            !s.contains("proposed"),
+            "the -proposed pocket carries the OpenSSL-4 rebuild of clevis 23; \
+             the release pocket's 23-1 is the one that installs cleanly on \
+             26.04: {s}"
+        );
+        // And the suite constant itself, since that is what a future edit would
+        // most likely touch.
+        assert!(
+            !CLEVIS23_SUITE.contains("proposed"),
+            "CLEVIS23_SUITE must name the release pocket only"
+        );
+
+        // Negative control: the assertion above is not passing because the
+        // renderer drops whatever suite it is handed.
+        let bad = clevis23_sources_content("stonking-proposed", CLEVIS23_MIRROR);
+        assert!(
+            bad.contains("proposed"),
+            "the renderer must actually emit its suite, or this test is vacuous"
+        );
+    }
+
+    /// The OpenSSL-4 packages are gone from the allowlist and must stay gone —
+    /// pinning them would re-admit the very upgrade the release pocket avoids.
+    #[test]
+    fn preferences_do_not_pin_the_openssl4_packages() {
+        let p = clevis23_preferences_content(CLEVIS23_SUITE);
+        for pkg in ["libssl4", "openssl-provider-legacy"] {
+            assert!(
+                !CLEVIS23_PINNED_PACKAGES.contains(&pkg),
+                "{pkg} must not be in the allowlist"
+            );
+            // The comment block explains WHY they are absent, so only the
+            // `Package:` allowlist line itself is checked.
+            let allow_line = p
+                .lines()
+                .find(|l| l.starts_with("Package: clevis"))
+                .expect("allowlist line must exist");
+            assert!(!allow_line.contains(pkg), "{pkg} in: {allow_line}");
+        }
     }
 
     #[test]
