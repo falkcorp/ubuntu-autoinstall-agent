@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.2.3
+// version: 1.3.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
 // last-edited: 2026-08-02
 
@@ -99,8 +99,9 @@ pub fn validate(groups: &[HostGroupProfile], profiles: &[HostProfile]) -> Result
 ///    Tang-server host with no Tang workload is a misconfigured host.
 ///    `role == InstallTarget` requires both a storage disk plan
 ///    (`disk_device` set OR `disks` non-empty) and a non-empty unlock
-///    (`tang_servers` non-empty OR `enroll_tpm2` true) — an install target
-///    with neither is a host nobody can unlock after first boot.
+///    (`tang_servers` non-empty OR `enroll_tpm2` true OR an authored
+///    `unlock_sss` policy tree) — an install target with a disk plan but no
+///    unlock factor at all is a host nobody can unlock after first boot.
 ///
 /// **Not checked here (PS-INSTALLER-29):** a resolved config carrying
 /// non-default disk sizes or `reset_enabled` would be unsupported today, but
@@ -193,11 +194,18 @@ pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
                         .to_string(),
                 );
             }
-            let has_unlock = !cfg.tang_servers.is_empty() || cfg.enroll_tpm2;
+            // An authored `unlock_sss` tree counts as an unlock factor in its
+            // own right: a host may declare its whole policy there (its Tang
+            // servers included) and leave the flat roster empty. Without this
+            // clause the validator would reject a config THIS crate's own
+            // `lower` happily produces.
+            let has_unlock =
+                !cfg.tang_servers.is_empty() || cfg.enroll_tpm2 || cfg.unlock_sss.is_some();
             if !has_unlock {
                 violations.push(
-                    "role is install-target but unlock is empty (no tang_servers and \
-                     enroll_tpm2 is false); at least one unlock factor is required"
+                    "role is install-target but unlock is empty (no tang_servers, no \
+                     unlock_sss policy, and enroll_tpm2 is false); at least one unlock \
+                     factor is required"
                         .to_string(),
                 );
             }
@@ -856,6 +864,42 @@ mod tests {
         cfg.disk_device = "/dev/nvme0n1".into();
         cfg.tang_servers = Vec::new();
         cfg.enroll_tpm2 = false;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role is install-target but unlock is empty"),
+            "got: {err}"
+        );
+    }
+
+    /// A host whose ENTIRE unlock policy lives in the `unlock_sss` tree — flat
+    /// Tang roster empty, TPM2 enrollment off — is a legal install target. The
+    /// tree is an unlock factor; rejecting it would mean this crate's own
+    /// `lower` produces configs its own validator refuses.
+    #[test]
+    fn test_rule5_install_target_unlocked_only_by_a_policy_tree_passes() {
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+        cfg.unlock_sss = Some(SssPolicy::tpm2_and_tang(
+            "7",
+            &[TangServer {
+                url: "http://tang1.example.internal".to_string(),
+            }],
+            1,
+        ));
+        assert!(
+            validate_resolved(&cfg).is_ok(),
+            "a tree-only unlock policy must satisfy rule 5"
+        );
+
+        // Negative control: drop the tree and the SAME config is rejected, so
+        // the assertion above is proving the tree clause and not a coincidence.
+        cfg.unlock_sss = None;
         let err = validate_resolved(&cfg).unwrap_err();
         assert!(
             err.to_string()

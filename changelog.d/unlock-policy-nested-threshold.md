@@ -1,5 +1,5 @@
 <!-- file: changelog.d/unlock-policy-nested-threshold.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 59dda7cf-7fcc-4924-bc16-5a52ca7b434c -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -26,3 +26,8 @@ Hosts that author no tree — every committed config today, len-serv-001/002
 included — lower to `unlock_sss: None`, serialize without the key, and keep
 their existing flat behavior byte-for-byte. Nothing consumes the tree yet: the
 clevis JSON emitter still builds the flat policy from `tang_servers`.
+
+Post-merge validation now counts an authored policy tree as a real unlock
+factor, so a host that declares its whole policy (Tang servers included) in the
+tree and leaves the flat roster empty is no longer rejected as "a host nobody
+can unlock".
