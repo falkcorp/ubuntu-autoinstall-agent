@@ -1,10 +1,9 @@
 <!-- file: docs/research/2026-08-02-clevis23-pkcs11-pinning-risk.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 9c2d41ab-7f38-4e05-b6a1-0d5e83c47f92 -->
 <!-- last-edited: 2026-08-02 -->
 
-# clevis 23 / pkcs11 pin on Ubuntu 26.04 — pinning design and the
-# `openssl-provider-legacy` collision
+# clevis 23 / pkcs11 pin on Ubuntu 26.04: pinning design and the `openssl-provider-legacy` collision
 
 **Status: the feature is implemented and OFF BY DEFAULT. The dependency
 collision described in [The unresolved collision](#the-unresolved-collision) is
@@ -175,3 +174,11 @@ pre-change apt line.
   one-line fix.
 - `InitramfsTools` targets do not get `clevis-dracut`/`clevis-systemd`, so the
   pkcs11 pin is effectively Dracut-only. Every real host here is Dracut.
+- The `Package: *` / `Pin-Priority: -1` catch-all means any 26.10-only
+  transitive dependency that is *not* on the allowlist makes `apt install` fail
+  outright rather than half-install. That is deliberate: an install-time failure
+  is recoverable, a machine that boots without an unlock factor is not.
+- `clevis_pkcs11_pin` is OR-ed into `needs_clevis` in `system_setup.rs`, so a
+  Tang-less `plain-luks` host with the flag on still gets the clevis packages.
+  Without that term the flag would pin the pocket and install `opensc`/`pcscd`
+  while installing no clevis at all — a silent success with no unlock factor.
