@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/verify.rs
-// version: 1.3.1
+// version: 1.4.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-07-24
+// last-edited: 2026-08-02
 
 //! Post-install verification for Lenovo fleet hosts.
 //!
@@ -65,8 +65,8 @@ pub const TANG_URLS: &[&str] = &[
     "http://172.16.2.47",
 ];
 
-/// The SSS JSON key that encodes the threshold (t=2).
-const CLEVIS_THRESHOLD_STR: &str = "\"t\":2";
+/// The SSS threshold the fleet policy requires (`"t":2`).
+const CLEVIS_THRESHOLD: u64 = 2;
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -251,29 +251,342 @@ pub fn evaluate_shim_present(esp_listing: &str) -> CheckResult {
     }
 }
 
-/// Clevis SSS Tang binding is present with t=2 and all 3 Tang URLs.
+/// One `slot: pin '<json>'` line from `clevis luks list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClevisBindingLine {
+    /// LUKS keyslot number, e.g. `1`.
+    pub slot: String,
+    /// Top-level clevis pin name, e.g. `sss` or `tang`.
+    pub pin: String,
+    /// The single-quoted JSON payload, unquoted.
+    pub json: String,
+}
+
+/// Parse `clevis luks list` output into one entry per bound keyslot.
 ///
-/// Expects output of `clevis luks list <dev>`.
-pub fn evaluate_clevis_binding(clevis_output: &str) -> CheckResult {
-    let tang_urls = &crate::fleet::fleet().tang_urls;
-    let has_sss = clevis_output.contains("sss");
-    let has_threshold = clevis_output.contains(CLEVIS_THRESHOLD_STR);
-    let missing_urls: Vec<&String> = tang_urls
-        .iter()
-        .filter(|url| !clevis_output.contains(url.as_str()))
+/// Real-world format is one line per slot:
+///
+/// ```text
+/// 1: sss '{"t":2,"pins":{...}}'
+/// ```
+///
+/// The pin name is taken from the parsed token, never from a substring of the
+/// whole line — that conflation is what let a vulnerable policy masquerade as a
+/// valid one. Lines that do not match the shape are skipped.
+pub fn parse_clevis_bindings(clevis_output: &str) -> Vec<ClevisBindingLine> {
+    clevis_output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (slot, rest) = line.split_once(':')?;
+            if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            // JSON never contains a single quote, so first/last delimit it.
+            let open = rest.find('\'')?;
+            let close = rest.rfind('\'')?;
+            if close <= open {
+                return None;
+            }
+            let pin = rest[..open].trim();
+            if pin.is_empty() {
+                return None;
+            }
+            Some(ClevisBindingLine {
+                slot: slot.to_string(),
+                pin: pin.to_string(),
+                json: rest[open + 1..close].to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Number of independent SSS **shares** contributed by a `pins` object.
+///
+/// This is the arithmetic the old substring-based verifier got wrong. In
+/// clevis's `sss` pin, an **array** value contributes one share PER ELEMENT —
+/// so `"tang":[a,b,c]` is three shares, not one. A non-array value is one
+/// share. An empty `pins` object contributes zero shares (and is therefore
+/// unsatisfiable at any `t >= 1`).
+pub fn count_shares(pins: &serde_json::Map<String, serde_json::Value>) -> usize {
+    pins.values()
+        .map(|v| match v {
+            serde_json::Value::Array(items) => items.len(),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Collect every Tang `url` appearing anywhere in a clevis policy tree.
+fn collect_tang_urls(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                if key == "tang" {
+                    let entries: Vec<&serde_json::Value> = match val {
+                        serde_json::Value::Array(items) => items.iter().collect(),
+                        other => vec![other],
+                    };
+                    for entry in entries {
+                        if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
+                            out.push(url.to_string());
+                        }
+                    }
+                }
+                collect_tang_urls(val, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_tang_urls(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Structural validation of ONE `sss` policy object. `Ok(detail)` on success.
+fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String, String> {
+    let obj = policy
+        .as_object()
+        .ok_or_else(|| "sss policy is not a JSON object".to_string())?;
+    let t = obj
+        .get("t")
+        .and_then(|t| t.as_u64())
+        .ok_or_else(|| "sss policy has no numeric \"t\" threshold".to_string())?;
+    let pins = obj
+        .get("pins")
+        .and_then(|p| p.as_object())
+        .ok_or_else(|| "sss policy has no \"pins\" object".to_string())?;
+
+    if t != CLEVIS_THRESHOLD {
+        return Err(format!(
+            "threshold is t={t}, fleet policy requires t=2 (missing t=2 threshold)"
+        ));
+    }
+
+    let shares = count_shares(pins);
+    if shares < t as usize {
+        return Err(format!(
+            "unsatisfiable policy: t={t} but pins provide only {shares} share(s) — \
+             this volume can never unlock unattended"
+        ));
+    }
+
+    let tang_shares = pins.get("tang").map(|v| match v {
+        serde_json::Value::Array(items) => items.len(),
+        _ => 1,
+    });
+    let other_keys: Vec<&str> = pins
+        .keys()
+        .filter(|k| k.as_str() != "tang")
+        .map(|k| k.as_str())
         .collect();
 
-    if has_sss && has_threshold && missing_urls.is_empty() {
-        CheckResult::pass("clevis_binding", format!("SSS t=2 with {} Tang servers", tang_urls.len()))
-    } else {
-        let mut reasons = vec![];
-        if !has_sss { reasons.push("missing 'sss' pin"); }
-        if !has_threshold { reasons.push("missing t=2 threshold"); }
-        if !missing_urls.is_empty() {
-            reasons.push("missing Tang URL(s)");
+    match (tang_shares, other_keys.is_empty()) {
+        // ── Legacy flat Tang-only policy (len-serv-001/002 in production). ──
+        // Tang-satisfiable by DESIGN: there is no second factor to undermine.
+        (Some(n), true) => Ok(format!(
+            "legacy flat Tang-only SSS: t={t} of {n} Tang shares (expected for len-serv-001/002)"
+        )),
+
+        // ── VULNERABLE: tang sits as a DIRECT sibling of other pins. ──
+        // Each Tang server is its own share, so the Tang group alone meets t.
+        (Some(n), false) if n >= t as usize => Err(format!(
+            "VULNERABLE: policy is Tang-satisfiable. \"tang\" is a direct child of \
+             \"pins\", so its {n} entries are {n} SEPARATE shares out of {shares} total \
+             with t={t} — the {n} Tang servers ALONE meet the threshold, and the \
+             other pin(s) [{others}] add availability only, NOT security. Anyone who \
+             controls the Tang servers can decrypt this volume. Fix: nest the Tang \
+             group under an inner sss so it collapses to ONE share, e.g. \
+             {{\"t\":2,\"pins\":{{\"tpm2\":{{...}},\"sss\":[{{\"t\":2,\"pins\":{{\"tang\":[...]}}}}]}}}}",
+            others = other_keys.join(", ")
+        )),
+
+        // tang is a direct sibling but too small to meet t on its own. Still
+        // wrong shape (share arithmetic is not what the policy author intended),
+        // so reject rather than silently bless it.
+        (Some(n), false) => Err(format!(
+            "\"tang\" is a direct child of \"pins\" alongside [{others}]: its {n} entries \
+             are {n} separate shares, not one. Nest the Tang group under an inner sss.",
+            others = other_keys.join(", ")
+        )),
+
+        // ── Correct AND shape: no direct tang; the Tang group is nested. ──
+        (None, _) => {
+            if shares != t as usize {
+                return Err(format!(
+                    "outer sss has {shares} shares with t={t}; an AND of all factors \
+                     requires shares == t (any {t} of {shares} factors would suffice)"
+                ));
+            }
+            let inner = pins.get("sss").ok_or_else(|| {
+                "outer sss has no nested \"sss\" pin — the Tang group must be nested \
+                 so it counts as a single share"
+                    .to_string()
+            })?;
+            let inner_policies: Vec<&serde_json::Value> = match inner {
+                serde_json::Value::Array(items) => items.iter().collect(),
+                other => vec![other],
+            };
+            let inner_policy = match inner_policies.as_slice() {
+                [single] => *single,
+                other => {
+                    return Err(format!(
+                        "nested \"sss\" pin has {} policies; expected exactly 1 \
+                         (each extra one is an extra share)",
+                        other.len()
+                    ))
+                }
+            };
+            let inner_obj = inner_policy
+                .as_object()
+                .ok_or_else(|| "nested sss policy is not a JSON object".to_string())?;
+            let inner_t = inner_obj
+                .get("t")
+                .and_then(|t| t.as_u64())
+                .ok_or_else(|| "nested sss policy has no numeric \"t\"".to_string())?;
+            let inner_pins = inner_obj
+                .get("pins")
+                .and_then(|p| p.as_object())
+                .ok_or_else(|| "nested sss policy has no \"pins\" object".to_string())?;
+            let inner_tang = inner_pins
+                .get("tang")
+                .map(|v| match v {
+                    serde_json::Value::Array(items) => items.len(),
+                    _ => 1,
+                })
+                .ok_or_else(|| "nested sss policy has no \"tang\" pin".to_string())?;
+            if inner_t < 2 {
+                return Err(format!(
+                    "VULNERABLE: nested Tang group has t={inner_t} of {inner_tang} — a \
+                     SINGLE compromised Tang server would satisfy it; require t>=2"
+                ));
+            }
+            if inner_t as usize > inner_tang {
+                return Err(format!(
+                    "unsatisfiable nested Tang group: t={inner_t} but only {inner_tang} \
+                     Tang server(s) — this volume can never unlock unattended"
+                ));
+            }
+            let other_outer: Vec<&str> = pins
+                .keys()
+                .filter(|k| k.as_str() != "sss")
+                .map(|k| k.as_str())
+                .collect();
+            Ok(format!(
+                "AND of [{others}] + nested {inner_t}-of-{inner_tang} Tang group \
+                 (outer t={t} of {shares} shares)",
+                others = other_outer.join(", ")
+            ))
         }
-        CheckResult::fail("clevis_binding", reasons.join("; "))
     }
+}
+
+/// Clevis SSS binding is present, has t=2, covers every configured Tang server,
+/// and has the correct **share topology**.
+///
+/// Expects output of `clevis luks list <dev>`.
+///
+/// # Why this is structural and not a substring match
+///
+/// In clevis's `sss` pin an array value contributes one share PER ELEMENT, so
+/// `{"t":2,"pins":{"tang":[a,b,c],"tpm2":{…}}}` is **2-of-4** and the three Tang
+/// servers alone satisfy the threshold — it is NOT `AND(tpm2, tang)`. The
+/// correct policy nests the Tang group under an inner `sss` so it collapses to a
+/// single share. Both strings contain `sss`, `"t":2` and every Tang URL, so the
+/// old substring checks passed the vulnerable one. See [`count_shares`].
+///
+/// Validation is against **invariants of the JSON itself**, not against a
+/// declared spec: the policy is self-describing (a second pin alongside `tang`
+/// means an AND was intended), so a mis-declared or absent spec cannot make a
+/// Tang-satisfiable volume verify clean.
+///
+/// Fails closed: empty output, unparseable JSON, or no `sss` binding all FAIL.
+/// With multiple keyslots, ANY vulnerable binding fails the check — every slot
+/// can unlock the volume, so a good slot does not redeem a bad one.
+pub fn evaluate_clevis_binding(clevis_output: &str) -> CheckResult {
+    const NAME: &str = "clevis_binding";
+    let tang_urls = &crate::fleet::fleet().tang_urls;
+
+    let bindings = parse_clevis_bindings(clevis_output);
+    if bindings.is_empty() {
+        return CheckResult::fail(
+            NAME,
+            "no clevis binding found (empty or unparseable `clevis luks list` output)",
+        );
+    }
+
+    let sss_bindings: Vec<&ClevisBindingLine> =
+        bindings.iter().filter(|b| b.pin == "sss").collect();
+    if sss_bindings.is_empty() {
+        let pins: Vec<&str> = bindings.iter().map(|b| b.pin.as_str()).collect();
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "missing 'sss' pin: bound pin(s) are [{}] — a bare pin has no threshold",
+                pins.join(", ")
+            ),
+        );
+    }
+
+    // A non-sss keyslot has NO threshold at all — e.g. a bare `tang` pin unlocks
+    // the volume from a single Tang server. It can open the volume just like the
+    // sss slot can, so it is exactly the vulnerability class above in its
+    // maximal form and must fail the check.
+    if let Some(bare) = bindings.iter().find(|b| b.pin != "sss") {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "VULNERABLE: slot {} is bound with a bare '{}' pin alongside the sss \
+                 policy. A bare pin has no threshold, so that slot ALONE unlocks the \
+                 volume — it defeats the sss policy entirely. Remove the extra \
+                 binding (`clevis luks unbind -d <dev> -s {}`).",
+                bare.slot, bare.pin, bare.slot
+            ),
+        );
+    }
+
+    let mut details = Vec::new();
+    for binding in &sss_bindings {
+        let policy: serde_json::Value = match serde_json::from_str(&binding.json) {
+            Ok(v) => v,
+            Err(e) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!("slot {}: unparseable clevis JSON: {e}", binding.slot),
+                )
+            }
+        };
+
+        match validate_sss_policy(&policy) {
+            Ok(detail) => {
+                let mut found = Vec::new();
+                collect_tang_urls(&policy, &mut found);
+                let missing: Vec<&str> = tang_urls
+                    .iter()
+                    .filter(|u| !found.iter().any(|f| f == *u))
+                    .map(|u| u.as_str())
+                    .collect();
+                if !missing.is_empty() {
+                    return CheckResult::fail(
+                        NAME,
+                        format!(
+                            "slot {}: missing Tang URL(s): {}",
+                            binding.slot,
+                            missing.join(", ")
+                        ),
+                    );
+                }
+                details.push(format!("slot {}: {detail}", binding.slot));
+            }
+            Err(reason) => {
+                return CheckResult::fail(NAME, format!("slot {}: {reason}", binding.slot))
+            }
+        }
+    }
+
+    CheckResult::pass(NAME, details.join(" | "))
 }
 
 /// `/etc/crypttab` exists and has at least one non-comment line.
@@ -652,6 +965,163 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     #[test]
     fn clevis_binding_passes_on_live_fixture() {
         assert!(evaluate_clevis_binding(CLEVIS_003).passed);
+    }
+
+    /// The VULNERABLE shape: `tang` is a DIRECT child of the outer `pins`, so
+    /// its three entries are three separate shares. With `t:2` this is 2-of-4
+    /// and the three Tang servers ALONE satisfy the threshold — the tpm2 pin
+    /// contributes nothing to the threat model.
+    const CLEVIS_VULNERABLE_2_OF_4: &str =
+        "1: sss '{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}],\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"}}}'";
+
+    /// The CORRECT shape: the Tang group is nested under an inner `sss`, so it
+    /// collapses to ONE share. Outer is 2-of-2 = AND(tpm2, 2-of-3 tang).
+    const CLEVIS_NESTED_CORRECT: &str =
+        "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"},\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'";
+
+    #[test]
+    fn clevis_binding_rejects_tang_satisfiable_2_of_4() {
+        let r = evaluate_clevis_binding(CLEVIS_VULNERABLE_2_OF_4);
+        assert!(
+            !r.passed,
+            "2-of-4 config is Tang-satisfiable and MUST be rejected: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.to_lowercase().contains("tang"),
+            "operator must be told it is Tang-satisfiable, got: {}",
+            r.detail
+        );
+    }
+
+    #[test]
+    fn clevis_binding_passes_on_nested_tpm2_and_tang() {
+        let r = evaluate_clevis_binding(CLEVIS_NESTED_CORRECT);
+        assert!(
+            r.passed,
+            "correct nested policy must verify clean: {}",
+            r.detail
+        );
+    }
+
+    // ── count_shares: the arithmetic that was wrong ──────────────────────────
+
+    fn pins_of(json: &str) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(json).expect("test fixture is valid JSON")
+    }
+
+    #[test]
+    fn count_shares_counts_each_array_element_separately() {
+        // THE bug: "tang":[a,b,c] is THREE shares, not one.
+        assert_eq!(
+            count_shares(&pins_of(
+                r#"{"tang":[{"url":"a"},{"url":"b"},{"url":"c"}]}"#
+            )),
+            3
+        );
+    }
+
+    #[test]
+    fn count_shares_counts_non_array_pin_as_one() {
+        assert_eq!(count_shares(&pins_of(r#"{"tpm2":{"pcr_ids":"7"}}"#)), 1);
+    }
+
+    #[test]
+    fn count_shares_sums_mixed_pins() {
+        // 3 tang + 1 tpm2 = 4 shares → t=2 is 2-of-4, NOT an AND.
+        assert_eq!(
+            count_shares(&pins_of(
+                r#"{"tang":[{"url":"a"},{"url":"b"},{"url":"c"}],"tpm2":{"pcr_ids":"7"}}"#
+            )),
+            4
+        );
+        // Nested: the tang group collapses into ONE sss share → 2 total.
+        assert_eq!(
+            count_shares(&pins_of(
+                r#"{"tpm2":{"pcr_ids":"7"},"sss":[{"t":2,"pins":{"tang":[{"url":"a"},{"url":"b"}]}}]}"#
+            )),
+            2
+        );
+    }
+
+    #[test]
+    fn count_shares_of_empty_pins_is_zero() {
+        assert_eq!(count_shares(&pins_of("{}")), 0);
+    }
+
+    // ── parse_clevis_bindings ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_clevis_bindings_reads_slot_pin_and_json() {
+        let parsed = parse_clevis_bindings(CLEVIS_003);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].slot, "1");
+        assert_eq!(parsed[0].pin, "sss");
+        assert!(parsed[0].json.starts_with('{') && parsed[0].json.ends_with('}'));
+    }
+
+    #[test]
+    fn parse_clevis_bindings_handles_multiple_slots_and_junk() {
+        let out =
+            format!("{CLEVIS_003}\n\n2: tang '{{\"url\":\"http://x\"}}'\nnot a binding line\n");
+        let parsed = parse_clevis_bindings(&out);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[1].pin, "tang");
+    }
+
+    // ── evaluate_clevis_binding: topology ────────────────────────────────────
+
+    #[test]
+    fn clevis_binding_fails_closed_on_empty_output() {
+        // verify_host uses unwrap_or_default(), so an SSH failure lands here.
+        assert!(!evaluate_clevis_binding("").passed);
+        assert!(!evaluate_clevis_binding("1: sss 'not json'").passed);
+    }
+
+    #[test]
+    fn clevis_binding_rejects_vulnerable_slot_even_if_another_slot_is_good() {
+        let out = format!("{CLEVIS_NESTED_CORRECT}\n{CLEVIS_VULNERABLE_2_OF_4}");
+        assert!(!evaluate_clevis_binding(&out).passed);
+    }
+
+    #[test]
+    fn clevis_binding_rejects_bare_tang_slot_beside_a_good_sss_slot() {
+        // Slot 2 has no threshold at all: one Tang server unlocks the volume,
+        // which defeats the correct sss policy in slot 1.
+        let out = format!("{CLEVIS_NESTED_CORRECT}\n2: tang '{{\"url\":\"http://172.16.2.45\"}}'");
+        let r = evaluate_clevis_binding(&out);
+        assert!(!r.passed, "a bare pin slot must fail the check: {}", r.detail);
+        assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
+    }
+
+    #[test]
+    fn clevis_binding_rejects_single_tang_nested_threshold() {
+        // inner t=1: one compromised Tang server unlocks the volume.
+        let r = evaluate_clevis_binding(
+            "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\"},\"sss\":[{\"t\":1,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'",
+        );
+        assert!(!r.passed);
+        assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
+    }
+
+    #[test]
+    fn clevis_binding_rejects_unsatisfiable_nested_threshold() {
+        // inner t=4 of 3 Tang servers: can never unlock.
+        let r = evaluate_clevis_binding(
+            "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\"},\"sss\":[{\"t\":4,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'",
+        );
+        assert!(!r.passed);
+        assert!(r.detail.contains("unsatisfiable"), "{}", r.detail);
+    }
+
+    #[test]
+    fn clevis_binding_rejects_extra_outer_share() {
+        // tpm2 + nested sss + a third factor = 3 shares with t=2 → any 2 of 3.
+        let r = evaluate_clevis_binding(
+            "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\"},\"sshd\":{\"host\":\"h\"},\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'",
+        );
+        assert!(!r.passed);
+        assert!(r.detail.contains("shares == t"), "{}", r.detail);
     }
 
     #[test]
