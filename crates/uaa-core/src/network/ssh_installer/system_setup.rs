@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.27.0
+// version: 2.28.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -32,6 +32,57 @@ use tracing::{info, warn};
 /// headless box; `console=tty0` keeps a local VGA console too. Harmless on a
 /// host with no physical UART (the kernel just never opens it).
 const SERIAL_CONSOLE_DROPIN: &str = "# file: /etc/default/grub.d/99-uaa-serial-console.cfg\n# Installed by ubuntu-autoinstall-agent: expose boot + LUKS unlock + emergency\n# shell on serial for IPMI SOL. Supermicro X10 BMC SOL = COM2/ttyS1 (IPMI SOL\n# payload channel 1), NOT ttyS0/COM1 — emit to BOTH COM ports with ttyS1 LAST so\n# it wins /dev/console (interactive LUKS/maintenance prompts land where SOL reads).\n# Sourced after /etc/default/grub, so this APPENDS.\nGRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX console=tty0 console=ttyS0,115200n8 console=ttyS1,115200n8\"\nGRUB_TERMINAL=\"console serial\"\nGRUB_SERIAL_COMMAND=\"serial --speed=115200 --unit=1 --word=8 --parity=no --stop=1\"\n";
+
+/// One Tang server plus the on-disk path of its **pre-fetched** advertisement.
+///
+/// `adv` is a path, not the advertisement body — clevis reads the file itself.
+/// Field order is the serialized key order (`url` then `adv`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct TangAdv<'a> {
+    pub url: &'a str,
+    pub adv: &'a str,
+}
+
+/// The clevis `tpm2` pin parameters.
+///
+/// `pcr_bank` is explicit because clevis defaults to `sha1`, which Secure Boot
+/// does not populate — a sha1-banked PCR7 seal unseals unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Tpm2Peer<'a> {
+    pub pcr_ids: &'a str,
+    pub pcr_bank: &'a str,
+}
+
+/// `{"tang":[…]}` — the inner `pins` object of the Tang group.
+#[derive(serde::Serialize)]
+struct TangPins<'a> {
+    tang: &'a [TangAdv<'a>],
+}
+
+/// `{"t":N,"pins":{"tang":[…]}}` — the legacy flat policy, and also the inner
+/// group of the nested policy.
+#[derive(serde::Serialize)]
+struct TangGroup<'a> {
+    t: u8,
+    pins: TangPins<'a>,
+}
+
+/// `{"tpm2":{…},"sss":[{…}]}` — outer pins of the nested AND policy.
+///
+/// `sss` is a one-element array so the whole Tang group counts as exactly one
+/// outer share.
+#[derive(serde::Serialize)]
+struct NestedPins<'a> {
+    tpm2: Tpm2Peer<'a>,
+    sss: [TangGroup<'a>; 1],
+}
+
+/// `{"t":2,"pins":{"tpm2":{…},"sss":[…]}}` — tpm2 AND Tang.
+#[derive(serde::Serialize)]
+struct NestedPolicy<'a> {
+    t: u8,
+    pins: NestedPins<'a>,
+}
 
 pub struct SystemConfigurator<'a> {
     runner: &'a mut dyn CommandExecutor,
@@ -1022,6 +1073,74 @@ impl<'a> SystemConfigurator<'a> {
         Ok(())
     }
 
+    /// Build the clevis SSS policy JSON.
+    ///
+    /// **Pure** — no I/O, no `self`. The Tang advertisements must already have
+    /// been pre-fetched by the caller; this function only consumes the resulting
+    /// `(url, adv_path)` pairs. Keeping it pure is what makes the policy shape
+    /// exhaustively unit-testable, which matters because a wrong shape here
+    /// silently produces a *weaker* binding that still installs and still boots.
+    ///
+    /// Two shapes are emitted:
+    ///
+    /// * `tpm2 == None` — **legacy flat, Tang-only**:
+    ///   `{"t":N,"pins":{"tang":[…]}}`. This is byte-for-byte what
+    ///   len-serv-001/002 were bound with in production; it must never drift.
+    ///
+    /// * `tpm2 == Some(_)` — **nested AND**:
+    ///   `{"t":2,"pins":{"tpm2":{…},"sss":[{"t":N,"pins":{"tang":[…]}}]}}`.
+    ///
+    /// The nesting is the whole point. In clevis SSS an *array* pin contributes
+    /// one share **per element**, so the old flat
+    /// `{"t":2,"pins":{"tang":[a,b,c],"tpm2":{…}}}` was really 2-of-**4** and the
+    /// three Tang servers alone met the threshold — tpm2 was decorative, not
+    /// required. Wrapping the Tang group in an inner `sss` collapses it to a
+    /// single outer share, so the outer `t` = 2 over exactly two shares
+    /// (`tpm2`, inner-`sss`) means both are required: a true AND.
+    ///
+    /// The outer threshold is hardcoded to 2 for that reason — it is not a
+    /// tunable, it is "there are two outer shares and both are mandatory".
+    /// The inner threshold stays `tang_threshold`; an outer t=2 does **not**
+    /// degrade it (verified against live Tang: 2-of-3 inner with 2 servers down
+    /// still fails closed).
+    ///
+    /// Availability trade-off, deliberate: under the flat policy a host whose TPM
+    /// failed or whose PCR7 changed (firmware update, Secure Boot key rotation)
+    /// still unlocked from Tang alone. Under the nested policy it will not unlock
+    /// at all. That is the intended semantics, not an oversight.
+    ///
+    /// No validation is performed on `tang` or `tang_threshold` (an empty slice
+    /// emits `"tang":[]`, an over-large threshold is emitted verbatim) — this
+    /// matches the previous behaviour exactly, and callers already guarantee a
+    /// non-empty Tang list before reaching here.
+    fn build_clevis_sss_config(
+        tang: &[TangAdv<'_>],
+        tang_threshold: u8,
+        tpm2: Option<Tpm2Peer<'_>>,
+    ) -> String {
+        let tang_group = TangGroup {
+            t: tang_threshold,
+            pins: TangPins { tang },
+        };
+        // serde_json emits derived structs in field-declaration order (only
+        // `Value`/`Map` sorts keys), so the byte layout below is deterministic
+        // and matches the hand-rolled `format!` it replaced. clevis itself does
+        // not care about key order; the golden tests do.
+        let json = match tpm2 {
+            None => serde_json::to_string(&tang_group),
+            Some(tpm2) => serde_json::to_string(&NestedPolicy {
+                t: 2,
+                pins: NestedPins {
+                    tpm2,
+                    sss: [tang_group],
+                },
+            }),
+        };
+        // Every field is a plain string/integer, so serialization is infallible;
+        // the fallback keeps the signature free of a Result the caller can't act on.
+        json.unwrap_or_default()
+    }
+
     /// Enroll Tang servers via Clevis SSS (t-of-n) on the LUKS partition.
     ///
     /// The clevis binary runs on the *host* (live environment) because the LUKS
@@ -1040,19 +1159,15 @@ impl<'a> SystemConfigurator<'a> {
             include_tpm2_peer,
         );
 
-        // Build the SSS pin JSON for clevis.
-        // PlainLuks: {"t":2,"pins":{"tang":[{"url":...},...]}}
-        // NativeKeystore D2-B: adds a tpm2 PEER share bound to PCR7 in the
-        // SHA-256 bank (clevis defaults to sha1, which Secure Boot doesn't
-        // populate). A lone tpm2 share is 1 < t=2, so it improves availability
-        // (survives 2 Tang down) without weakening the off-LAN threat model.
-        // Pre-fetch each Tang advertisement to a root-only file and reference it
-        // via the clevis `adv` key. WITHOUT a pre-fetched adv, `clevis luks bind`
-        // prompts on /dev/tty to confirm trust of the Tang signing keys, which
-        // fails non-interactively over SSH ("/dev/tty: No such device or
-        // address") and would leave the keystore with NO unattended-unlock
-        // binding. Embedding the adv makes the bind fully non-interactive.
-        let mut tang_entries: Vec<String> = Vec::with_capacity(config.tang_servers.len());
+        // Pre-fetch each Tang advertisement to a root-only file so it can be
+        // referenced via the clevis `adv` key. WITHOUT a pre-fetched adv,
+        // `clevis luks bind` prompts on /dev/tty to confirm trust of the Tang
+        // signing keys, which fails non-interactively over SSH ("/dev/tty: No
+        // such device or address") and would leave the keystore with NO
+        // unattended-unlock binding. Embedding the adv makes the bind fully
+        // non-interactive. This loop is the only I/O here; the JSON assembly
+        // below is a pure, unit-tested function.
+        let mut adv_paths: Vec<String> = Vec::with_capacity(config.tang_servers.len());
         for (i, s) in config.tang_servers.iter().enumerate() {
             let adv_path = format!("/run/uaa-tang-{i}.adv");
             self.log_and_execute(
@@ -1060,19 +1175,28 @@ impl<'a> SystemConfigurator<'a> {
                 &format!("curl -sf --max-time 10 {}/adv -o {}", s.url, adv_path),
             )
             .await?;
-            tang_entries.push(format!(r#"{{"url":"{}","adv":"{}"}}"#, s.url, adv_path));
+            adv_paths.push(adv_path);
         }
-        let tpm2_pin = if include_tpm2_peer {
-            format!(r#","tpm2":{{"pcr_ids":"{}","pcr_bank":"sha256"}}"#, config.tpm2_pcr_ids)
-        } else {
-            String::new()
-        };
-        let sss_config = format!(
-            r#"{{"t":{},"pins":{{"tang":[{}]{}}}}}"#,
-            config.tang_threshold,
-            tang_entries.join(","),
-            tpm2_pin,
-        );
+        let tang: Vec<TangAdv<'_>> = config
+            .tang_servers
+            .iter()
+            .zip(adv_paths.iter())
+            .map(|(s, adv)| TangAdv {
+                url: s.url.as_str(),
+                adv: adv.as_str(),
+            })
+            .collect();
+
+        // PlainLuks: Tang-only, flat — {"t":N,"pins":{"tang":[…]}}.
+        // NativeKeystore D2-B: nested AND — the tpm2 PEER share (PCR7 in the
+        // SHA-256 bank; clevis defaults to sha1, which Secure Boot doesn't
+        // populate) plus a one-share inner sss holding the Tang group, so BOTH
+        // are required. See build_clevis_sss_config for why the nesting matters.
+        let tpm2 = include_tpm2_peer.then_some(Tpm2Peer {
+            pcr_ids: config.tpm2_pcr_ids.as_str(),
+            pcr_bank: "sha256",
+        });
+        let sss_config = Self::build_clevis_sss_config(&tang, config.tang_threshold, tpm2);
 
         // Write the LUKS passphrase to a root-only tempfile so it never appears
         // in the clevis bind command line (visible in /proc/<pid>/cmdline) or in
@@ -1794,6 +1918,192 @@ mod tests {
         assert!(s.contains("Suites: plucky"));
         assert!(s.contains("Suites: plucky-security"));
         assert!(s.contains("Components: main restricted universe multiverse"));
+    }
+
+    // ---- clevis SSS policy emitter -------------------------------------
+
+    fn tang(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("http://172.16.2.4{i}"),
+                    format!("/run/uaa-tang-{i}.adv"),
+                )
+            })
+            .collect()
+    }
+
+    fn advs(pairs: &[(String, String)]) -> Vec<TangAdv<'_>> {
+        pairs
+            .iter()
+            .map(|(url, adv)| TangAdv {
+                url: url.as_str(),
+                adv: adv.as_str(),
+            })
+            .collect()
+    }
+
+    /// The **pre-fix** string builder, preserved verbatim as a test oracle.
+    ///
+    /// This is the exact `format!` that bound len-serv-001/002 in production.
+    /// It is deliberately duplicated here rather than shared: the point is that
+    /// it can never be refactored in lockstep with the real emitter.
+    fn legacy_flat_oracle(pairs: &[(String, String)], threshold: u8) -> String {
+        let entries: Vec<String> = pairs
+            .iter()
+            .map(|(url, adv)| format!(r#"{{"url":"{}","adv":"{}"}}"#, url, adv))
+            .collect();
+        format!(
+            r#"{{"t":{},"pins":{{"tang":[{}]}}}}"#,
+            threshold,
+            entries.join(","),
+        )
+    }
+
+    /// Byte-identity proof against the original code, swept over server counts
+    /// and thresholds. len-serv-001/002 are bound with this exact string.
+    #[test]
+    fn test_sss_tang_only_is_byte_identical_to_legacy_builder() {
+        for n in 1..=4usize {
+            for threshold in 1..=3u8 {
+                let pairs = tang(n);
+                let got =
+                    SystemConfigurator::build_clevis_sss_config(&advs(&pairs), threshold, None);
+                assert_eq!(
+                    got,
+                    legacy_flat_oracle(&pairs, threshold),
+                    "drift for n={n} t={threshold}"
+                );
+            }
+        }
+    }
+
+    /// Hardcoded golden, so refactoring emitter *and* oracle together still fails.
+    #[test]
+    fn test_sss_tang_only_golden_literal() {
+        let pairs = tang(3);
+        let got = SystemConfigurator::build_clevis_sss_config(&advs(&pairs), 2, None);
+        assert_eq!(
+            got,
+            r#"{"t":2,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"},{"url":"http://172.16.2.41","adv":"/run/uaa-tang-1.adv"},{"url":"http://172.16.2.42","adv":"/run/uaa-tang-2.adv"}]}}"#
+        );
+    }
+
+    /// Single-Tang edge case: still a flat one-element array, no trailing comma.
+    #[test]
+    fn test_sss_tang_only_single_server() {
+        let pairs = tang(1);
+        let got = SystemConfigurator::build_clevis_sss_config(&advs(&pairs), 1, None);
+        assert_eq!(
+            got,
+            r#"{"t":1,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
+        );
+    }
+
+    /// Empty Tang list is emitted verbatim (`"tang":[]`), matching the previous
+    /// behaviour — validation is the caller's job, not the emitter's.
+    #[test]
+    fn test_sss_tang_only_empty_matches_legacy() {
+        let got = SystemConfigurator::build_clevis_sss_config(&[], 2, None);
+        assert_eq!(got, r#"{"t":2,"pins":{"tang":[]}}"#);
+        assert_eq!(got, legacy_flat_oracle(&[], 2));
+    }
+
+    /// Nested AND: outer t=2 over exactly two shares (tpm2, inner sss).
+    #[test]
+    fn test_sss_nested_and_with_tpm2_golden() {
+        let pairs = tang(3);
+        let got = SystemConfigurator::build_clevis_sss_config(
+            &advs(&pairs),
+            2,
+            Some(Tpm2Peer {
+                pcr_ids: "7",
+                pcr_bank: "sha256",
+            }),
+        );
+        assert_eq!(
+            got,
+            r#"{"t":2,"pins":{"tpm2":{"pcr_ids":"7","pcr_bank":"sha256"},"sss":[{"t":2,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"},{"url":"http://172.16.2.41","adv":"/run/uaa-tang-1.adv"},{"url":"http://172.16.2.42","adv":"/run/uaa-tang-2.adv"}]}}]}}"#
+        );
+    }
+
+    /// The Tang array must live *inside* the nested group, never as an outer
+    /// sibling of tpm2 — an outer `"tang":[a,b,c]` is the 2-of-4 bug.
+    #[test]
+    fn test_sss_nested_and_never_emits_tang_as_outer_pin() {
+        let pairs = tang(3);
+        let got = SystemConfigurator::build_clevis_sss_config(
+            &advs(&pairs),
+            2,
+            Some(Tpm2Peer {
+                pcr_ids: "7",
+                pcr_bank: "sha256",
+            }),
+        );
+        assert!(!got.starts_with(r#"{"t":2,"pins":{"tang":"#));
+        assert!(got.contains(r#""sss":[{"t":2,"pins":{"tang":"#));
+        // Exactly two outer shares.
+        assert_eq!(got.matches(r#""pins":{"#).count(), 2);
+    }
+
+    /// The outer threshold is fixed at 2 (AND); only the inner one varies.
+    #[test]
+    fn test_sss_nested_inner_threshold_varies_outer_stays_two() {
+        let pairs = tang(3);
+        for inner in 1..=3u8 {
+            let got = SystemConfigurator::build_clevis_sss_config(
+                &advs(&pairs),
+                inner,
+                Some(Tpm2Peer {
+                    pcr_ids: "7",
+                    pcr_bank: "sha256",
+                }),
+            );
+            assert!(
+                got.starts_with(r#"{"t":2,"pins":{"tpm2":"#),
+                "outer t for {inner}"
+            );
+            assert!(
+                got.contains(&format!(r#""sss":[{{"t":{inner},"#)),
+                "inner t for {inner}"
+            );
+        }
+    }
+
+    /// Multi-PCR / non-default bank flow through unmodified.
+    #[test]
+    fn test_sss_nested_multi_pcr_ids() {
+        let pairs = tang(1);
+        let got = SystemConfigurator::build_clevis_sss_config(
+            &advs(&pairs),
+            1,
+            Some(Tpm2Peer {
+                pcr_ids: "0,7",
+                pcr_bank: "sha384",
+            }),
+        );
+        assert_eq!(
+            got,
+            r#"{"t":2,"pins":{"tpm2":{"pcr_ids":"0,7","pcr_bank":"sha384"},"sss":[{"t":1,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}]}}"#
+        );
+    }
+
+    /// Whatever the shape, the result must be valid JSON clevis can parse.
+    #[test]
+    fn test_sss_output_is_valid_json_both_shapes() {
+        let pairs = tang(3);
+        for tpm2 in [
+            None,
+            Some(Tpm2Peer {
+                pcr_ids: "7",
+                pcr_bank: "sha256",
+            }),
+        ] {
+            let got = SystemConfigurator::build_clevis_sss_config(&advs(&pairs), 2, tpm2);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&got).expect("emitted policy must be valid JSON");
+            assert_eq!(parsed["t"], 2);
+        }
     }
 
     #[test]
