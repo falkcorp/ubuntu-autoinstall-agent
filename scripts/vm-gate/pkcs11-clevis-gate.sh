@@ -226,7 +226,7 @@ assert_cmd() {
 # =========================================================================
 stage_echo 0 preflight
 for tool in cryptsetup losetup clevis clevis-encrypt-sss jose curl \
-            softhsm2-util pkcs11-tool swtpm tpm2_pcrread \
+            softhsm2-util pkcs11-tool swtpm tpm2_pcrread jq \
             systemd-socket-activate shred; do
   command -v "$tool" >/dev/null || \
     fail_stage 0 "required tool '$tool' not found — install it; this gate has no skip state"
@@ -301,21 +301,40 @@ tang_kill() {
 # swtpm over TCP: tpm2-tools reaches it via TPM2TOOLS_TCTI, which
 # clevis-encrypt-tpm2 / clevis-decrypt-tpm2 inherit because they shell out to
 # tpm2_* as child processes.
-swtpm socket --tpm2 \
-  --tpmstate "dir=${WORKDIR}/swtpm" \
-  --server "type=tcp,port=${SWTPM_PORT},bindaddr=127.0.0.1" \
-  --ctrl "type=tcp,port=$((SWTPM_PORT + 1)),bindaddr=127.0.0.1" \
-  --flags not-need-init,startup-clear \
-  >>"${LOGDIR}/01-swtpm.log" 2>&1 &
-SWTPM_PID=$!
+#
+# --tpmstate persists across a restart, so the seed (and therefore the SRK the
+# tpm2 pin sealed to) survives tpm_down/tpm_up. That is what lets the harness
+# simulate "the TPM is absent" without invalidating the binding.
 export TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=${SWTPM_PORT}"
-tpm2_ok=0
-for i in $(seq 1 30); do
-  if tpm2_pcrread sha256:7 >>"${LOGDIR}/01-swtpm.log" 2>&1; then tpm2_ok=1; break; fi
-  sleep 0.5
-done
-[ "$tpm2_ok" = "1" ] || fail_stage 1 \
-  "swtpm not reachable via TPM2TOOLS_TCTI='${TPM2TOOLS_TCTI}'. Slot A cannot be asserted on this host — run the gate inside the QEMU VM (scripts/vm-validate.sh already attaches a swtpm tpm-tis device) instead. This is a FAIL, not a skip."
+start_swtpm() {
+  swtpm socket --tpm2 \
+    --tpmstate "dir=${WORKDIR}/swtpm" \
+    --server "type=tcp,port=${SWTPM_PORT},bindaddr=127.0.0.1" \
+    --ctrl "type=tcp,port=$((SWTPM_PORT + 1)),bindaddr=127.0.0.1" \
+    --flags not-need-init,startup-clear \
+    >>"${LOGDIR}/01-swtpm.log" 2>&1 &
+  SWTPM_PID=$!
+  local i
+  for i in $(seq 1 30); do
+    if tpm2_pcrread sha256:7 >>"${LOGDIR}/01-swtpm.log" 2>&1; then return 0; fi
+    sleep 0.5
+  done
+  fail_stage 1 "swtpm not reachable via TPM2TOOLS_TCTI='${TPM2TOOLS_TCTI}'. Slot A cannot be asserted on this host — run the gate inside the QEMU VM (scripts/vm-validate.sh already attaches a swtpm tpm-tis device) instead. This is a FAIL, not a skip."
+}
+tpm_down() {
+  if [ -n "$SWTPM_PID" ] && kill -0 "$SWTPM_PID" 2>/dev/null; then
+    kill "$SWTPM_PID" 2>/dev/null || true
+    wait "$SWTPM_PID" 2>/dev/null || true
+  fi
+  SWTPM_PID=""
+  # Prove it is really gone. A "simulated absent" TPM that still answers is
+  # the classic confounded negative control.
+  if tpm2_pcrread sha256:7 >/dev/null 2>&1; then
+    fail_stage 1 "swtpm still answering after kill — the TPM-absent control would be confounded"
+  fi
+}
+tpm_up() { start_swtpm; }
+start_swtpm
 
 # SoftHSM tokens. Three separate tokens, deliberately:
 #   gate1  single keypair  -> Slot B primary URI + positive control
@@ -343,6 +362,73 @@ URI_B="$(uri gate2 01 1)"
 URI_X_WRONG="$(uri gatex 02 2)"   # asks for key 02 on a two-keypair token
 URI_X_RIGHT="$(uri gatex 01 1)"
 URI_NEG="$(uri gateneg 01 1)"
+
+# =========================================================================
+# Generated helper: inspect the ACTUAL SHARE TOPOLOGY of a binding.
+#
+# WHY THIS EXISTS. crates/uaa-core/src/autoinstall/verify.rs:257
+# evaluate_clevis_binding() validates a binding by SUBSTRING only:
+#   clevis_output.contains("sss") && contains("\"t\":2") && every Tang URL present
+# The BROKEN flat config
+#   {"t":2,"pins":{"tang":[a,b,c],"tpm2":{}}}
+# satisfies all three — and so does the CORRECT nested AND. The flat form is
+# 2-of-FOUR shares, so Tang alone opens it with no TPM at all. The existing
+# verifier cannot tell the two apart, so this gate asserts on TOPOLOGY.
+#
+# Modes:
+#   topology  exit 1 if `tang` appears as a DIRECT child of the outer `pins`
+#   substring exit 0 if verify.rs's three substring predicates all pass
+#             (used to DEMONSTRATE that they pass on both configs)
+# =========================================================================
+CHECK_BINDING="${WORKDIR}/check-binding.sh"
+cat >"$CHECK_BINDING" <<'CHECKEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+mode="$1"; dev="$2"; shift 2
+rc=0
+found_any=0
+while IFS= read -r line; do
+  json="${line#*\'}"; json="${json%\'*}"
+  [ -n "$json" ] || continue
+  case "$mode" in
+    topology)
+      found_any=1
+      if printf '%s' "$json" | jq -e '.pins | (type == "object") and has("tang")' >/dev/null 2>&1; then
+        echo "TOPOLOGY VIOLATION: 'tang' is a DIRECT child of the outer pins -> this is a flat N-of-many policy, Tang alone can open it: ${json}"
+        rc=1
+      else
+        echo "topology OK (no top-level pins.tang): ${json}"
+      fi
+      ;;
+    substring)
+      found_any=1
+      # Reproduce verify.rs:257's predicates verbatim. NOTE: it matches against
+      # the WHOLE `clevis luks list` line, not the extracted pin JSON — and the
+      # line begins "1: sss '...'", so the literal pin NAME satisfies
+      # contains("sss") even when the policy has no nested sss at all. Checking
+      # $json here instead of $line would under-report the gap.
+      ok=1
+      case "$line" in *sss*) ;; *) ok=0; echo "no 'sss' substring" ;; esac
+      case "$line" in *'"t":2'*) ;; *) ok=0; echo "no '\"t\":2' substring" ;; esac
+      for url in "$@"; do
+        case "$line" in *"$url"*) ;; *) ok=0; echo "missing url ${url}" ;; esac
+      done
+      if [ "$ok" = "1" ]; then
+        echo "verify.rs substring predicates ALL PASS on: ${line}"
+      else
+        rc=1
+      fi
+      ;;
+    *) echo "unknown mode: $mode" >&2; exit 2 ;;
+  esac
+done < <(clevis luks list -d "$dev" 2>/dev/null)
+if [ "$found_any" = "0" ]; then
+  echo "no clevis bindings found on ${dev} — INDETERMINATE" >&2
+  exit 2
+fi
+exit "$rc"
+CHECKEOF
+chmod +x "$CHECK_BINDING"
 
 # The PIN file clevis-decrypt-pkcs11 reads. Created by us, removed on exit.
 write_pin_file() {
@@ -382,6 +468,12 @@ TANG_JSON="$(tang_json)"
 # alone satisfies it — measured, not assumed.
 SLOT_A_JSON="{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"},\"sss\":[{\"t\":2,\"pins\":{\"tang\":[${TANG_JSON}]}}]}}"
 SLOT_B_JSON="{\"t\":1,\"pins\":{\"pkcs11\":[{\"uri\":\"${URI_A}\"},{\"uri\":\"${URI_B}\"}]}}"
+
+# The BROKEN flat form, bound deliberately as a WITNESS. It is 2-of-FOUR
+# shares (three tang + one tpm2), so any two Tang alone satisfy it. It exists
+# only so the harness can prove its own TPM-absent simulation is meaningful
+# and that the topology check has teeth.
+FLAT_A_JSON="{\"t\":2,\"pins\":{\"tang\":[${TANG_JSON}],\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"}}}"
 
 # --- LUKS container factory ---------------------------------------------
 KEYFILE="${WORKDIR}/luks.key"
@@ -490,14 +582,55 @@ EOF
     clevis luks unlock -d "$DEV" -n gate-neg02 || NEG_BASELINE_FAILS=1
   close_mapping gate-neg02
 
+  # ---- TOPOLOGY: flat-vs-nested. The measured gap in verify.rs:257. -----
+  #
+  # Bind BOTH forms, then take the TPM away with all three Tang up.
+  #   pos-09 (witness) the FLAT config still unlocks -> proves it really is
+  #          2-of-4 and that "TPM absent" is not simply breaking everything.
+  #   neg-04           the NESTED config must NOT unlock -> the real assertion.
+  # Without pos-09, neg-04 could go red merely because the harness broke the
+  # TPM path for both, which would prove nothing about the topology.
+  new_container flatA; DEV_FLAT="$NEW_DEV"
+  bind_pin "$DEV_FLAT" sss "$FLAT_A_JSON" >>"${LOGDIR}/02-neg.log" 2>&1 \
+    || fail_stage 2 "witness setup: flat-config bind failed (INDETERMINATE, not a red)"
+  new_container neg03; DEV_A_QUORUM="$NEW_DEV"
+  bind_pin "$DEV_A_QUORUM" sss "$SLOT_A_JSON" >>"${LOGDIR}/02-neg.log" 2>&1 \
+    || fail_stage 2 "neg-03/neg-04 setup: Slot A bind failed with all Tang up (INDETERMINATE, not a red)"
+
+  # Static topology checks first — cheap, and they must disagree about the
+  # two bindings or the check has no teeth.
+  assert_cmd pos-10 nested-topology-no-toplevel-tang OK \
+    "$CHECK_BINDING" topology "$DEV_A_QUORUM" || NEG_BASELINE_FAILS=1
+  assert_cmd neg-05 flat-topology-violation-detected FAIL \
+    "$CHECK_BINDING" topology "$DEV_FLAT" || NEG_BASELINE_FAILS=1
+
+  # And the demonstration that the EXISTING verifier cannot separate them:
+  # verify.rs:257's three substring predicates pass on the flat config too.
+  assert_cmd pos-11 substrings-pass-on-BROKEN-flat OK \
+    "$CHECK_BINDING" substring "$DEV_FLAT" \
+      "http://127.0.0.1:${TANG_PORTS[0]}" \
+      "http://127.0.0.1:${TANG_PORTS[1]}" \
+      "http://127.0.0.1:${TANG_PORTS[2]}" || NEG_BASELINE_FAILS=1
+
+  # Now the behavioural half: TPM absent, all Tang up.
+  tpm_down
+  track_mapping gate-flat
+  assert_cmd pos-09 flat-tang-alone-unlocks-WITNESS OK \
+    clevis luks unlock -d "$DEV_FLAT" -n gate-flat || NEG_BASELINE_FAILS=1
+  close_mapping gate-flat
+
+  track_mapping gate-neg04
+  assert_cmd neg-04 nested-slotA-tang-alone-fails FAIL \
+    clevis luks unlock -d "$DEV_A_QUORUM" -n gate-neg04 || NEG_BASELINE_FAILS=1
+  close_mapping gate-neg04
+  tpm_up
+
   # neg-03: Slot A with the INNER Tang quorum unmet. Bind with all three Tang
   # up, then kill two. The inner sss is t=2 of 3, so it can no longer be
   # satisfied; the outer t=2 therefore has only the tpm2 share (1 < 2) and
   # unlock must fail. This is simultaneously the "FAILS with 2 of 3 down"
   # assertion from the design.
-  new_container neg03; DEV_A_QUORUM="$NEW_DEV"; track_mapping gate-neg03
-  bind_pin "$DEV_A_QUORUM" sss "$SLOT_A_JSON" >>"${LOGDIR}/02-neg.log" 2>&1 \
-    || fail_stage 2 "neg-03 setup: Slot A bind failed with all Tang up (INDETERMINATE, not a red)"
+  track_mapping gate-neg03
   tang_kill 1
   tang_kill 2
   assert_cmd neg-03 slotA-tang-quorum-unmet-fails FAIL \

@@ -30,6 +30,23 @@ Slot A is **nested on purpose**. A flat
 alone satisfies it — measured, not assumed. True AND across "TPM2" and "a Tang
 quorum" requires the inner `sss`. The gate asserts both halves of that claim.
 
+### Why the gate checks topology, not substrings
+
+`evaluate_clevis_binding` (`crates/uaa-core/src/autoinstall/verify.rs:257`)
+validates a binding by substring: `contains("sss")`, `contains("\"t\":2")`, and
+every Tang URL present. **The broken flat config satisfies all three, and so
+does the correct nested one** — the existing verifier cannot distinguish them.
+It is worse than it looks: the check runs against the whole `clevis luks list`
+line, which begins `1: sss '…'`, so the literal *pin name* satisfies
+`contains("sss")` even for a policy with no nested `sss` at all.
+
+So this gate asserts on the **actual share topology** — it parses the pin JSON
+and rejects any binding where `tang` is a direct child of the outer `pins`
+object — and pairs that with a behavioural control: with the TPM absent and all
+Tang up, the nested policy must **fail** to unlock while the flat one still
+opens. `todo.d/2026-08-02-clevis-binding-topology-verifier.md` tracks porting
+the predicate back into `verify.rs`.
+
 ## The three tiers
 
 | Tier | What it proves | Script | Needs a boot? |
@@ -59,7 +76,7 @@ preflight.
 
 ```bash
 apt install -y softhsm2 opensc cryptsetup-bin clevis clevis-luks \
-                clevis-tpm2 clevis-pin-tpm2 tpm2-tools tang jose curl \
+                clevis-tpm2 clevis-pin-tpm2 tpm2-tools tang jose curl jq \
                 swtpm swtpm-tools dracut-core
 ```
 
@@ -143,6 +160,11 @@ assertion — a green result below a broken red path is worthless.
 | `neg-01` | Unlock with the **wrong PIN** | **FAIL** |
 | `neg-02` | Unlock with the **token absent** (empty token store) | **FAIL** |
 | `neg-03` | Slot A with **2 of 3 Tang down** — inner quorum unmet | **FAIL** |
+| `pos-10` | Nested Slot A: no `tang` as a direct child of outer `pins` | **OK** |
+| `neg-05` | Same topology check against the **flat** config | **FAIL** — proves the check has teeth |
+| `pos-11` | `verify.rs`'s substring predicates run against the **broken flat** binding | **OK** — i.e. they *pass*, demonstrating the gap |
+| `pos-09` | **Witness**: flat config unlocks with **TPM absent**, all Tang up | **OK** — proves it really is 2-of-4, and that "TPM absent" is not simply breaking everything |
+| `neg-04` | **Nested Slot A with TPM absent, all Tang up** | **FAIL** — Tang alone must never open Slot A |
 | `pos-01` | Slot A, all Tang up | **OK** |
 | `pos-02` | Slot A, **1 of 3 Tang down** | **OK** |
 | `pos-03` | Slot B, **ALL Tang down** | **OK** — this is the entire point of Slot B |
@@ -222,23 +244,27 @@ Read this before treating a green run as permission to reboot hardware.
    load; a real YubiKey is reached through pcscd. Green here does not mean a
    real token works. `verify-initramfs.sh` checks the pcsc pieces are *in the
    image*, which is the most this tier can do.
-3. **swtpm PCR7 values do not match real hardware.** The gate validates that
+3. **`neg-04` proves the policy, not the hardware.** The TPM is removed by
+   killing the local `swtpm`; a real machine loses its TPM differently (PCR
+   mismatch, not an absent device). The share arithmetic is what is under
+   test.
+4. **swtpm PCR7 values do not match real hardware.** The gate validates that
    the tpm2 share participates in the policy with the right threshold
    arithmetic. It says nothing about whether the PCR7 measurement on a real
    Secure Boot machine will match at boot.
-4. **A userspace `clevis luks unlock` does not exercise the boot-time askpass
+5. **A userspace `clevis luks unlock` does not exercise the boot-time askpass
    path.** `clevis-luks-pkcs11-askpass.socket` writing
    `/run/systemd/clevis-pkcs11.pin` only happens in the initramfs. A green
    tier 1 tells you the *policy* is right and says nothing about whether the
    machine will actually boot. **This is the entire justification for
    `verify-initramfs.sh` existing** — and even that checks contents, not that
    the socket unit is enabled.
-5. **The `lsinitrd -m` dracut-module path is not yet exercised.** The
+6. **The `lsinitrd -m` dracut-module path is not yet exercised.** The
    `50clevis-pin-pkcs11` check resolves through `lsinitrd -m` on a real dracut
    image; the synthetic smoke test exercised only the `cpio-fallback` lister.
    Treat that one requirement as unvalidated until the verifier has been run
    against a real dracut-built initramfs.
-6. **Local Tang is not fleet Tang.** The harness runs three `tangd` on
+7. **Local Tang is not fleet Tang.** The harness runs three `tangd` on
    `127.0.0.1`. It never contacts `172.16.x.x` and will hard-fail if asked
    to. Real Tang quorum health is a separate pre-flight.
 

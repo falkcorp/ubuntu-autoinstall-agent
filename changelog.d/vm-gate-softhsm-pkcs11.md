@@ -1,5 +1,5 @@
 <!-- file: changelog.d/vm-gate-softhsm-pkcs11.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 3f938e81-029d-4282-be59-5b208d3615b2 -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -46,3 +46,24 @@ what the gate cannot prove: SoftHSM is not a YubiKey, swtpm PCR7 is not real
 hardware PCR7, and a userspace `clevis luks unlock` does not exercise the
 boot-time askpass path — the gate validates logic and initramfs contents, not
 hardware-specific values.
+
+#### Gate asserts clevis share TOPOLOGY, closing a measured hole in `evaluate_clevis_binding`
+
+`crates/uaa-core/src/autoinstall/verify.rs:257` validates a clevis binding by
+substring — `contains("sss")`, `contains("\"t\":2")`, and every Tang URL
+present. The **broken flat** policy `{"t":2,"pins":{"tang":[a,b,c],"tpm2":{}}}`
+satisfies all three, and so does the **correct nested** AND, so the verifier
+cannot tell them apart; the flat form is 2-of-**four** shares and Tang alone
+opens it with no TPM. The `contains("sss")` check is additionally satisfied by
+the literal pin name in the `1: sss '…'` line prefix, independent of nesting.
+
+The gate now parses the pin JSON and rejects any binding where `tang` is a
+direct child of the outer `pins` object (`pos-10` green on nested, `neg-05` red
+on flat, so the check demonstrably has teeth), and records the gap explicitly
+(`pos-11`: the substring predicates *pass* on the broken flat binding). It is
+paired with a behavioural control run with the TPM absent and all Tang up:
+`pos-09` witnesses that the flat config still unlocks — proving the simulation
+is not simply breaking everything — while `neg-04` requires the nested Slot A to
+**fail**. Porting the topology predicate back into `verify.rs` is tracked in
+`todo.d/2026-08-02-clevis-binding-topology-verifier.md`; this change touches no
+Rust.
