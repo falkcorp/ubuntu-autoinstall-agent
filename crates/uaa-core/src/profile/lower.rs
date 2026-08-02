@@ -109,6 +109,11 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
         tpm2_pin,
         tpm2_pcr_ids,
         expect_fido2,
+        // Not yet authorable through the profile system — the clevis pkcs11 pin
+        // is opt-in per host via the raw InstallationConfig YAML while its
+        // openssl-provider-legacy risk is unresolved. Lowering it as `false`
+        // keeps every profile-derived host on today's package selection.
+        clevis_pkcs11_pin: false,
         install_ca_cert: resolved
             .install_ca_cert
             .clone()

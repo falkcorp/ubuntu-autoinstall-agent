@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.29.0
+// version: 2.30.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-08-02
 
@@ -12,6 +12,7 @@
 use super::config::{
     Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount,
 };
+use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix};
 use super::partitions::partition_path;
 use super::unlock_sss::{SssPolicy, UnlockPin};
 use crate::network::CommandExecutor;
@@ -562,9 +563,15 @@ impl<'a> SystemConfigurator<'a> {
         // gating on the roster alone installed no clevis at all, ran no
         // `clevis luks bind`, and still reported a successful install — leaving
         // a machine that boots to a LUKS prompt nobody can satisfy.
+        //
+        // `clevis_pkcs11_pin` also implies clevis: the pkcs11 pin IS a clevis
+        // pin. Without this term a PlainLuks host with no Tang servers would
+        // pin the 26.10 pocket and install opensc/pcscd but no clevis at all -
+        // a silent success with no unlock factor.
         let needs_clevis = !config.tang_servers.is_empty()
             || config.storage_mode == StorageMode::NativeKeystore
-            || config.unlock_sss.is_some();
+            || config.unlock_sss.is_some()
+            || config.clevis_pkcs11_pin;
         let clevis_pkgs = if needs_clevis {
             let base = match config.initramfs_type {
                 InitramfsType::Dracut => " clevis clevis-luks clevis-dracut clevis-systemd",
@@ -611,11 +618,27 @@ impl<'a> SystemConfigurator<'a> {
             String::new()
         };
 
-        let chroot_commands = vec![
+        // OPT-IN, OFF BY DEFAULT: the clevis pkcs11 pin (YubiKey PIV) needs
+        // clevis 23, which 26.04 does not ship. When enabled, the narrowly
+        // pinned 26.10 pocket is written into the target BEFORE `apt update`
+        // (ordering is load-bearing — after it, the pocket is unindexed and the
+        // chroot silently resolves clevis 20 with no pkcs11 pin, producing a
+        // keyslot that never unlocks). `opensc`/`pcscd` come from plain 26.04
+        // universe; `clevis` only Recommends opensc and nothing pulls pcscd.
+        let pkcs11_apt_setup: Vec<String> = if config.clevis_pkcs11_pin {
+            clevis23_apt_config_commands("")
+        } else {
+            Vec::new()
+        };
+        let pkcs11_pkgs = target_pkcs11_package_suffix(config.clevis_pkcs11_pin);
+
+        let chroot_commands: Vec<String> = pkcs11_apt_setup
+            .into_iter()
+            .chain([
             "apt update".to_string(),
             format!(
-                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}",
-                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra
+                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}{}",
+                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra, pkcs11_pkgs
             ),
             "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-generic".to_string(),
             // `sudo` is load-bearing for provisioned operator accounts (they get
@@ -626,7 +649,8 @@ impl<'a> SystemConfigurator<'a> {
             "addgroup --system lpadmin || true".to_string(),
             "addgroup --system lxd || true".to_string(),
             "addgroup --system sambashare || true".to_string(),
-        ];
+            ])
+            .collect();
 
         for cmd in chroot_commands {
             let desc = format!("Chroot: {}", cmd);
@@ -2807,6 +2831,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
@@ -2818,6 +2843,80 @@ mod tests {
             hooks: Default::default(),
             unlock_sss: None,
         }
+    }
+
+    /// The chroot apt line as it stood before clevis-23 support existed, for
+    /// `sample_netplan_config` (Dracut, PlainLuks, no Tang, TPM2+FIDO2 on).
+    /// This is the line that actually installs len-serv-001/002 — the
+    /// `build_next_commands_after_storage` list in installer.rs is only the
+    /// pause-after-storage manual transcript.
+    const BASELINE_CHROOT_APT_LINE: &str = "chroot /mnt/targetos bash -lc \'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools tpm2-tools tpm-udev systemd-cryptsetup libfido2-1\'";
+
+    async fn chroot_commands_for(cfg: &InstallationConfig) -> Vec<String> {
+        let mut executor = RecordingExecutor::default();
+        {
+            let mut sysconf = SystemConfigurator::new(&mut executor);
+            sysconf.configure_system_in_chroot(cfg).await.unwrap();
+        }
+        executor.recorded()
+    }
+
+    #[tokio::test]
+    async fn clevis_pkcs11_pin_off_leaves_the_real_apt_line_untouched() {
+        let cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        assert!(!cfg.clevis_pkcs11_pin, "default MUST be off");
+        let recorded = chroot_commands_for(&cfg).await;
+
+        let apt: Vec<&String> = recorded
+            .iter()
+            .filter(|c| c.contains("apt install -y grub-efi-amd64"))
+            .collect();
+        assert_eq!(apt.len(), 1, "one base apt line: {recorded:#?}");
+        // Byte equality, not contains() — this is the byte-identity guarantee
+        // for the hosts already in service.
+        assert_eq!(apt[0], BASELINE_CHROOT_APT_LINE);
+
+        // And the apt plumbing must be absent from the stream entirely.
+        for c in &recorded {
+            assert!(!c.contains("uaa-clevis23.sources"), "{c}");
+            assert!(!c.contains("99-uaa-clevis23-pkcs11"), "{c}");
+            assert!(!c.contains("opensc"), "{c}");
+            assert!(!c.contains("pcscd"), "{c}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clevis_pkcs11_pin_on_pins_the_pocket_before_apt_update() {
+        let mut cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        cfg.clevis_pkcs11_pin = true;
+        let recorded = chroot_commands_for(&cfg).await;
+
+        let sources = recorded
+            .iter()
+            .position(|c| c.contains("uaa-clevis23.sources"))
+            .expect("sources file must be written");
+        let prefs = recorded
+            .iter()
+            .position(|c| c.contains("99-uaa-clevis23-pkcs11"))
+            .expect("preferences file must be written");
+        let update = recorded
+            .iter()
+            .position(|c| c.contains("bash -lc \'apt update\'"))
+            .expect("apt update");
+        assert!(
+            sources < update && prefs < update,
+            "plumbing must precede apt update or the pocket is never indexed: {recorded:#?}"
+        );
+
+        let apt = recorded
+            .iter()
+            .find(|c| c.contains("apt install -y grub-efi-amd64"))
+            .expect("base apt line");
+        assert!(apt.ends_with("opensc pcscd\'"), "{apt}");
+        // The pkcs11 pin IS a clevis pin: a Tang-less PlainLuks host must still
+        // get clevis, or the flag installs a token stack with nothing to use it.
+        assert!(apt.contains(" clevis clevis-luks clevis-dracut clevis-systemd"), "{apt}");
+        assert_ne!(apt.as_str(), BASELINE_CHROOT_APT_LINE);
     }
 
     #[test]

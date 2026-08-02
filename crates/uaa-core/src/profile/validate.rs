@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
 // last-edited: 2026-08-02
 
@@ -627,6 +627,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
