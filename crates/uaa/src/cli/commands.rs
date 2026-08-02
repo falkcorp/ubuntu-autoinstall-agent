@@ -1,7 +1,7 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.15.0
+// version: 2.15.1
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Command implementations for the CLI
 
@@ -880,6 +880,7 @@ fn create_local_installation_config(
         tpm2_pin: None,
         tpm2_pcr_ids: "7".to_string(),
         expect_fido2: true,
+        clevis_pkcs11_pin: false,
         // No place-time delivery on this interactive path (it runs live, off the
         // netboot server) — leave the fail-closed placeholder; `uaa enroll` will
         // refuse to trust it until the CA is delivered by hand.

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.15.1
+// version: 2.16.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -13,7 +13,7 @@ use super::config::{InstallationConfig, StorageMode, SystemInfo};
 use super::disk_native::DiskNativeManager;
 use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
-use super::packages::PackageManager;
+use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix, PackageManager};
 use super::partitions::partition_path;
 use super::reset_partition::ResetPartitionStager;
 use super::system_setup::SystemConfigurator;
@@ -297,7 +297,7 @@ impl SshInstaller {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", self.phase_1_package_installation());
+            run_phase!("Phase 1: Package installation", self.phase_1_package_installation(config));
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
@@ -407,7 +407,7 @@ impl SshInstaller {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation());
+            run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation(config));
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
@@ -870,10 +870,13 @@ impl SshInstaller {
         Ok(())
     }
 
-    async fn phase_1_package_installation(&mut self) -> Result<()> {
+    async fn phase_1_package_installation(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Phase 1: Package installation");
         let mut pm = PackageManager::new(&mut *self.runner);
-        pm.install_required_packages().await?;
+        // `clevis luks bind … pkcs11` runs on the LIVE host, so the clevis-23
+        // pocket has to be pinned here too, not only in the target chroot.
+        pm.install_required_packages(config.clevis_pkcs11_pin)
+            .await?;
         info!("Phase 1 completed");
         Ok(())
     }
@@ -982,7 +985,7 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
     let esp_part = partition_path(&config.disk_device, 1);
     let p4 = partition_path(&config.disk_device, 4);
     let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
-    vec![
+    let mut cmds = vec![
         "mkdir -p /mnt/targetos/boot/efi".to_string(),
         format!("mount {} /mnt/targetos/boot/efi", esp_part),
         format!(
@@ -1012,12 +1015,22 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         "echo 'nameserver 1.1.1.1' > /mnt/targetos/etc/resolv.conf".to_string(),
         format!("bash -lc 'ESP_UUID=$(blkid -s UUID -o value {e} 2>/dev/null || true); if [ -n \"$ESP_UUID\" ]; then echo \"UUID=$ESP_UUID /boot/efi vfat umask=0077 0 1\" >> /mnt/targetos/etc/fstab; fi'", e=esp_part),
         "chroot /mnt/targetos bash -lc '[ -d /sys/firmware/efi/efivars ] || mkdir -p /sys/firmware/efi/efivars; mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true'".to_string(),
+    ];
+
+    // OPT-IN, OFF BY DEFAULT. Lay the pinned 26.10 pocket into the target
+    // BEFORE `apt update`, otherwise the pocket is never indexed and the
+    // chroot silently resolves clevis 20 (no pkcs11 pin).
+    if config.clevis_pkcs11_pin {
+        cmds.extend(clevis23_apt_config_commands("/mnt/targetos"));
+    }
+
+    cmds.extend([
         "chroot /mnt/targetos bash -lc 'apt update'".to_string(),
         // Package set matched to the clean 26.04 install on len-serv-003: dracut
         // (never initramfs-tools), zfs-dracut (never zfs-initramfs), base clevis
         // (the tang pin is bundled — no clevis-tang pkg), and systemd-cryptsetup +
         // tpm2/fido2 stacks for the TPM2+PIN and YubiKey keyslots.
-        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1'".to_string(),
+        format!("chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1{}'", target_pkcs11_package_suffix(config.clevis_pkcs11_pin)),
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
         format!("bash -lc 'UUID=$(blkid -s UUID -o value {p4} 2>/dev/null || true); DEV=\"{p4}\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'"),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),
@@ -1026,7 +1039,9 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck'".to_string(),
         "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck --no-nvram' # fallback".to_string(),
         "chroot /mnt/targetos bash -lc 'update-grub'".to_string(),
-    ]
+    ]);
+
+    cmds
 }
 
 #[cfg(test)]
@@ -1058,6 +1073,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
@@ -1078,6 +1094,65 @@ mod tests {
         assert!(cmds.iter().any(|c| c.contains("dracut --regenerate-all")));
         assert!(cmds.iter().any(|c| c.contains("grub-install")));
         assert!(cmds.iter().any(|c| c.contains("update-grub")));
+    }
+
+    /// The exact chroot apt line as it stood before clevis-23 support existed.
+    /// Default-off must reproduce it byte for byte — this is what keeps
+    /// len-serv-001/002 unaffected.
+    const BASELINE_CHROOT_APT_LINE: &str = "chroot /mnt/targetos bash -lc \'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1\'";
+
+    #[test]
+    fn clevis_pkcs11_pin_defaults_off_and_changes_nothing() {
+        let cfg = sample_config();
+        assert!(!cfg.clevis_pkcs11_pin, "default MUST be off");
+        let cmds = build_next_commands_after_storage(&cfg);
+
+        // Byte-identical package selection, not a fuzzy contains().
+        assert!(
+            cmds.iter().any(|c| c == BASELINE_CHROOT_APT_LINE),
+            "chroot apt line drifted from the pre-clevis-23 baseline: {cmds:#?}"
+        );
+        // And the apt plumbing must be ABSENT from the vector entirely, not
+        // present-and-empty.
+        for c in &cmds {
+            assert!(!c.contains("uaa-clevis23.sources"), "{c}");
+            assert!(!c.contains("99-uaa-clevis23-pkcs11"), "{c}");
+            assert!(!c.contains("opensc"), "{c}");
+            assert!(!c.contains("pcscd"), "{c}");
+        }
+    }
+
+    #[test]
+    fn clevis_pkcs11_pin_enabled_adds_pinned_pocket_before_apt_update() {
+        let mut cfg = sample_config();
+        cfg.clevis_pkcs11_pin = true;
+        let cmds = build_next_commands_after_storage(&cfg);
+
+        let prefs = cmds
+            .iter()
+            .position(|c| c.contains("99-uaa-clevis23-pkcs11"))
+            .expect("preferences file must be written");
+        let sources = cmds
+            .iter()
+            .position(|c| c.contains("uaa-clevis23.sources"))
+            .expect("sources file must be written");
+        let update = cmds
+            .iter()
+            .position(|c| c.contains("bash -lc \'apt update\'"))
+            .expect("apt update");
+        assert!(
+            sources < update && prefs < update,
+            "apt plumbing must precede apt update or the pocket is never indexed"
+        );
+        // Written into the TARGET filesystem, not the live host.
+        assert!(cmds[sources].contains("/mnt/targetos/etc/apt/sources.list.d/"));
+
+        assert!(
+            cmds.iter().any(|c| c.contains("libfido2-1 opensc pcscd\'")),
+            "PIV token userspace must be appended to the chroot apt line: {cmds:#?}"
+        );
+        // Only the suffix changed.
+        assert!(!cmds.iter().any(|c| c == BASELINE_CHROOT_APT_LINE));
     }
 
     #[test]

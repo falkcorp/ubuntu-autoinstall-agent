@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.27.0
+// version: 2.28.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -12,6 +12,7 @@
 use super::config::{
     Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount,
 };
+use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix};
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
 use crate::Result;
@@ -519,11 +520,27 @@ impl<'a> SystemConfigurator<'a> {
             String::new()
         };
 
-        let chroot_commands = vec![
+        // OPT-IN, OFF BY DEFAULT: the clevis pkcs11 pin (YubiKey PIV) needs
+        // clevis 23, which 26.04 does not ship. When enabled, the narrowly
+        // pinned 26.10 pocket is written into the target BEFORE `apt update`
+        // (ordering is load-bearing — after it, the pocket is unindexed and the
+        // chroot silently resolves clevis 20 with no pkcs11 pin, producing a
+        // keyslot that never unlocks). `opensc`/`pcscd` come from plain 26.04
+        // universe; `clevis` only Recommends opensc and nothing pulls pcscd.
+        let pkcs11_apt_setup: Vec<String> = if config.clevis_pkcs11_pin {
+            clevis23_apt_config_commands("")
+        } else {
+            Vec::new()
+        };
+        let pkcs11_pkgs = target_pkcs11_package_suffix(config.clevis_pkcs11_pin);
+
+        let chroot_commands: Vec<String> = pkcs11_apt_setup
+            .into_iter()
+            .chain([
             "apt update".to_string(),
             format!(
-                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}",
-                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra
+                "DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed {} {} efibootmgr cryptsetup dosfstools{}{}{}",
+                initramfs_pkg, zfs_pkg, clevis_pkgs, crypt_extra, pkcs11_pkgs
             ),
             "DEBIAN_FRONTEND=noninteractive apt install -y linux-headers-generic".to_string(),
             // `sudo` is load-bearing for provisioned operator accounts (they get
@@ -534,7 +551,8 @@ impl<'a> SystemConfigurator<'a> {
             "addgroup --system lpadmin || true".to_string(),
             "addgroup --system lxd || true".to_string(),
             "addgroup --system sambashare || true".to_string(),
-        ];
+            ])
+            .collect();
 
         for cmd in chroot_commands {
             let desc = format!("Chroot: {}", cmd);
@@ -1841,6 +1859,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),

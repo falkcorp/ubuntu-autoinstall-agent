@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/lower.rs
-// version: 1.0.2
+// version: 1.1.0
 // guid: 74997d1d-8349-4aaf-ac8a-b6ec886492a1
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Pure authoring->flat-wire bridge (PS-LOWER-12).
 //!
@@ -107,6 +107,11 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
         tpm2_pin,
         tpm2_pcr_ids,
         expect_fido2,
+        // Not yet authorable through the profile system — the clevis pkcs11 pin
+        // is opt-in per host via the raw InstallationConfig YAML while its
+        // openssl-provider-legacy risk is unresolved. Lowering it as `false`
+        // keeps every profile-derived host on today's package selection.
+        clevis_pkcs11_pin: false,
         install_ca_cert: resolved
             .install_ca_cert
             .clone()

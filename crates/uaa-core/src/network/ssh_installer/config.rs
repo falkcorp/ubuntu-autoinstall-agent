@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.15.0
+// version: 2.16.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Configuration structures for SSH/local installation
 
@@ -504,6 +504,34 @@ pub struct InstallationConfig {
     /// drives `verify` to check that at least one fido2 keyslot exists.
     #[serde(default = "default_true")]
     pub expect_fido2: bool,
+    /// Opt into the clevis **pkcs11 pin** (YubiKey PIV as a LUKS unlock
+    /// factor). OFF BY DEFAULT, and off is byte-identical to the behaviour
+    /// len-serv-001/002 were installed with — enabling this is a per-host
+    /// decision, never a fleet default.
+    ///
+    /// The pin does not exist in the clevis Ubuntu 26.04 ships (`20-1ubuntu2`,
+    /// resolute/universe: `clevis luks bind … pkcs11` returns
+    /// `'pkcs11' is not a valid pin!`), and clevis is not in
+    /// `resolute-backports`. The first clevis with the pin is `23-1build1` in
+    /// 26.10. So enabling this flag makes the installer add a *narrowly pinned*
+    /// 26.10 pocket — see `packages::clevis23_preferences_content` — on both the
+    /// live host (where `clevis luks bind` runs) and inside the target chroot
+    /// (which needs the `50clevis-pin-pkcs11` dracut module and
+    /// `clevis-luks-pkcs11-askpass.service` to actually unlock at boot), plus
+    /// `opensc`/`pcscd` from plain 26.04 universe for PIV token access.
+    ///
+    /// OPEN RISK: clevis 23 pulls `libssl4`, which pulls the 26.10
+    /// `openssl-provider-legacy`, displacing the 26.04 one the OpenSSL 3.5 stack
+    /// uses. Unresolved — see
+    /// `docs/research/2026-08-02-clevis23-pkcs11-pinning-risk.md` before
+    /// flipping this on any host that matters.
+    ///
+    /// `skip_serializing_if` omits the key entirely when off, for the same
+    /// control-rollback reason as `applications`: a registry-resolved config
+    /// must stay parseable by an older binary (and by the
+    /// `deny_unknown_fields` overrides partial) that predates this field.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clevis_pkcs11_pin: bool,
     /// Install CA public cert (PEM), written to `/etc/uaa/install-ca.crt` on
     /// the target in Phase 5 so `uaa enroll`'s default `--ca` path finds it
     /// (spec Decision 7). NOT a per-host secret — the same cert for every
@@ -660,6 +688,13 @@ fn default_true() -> bool {
     true
 }
 
+/// `skip_serializing_if` predicate for off-by-default bool opt-ins: an unset
+/// flag serializes to nothing at all, so a resolved config stays parseable by
+/// a binary (or a `deny_unknown_fields` partial) that predates the field.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn default_tpm2_pcr_ids() -> String {
     "7".to_string()
 }
@@ -812,6 +847,10 @@ impl InstallationConfig {
             tpm2_pin: None,
             tpm2_pcr_ids: default_tpm2_pcr_ids(),
             expect_fido2: true,
+            // Off. The clevis pkcs11 pin needs a pinned 26.10 pocket with an
+            // unresolved openssl-provider-legacy collision; it is opt-in per
+            // host, never a fallback default.
+            clevis_pkcs11_pin: false,
             install_ca_cert: default_install_ca_cert(),
             applications: Vec::new(),
             cockroach_members: Vec::new(),
@@ -1131,6 +1170,25 @@ network_nameservers: ["10.0.0.1"]
         assert_eq!(cfg.tpm2_pcr_ids, "7");
         assert!(cfg.expect_fido2);
         assert_eq!(cfg.tpm2_pin, None);
+    }
+
+    #[test]
+    fn clevis_pkcs11_pin_is_off_by_default_and_omitted_when_off() {
+        let cfg = InstallationConfig::for_len_serv_003();
+        assert!(
+            !cfg.clevis_pkcs11_pin,
+            "the clevis pkcs11 pin must never default on"
+        );
+        let yaml = serde_yaml::to_string(&cfg).expect("serialize");
+        assert!(
+            !yaml.contains("clevis_pkcs11_pin"),
+            "an off flag must not appear in a resolved config (rollback safety): {yaml}"
+        );
+
+        let mut on = InstallationConfig::for_len_serv_003();
+        on.clevis_pkcs11_pin = true;
+        let yaml_on = serde_yaml::to_string(&on).expect("serialize");
+        assert!(yaml_on.contains("clevis_pkcs11_pin: true"), "{yaml_on}");
     }
 
     #[test]
