@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
 // last-edited: 2026-08-02
 
@@ -188,6 +188,29 @@ impl SssPolicy {
                 UnlockPin::Tpm2(_) | UnlockPin::Pkcs11(_) => {}
             }
         }
+    }
+
+    /// Does ANY level of the tree use the given [`UnlockPin::kind`]?
+    ///
+    /// The installer gates *packages* on this. A pin whose userspace is missing
+    /// from the target does not fail loudly at install time — it fails at the
+    /// next boot, in the initramfs, on a host that is by then encrypted and
+    /// unreachable. `tpm2` is the live example: `clevis-decrypt-tpm2` ships in
+    /// the separate `clevis-tpm2` package, and without it the tpm2 share is
+    /// simply unsatisfiable. Nesting means the pin can be at any depth, so the
+    /// check must recurse rather than scan `pins` at the top level.
+    ///
+    /// Note the deliberate asymmetry with [`Self::tang_urls`]: this reports
+    /// `"sss"` for a level that *contains* a nested group, since `kind()` is the
+    /// authority and a nested group really is an `sss` pin at its own level.
+    pub fn contains_kind(&self, kind: &str) -> bool {
+        self.pins.iter().any(|pin| {
+            pin.kind() == kind
+                || match pin {
+                    UnlockPin::Sss(nested) => nested.contains_kind(kind),
+                    _ => false,
+                }
+        })
     }
 
     /// The LEGACY flat policy: `threshold`-of-N over N Tang servers, one share
@@ -469,5 +492,67 @@ pins:
             err.to_string().contains('t'),
             "error must name the offending key, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_contains_kind_recurses_into_nested_groups() {
+        // The package gate that consumes this must see a tpm2 pin buried two
+        // levels down; a top-level-only scan is the bug it exists to prevent.
+        let deep = SssPolicy {
+            threshold: 2,
+            pins: vec![
+                UnlockPin::Sss(SssPolicy::flat_tang(&tang3(), 2)),
+                UnlockPin::Sss(SssPolicy {
+                    threshold: 1,
+                    pins: vec![UnlockPin::Tpm2(Tpm2Pin {
+                        pcr_ids: "7".to_string(),
+                        pcr_bank: default_pcr_bank(),
+                    })],
+                }),
+            ],
+        };
+        assert!(deep.contains_kind("tpm2"), "nested tpm2 must be found");
+        assert!(deep.contains_kind("tang"), "nested tang must be found");
+        assert!(
+            deep.contains_kind("sss"),
+            "an sss pin is present at level 0"
+        );
+        assert!(!deep.contains_kind("pkcs11"));
+
+        // Flat trees still answer correctly, and a Tang-only tree must NOT
+        // claim tpm2 — that direction is what suppresses a bogus clevis-tpm2.
+        let flat = SssPolicy::flat_tang(&tang3(), 2);
+        assert!(flat.contains_kind("tang"));
+        assert!(!flat.contains_kind("tpm2"));
+        assert!(!flat.contains_kind("sss"));
+    }
+
+    #[test]
+    fn test_contains_kind_agrees_with_kind_for_every_variant() {
+        // Same drift guard as kind(): a new variant that forgets to be
+        // reachable here silently loses its package.
+        for pin in [
+            UnlockPin::Tang(TangPin {
+                url: "http://t".to_string(),
+            }),
+            UnlockPin::Tpm2(Tpm2Pin {
+                pcr_ids: "7".to_string(),
+                pcr_bank: default_pcr_bank(),
+            }),
+            UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:x".to_string(),
+            }),
+            UnlockPin::Sss(SssPolicy {
+                threshold: 1,
+                pins: vec![],
+            }),
+        ] {
+            let kind = pin.kind();
+            let wrapped = SssPolicy {
+                threshold: 1,
+                pins: vec![pin],
+            };
+            assert!(wrapped.contains_kind(kind), "contains_kind missed {kind}");
+        }
     }
 }

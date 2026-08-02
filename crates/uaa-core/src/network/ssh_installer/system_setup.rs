@@ -13,6 +13,7 @@ use super::config::{
     Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount,
 };
 use super::partitions::partition_path;
+use super::unlock_sss::{SssPolicy, UnlockPin};
 use crate::network::CommandExecutor;
 use crate::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -84,6 +85,12 @@ struct NestedPolicy<'a> {
     pins: NestedPins<'a>,
 }
 
+/// The clevis `pkcs11` pin parameters (e.g. a YubiKey PIV slot URI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct Pkcs11Peer<'a> {
+    uri: &'a str,
+}
+
 pub struct SystemConfigurator<'a> {
     runner: &'a mut dyn CommandExecutor,
 }
@@ -91,6 +98,24 @@ pub struct SystemConfigurator<'a> {
 impl<'a> SystemConfigurator<'a> {
     pub fn new(runner: &'a mut dyn CommandExecutor) -> Self {
         Self { runner }
+    }
+
+    /// Does this host unlock via Tang at all — flat roster **or** anywhere
+    /// inside an authored [`SssPolicy`] tree?
+    ///
+    /// Tang is the only unlock factor that needs the *network* up inside the
+    /// initramfs, so this (not `!tang_servers.is_empty()`) is the predicate for
+    /// `rd.neednet=1`, the static `ip=` cmdline, and the forced NIC driver. A
+    /// host that declares its Tang servers only in the tree has an empty
+    /// `tang_servers`; gating on that roster ships an initramfs with no network
+    /// and no NIC driver, so the Tang bind exists but can never be satisfied at
+    /// boot — a bricked host from a green install.
+    fn uses_tang(config: &InstallationConfig) -> bool {
+        !config.tang_servers.is_empty()
+            || config
+                .unlock_sss
+                .as_ref()
+                .is_some_and(|p| !p.tang_urls().is_empty())
     }
 
     /// Build the command used to detect the ESP partition by GUID
@@ -531,14 +556,30 @@ impl<'a> SystemConfigurator<'a> {
         //   "Module 'uaa-keystore-wait' depends on module 'clevis', which can't
         //    be installed"
         // after the pools were already created. Caught by the VM gate.
-        let needs_clevis =
-            !config.tang_servers.is_empty() || config.storage_mode == StorageMode::NativeKeystore;
+        // An authored `unlock_sss` tree is ALSO a clevis host, whatever the
+        // storage mode and whatever the flat roster says. A host that declares
+        // its Tang servers only inside the tree has an EMPTY `tang_servers`, so
+        // gating on the roster alone installed no clevis at all, ran no
+        // `clevis luks bind`, and still reported a successful install — leaving
+        // a machine that boots to a LUKS prompt nobody can satisfy.
+        let needs_clevis = !config.tang_servers.is_empty()
+            || config.storage_mode == StorageMode::NativeKeystore
+            || config.unlock_sss.is_some();
         let clevis_pkgs = if needs_clevis {
             let base = match config.initramfs_type {
                 InitramfsType::Dracut => " clevis clevis-luks clevis-dracut clevis-systemd",
                 InitramfsType::InitramfsTools => " clevis clevis-luks clevis-initramfs",
             };
-            if config.storage_mode == StorageMode::NativeKeystore {
+            // Same reasoning one level down: the tpm2 pin's decrypter lives in
+            // `clevis-tpm2`, so a PlainLuks host whose TREE carries a tpm2 pin
+            // needs it just as much as a NativeKeystore host does — and misses
+            // it silently, in the initramfs, at first boot. `contains_kind`
+            // recurses, because the pin may sit at any depth.
+            let tree_uses_tpm2 = config
+                .unlock_sss
+                .as_ref()
+                .is_some_and(|p| p.contains_kind("tpm2"));
+            if config.storage_mode == StorageMode::NativeKeystore || tree_uses_tpm2 {
                 format!("{base} clevis-tpm2")
             } else {
                 base.to_string()
@@ -825,7 +866,7 @@ impl<'a> SystemConfigurator<'a> {
         // cmdline is parsed by systemd-network-generator (NOT dracut's own
         // variables) and, because it generates a *.network file, overrides the
         // DHCP default. Falls back to `ip=dhcp` only when the host really is DHCP.
-        if config.initramfs_type == InitramfsType::Dracut && !config.tang_servers.is_empty() {
+        if config.initramfs_type == InitramfsType::Dracut && Self::uses_tang(config) {
             let ip_arg = if config.network_address.eq_ignore_ascii_case("dhcp") {
                 "ip=dhcp".to_string()
             } else {
@@ -929,8 +970,12 @@ impl<'a> SystemConfigurator<'a> {
         //   - crypt/tpm2/fido2 → systemd-cryptenroll TPM2+PIN and YubiKey keyslots
         self.configure_dracut_crypt_modules(config).await?;
 
-        // Enroll Tang servers via Clevis SSS when configured (PlainLuks: tang-only).
-        if !config.tang_servers.is_empty() {
+        // Enroll via Clevis SSS when configured (PlainLuks: tang-only unless a
+        // tree is authored). An authored `unlock_sss` tree counts even with an
+        // EMPTY flat roster — it may carry Tang, tpm2 and pkcs11 shares of its
+        // own, and skipping the bind here is what produced a "successful"
+        // install of a host with no unattended-unlock binding at all.
+        if !config.tang_servers.is_empty() || config.unlock_sss.is_some() {
             self.enroll_tang_clevis(config, &part, false).await?;
         }
 
@@ -985,8 +1030,10 @@ impl<'a> SystemConfigurator<'a> {
         self.configure_dracut_crypt_modules(config).await?;
         self.install_keystore_dracut_module().await?;
 
-        // Clevis D2-B bind on the keystore LUKS (tang + tpm2 peer, sha256).
-        if !config.tang_servers.is_empty() {
+        // Clevis D2-B bind on the keystore LUKS (tang + tpm2 peer, sha256), or
+        // the authored tree verbatim when one is present — see the PlainLuks
+        // call site for why an empty flat roster must not skip the bind.
+        if !config.tang_servers.is_empty() || config.unlock_sss.is_some() {
             self.enroll_tang_clevis(config, keystore_dev, true).await?;
         }
 
@@ -1141,6 +1188,99 @@ impl<'a> SystemConfigurator<'a> {
         json.unwrap_or_default()
     }
 
+    /// Emit clevis SSS JSON for an AUTHORED [`SssPolicy`] tree.
+    ///
+    /// **Pure** — the sibling of [`Self::build_clevis_sss_config`], which stays
+    /// untouched and keeps serving the flat, un-authored path byte-for-byte.
+    /// This one exists because a tree can nest to any depth and mix pin kinds,
+    /// which the fixed `(tang, threshold, tpm2)` signature cannot express: it
+    /// would have to *flatten* the tree, and a flattened `sss` group is exactly
+    /// the 2-of-4 weakening the tree type was introduced to make unrepresentable.
+    ///
+    /// # Shape
+    ///
+    /// Every level emits `{"t":<threshold>,"pins":{…}}`, with `t` before `pins`
+    /// (declaration order, not `serde_json::Value`'s key sorting). Each pin kind
+    /// becomes ONE key — clevis's `pins` is a JSON object, so a duplicate key
+    /// would be invalid — grouped by `SssPolicy::pins_by_kind`, which orders
+    /// kinds by first appearance and pins within a kind in authored order. The
+    /// output is therefore deterministic and diffable.
+    ///
+    /// Every kind is emitted as an **array**, uniformly, including a lone
+    /// `tpm2` or `pkcs11`. That is not cosmetic: `sss` accepts an array for any
+    /// pin and an N-element array is N shares (measured, see `unlock_sss`'s
+    /// module doc), so a 1-element array is exactly one share — identical
+    /// semantics to the bare object, with no special case to get wrong as pins
+    /// are added. `UnlockPin::kind()` supplies the key; the variant supplies the
+    /// value shape, so a new variant cannot be added without deciding both.
+    ///
+    /// This means the nested output here is textually *different* from
+    /// `build_clevis_sss_config(.., Some(tpm2))` (which emits a bare
+    /// `"tpm2":{…}`) while being semantically identical. Both are correct; the
+    /// tree path is only ever taken when a tree was authored.
+    ///
+    /// # `adv` lookup
+    ///
+    /// `advs` is `(tang_url, adv_path)` built by the caller from this same
+    /// tree's `tang_urls()`, so every Tang pin resolves by construction. If one
+    /// somehow did not, it emits `"adv":""` — clevis then fails the bind, which
+    /// is fatal to the install. It fails CLOSED: no path here can produce a
+    /// silently unbound host.
+    fn build_clevis_policy_from_tree(policy: &SssPolicy, advs: &[(String, String)]) -> String {
+        let mut out = String::new();
+        Self::emit_sss_level(policy, advs, &mut out);
+        out
+    }
+
+    fn emit_sss_level(policy: &SssPolicy, advs: &[(String, String)], out: &mut String) {
+        use std::fmt::Write as _;
+        // Writing into a String is infallible; `let _ =` keeps this total.
+        let _ = write!(out, r#"{{"t":{},"pins":{{"#, policy.threshold);
+        for (i, (kind, pins)) in policy.pins_by_kind().into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, r#""{kind}":["#);
+            for (j, pin) in pins.into_iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                match pin {
+                    UnlockPin::Tang(t) => {
+                        let adv = advs
+                            .iter()
+                            .find(|(url, _)| url == &t.url)
+                            .map(|(_, adv)| adv.as_str())
+                            .unwrap_or("");
+                        out.push_str(
+                            &serde_json::to_string(&TangAdv {
+                                url: t.url.as_str(),
+                                adv,
+                            })
+                            .unwrap_or_default(),
+                        );
+                    }
+                    UnlockPin::Tpm2(p) => out.push_str(
+                        &serde_json::to_string(&Tpm2Peer {
+                            pcr_ids: p.pcr_ids.as_str(),
+                            pcr_bank: p.pcr_bank.as_str(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    UnlockPin::Pkcs11(p) => out.push_str(
+                        &serde_json::to_string(&Pkcs11Peer {
+                            uri: p.uri.as_str(),
+                        })
+                        .unwrap_or_default(),
+                    ),
+                    UnlockPin::Sss(nested) => Self::emit_sss_level(nested, advs, out),
+                }
+            }
+            out.push(']');
+        }
+        out.push_str("}}");
+    }
+
     /// Enroll Tang servers via Clevis SSS (t-of-n) on the LUKS partition.
     ///
     /// The clevis binary runs on the *host* (live environment) because the LUKS
@@ -1152,9 +1292,19 @@ impl<'a> SystemConfigurator<'a> {
         luks_part: &str,
         include_tpm2_peer: bool,
     ) -> Result<()> {
+        // Which Tang servers does this host actually use? An authored tree
+        // carries its own — possibly NESTED, so not reachable by iterating the
+        // flat roster, and possibly with the roster left entirely empty.
+        // `tang_urls()` walks the tree depth-first; the flat roster is the
+        // fallback for the un-authored path.
+        let tang_urls: Vec<String> = match &config.unlock_sss {
+            Some(policy) => policy.tang_urls().into_iter().map(str::to_string).collect(),
+            None => config.tang_servers.iter().map(|s| s.url.clone()).collect(),
+        };
         info!(
-            "Enrolling {} Tang servers via Clevis SSS (threshold={}, tpm2_peer={})",
-            config.tang_servers.len(),
+            "Enrolling {} Tang servers via Clevis SSS (authored_tree={}, threshold={}, tpm2_peer={})",
+            tang_urls.len(),
+            config.unlock_sss.is_some(),
             config.tang_threshold,
             include_tpm2_peer,
         );
@@ -1167,36 +1317,68 @@ impl<'a> SystemConfigurator<'a> {
         // unattended-unlock binding. Embedding the adv makes the bind fully
         // non-interactive. This loop is the only I/O here; the JSON assembly
         // below is a pure, unit-tested function.
-        let mut adv_paths: Vec<String> = Vec::with_capacity(config.tang_servers.len());
-        for (i, s) in config.tang_servers.iter().enumerate() {
-            let adv_path = format!("/run/uaa-tang-{i}.adv");
+        //
+        // Keyed by URL rather than by position: a tree may legitimately name the
+        // same server at two places in the policy, and one advertisement serves
+        // both. Numbering follows fetch order, so the un-authored path still
+        // emits /run/uaa-tang-0..N-1 exactly as before.
+        let mut advs: Vec<(String, String)> = Vec::with_capacity(tang_urls.len());
+        for url in &tang_urls {
+            if advs.iter().any(|(u, _)| u == url) {
+                continue;
+            }
+            let adv_path = format!("/run/uaa-tang-{}.adv", advs.len());
             self.log_and_execute(
-                &format!("Fetch Tang advertisement from {}", s.url),
-                &format!("curl -sf --max-time 10 {}/adv -o {}", s.url, adv_path),
+                &format!("Fetch Tang advertisement from {url}"),
+                &format!("curl -sf --max-time 10 {url}/adv -o {adv_path}"),
             )
             .await?;
-            adv_paths.push(adv_path);
+            advs.push((url.clone(), adv_path));
         }
-        let tang: Vec<TangAdv<'_>> = config
-            .tang_servers
-            .iter()
-            .zip(adv_paths.iter())
-            .map(|(s, adv)| TangAdv {
-                url: s.url.as_str(),
-                adv: adv.as_str(),
-            })
-            .collect();
 
-        // PlainLuks: Tang-only, flat — {"t":N,"pins":{"tang":[…]}}.
-        // NativeKeystore D2-B: nested AND — the tpm2 PEER share (PCR7 in the
-        // SHA-256 bank; clevis defaults to sha1, which Secure Boot doesn't
-        // populate) plus a one-share inner sss holding the Tang group, so BOTH
-        // are required. See build_clevis_sss_config for why the nesting matters.
-        let tpm2 = include_tpm2_peer.then_some(Tpm2Peer {
-            pcr_ids: config.tpm2_pcr_ids.as_str(),
-            pcr_bank: "sha256",
-        });
-        let sss_config = Self::build_clevis_sss_config(&tang, config.tang_threshold, tpm2);
+        // THE TREE WINS, WHOLESALE. When `unlock_sss` is authored it supplies
+        // its own threshold and its own tpm2/pkcs11 shares, so BOTH
+        // `config.tang_threshold` and `include_tpm2_peer` are deliberately
+        // ignored on that path. Honoring them would either overwrite the
+        // authored `t` or graft an extra tpm2 share onto a policy that did not
+        // ask for one — silently changing the share arithmetic the author
+        // computed. The un-authored path below is untouched:
+        //
+        //   PlainLuks: Tang-only, flat — {"t":N,"pins":{"tang":[…]}}.
+        //   NativeKeystore D2-B: nested AND — the tpm2 PEER share (PCR7 in the
+        //   SHA-256 bank; clevis defaults to sha1, which Secure Boot doesn't
+        //   populate) plus a one-share inner sss holding the Tang group, so BOTH
+        //   are required. See build_clevis_sss_config for why nesting matters.
+        let sss_config = match &config.unlock_sss {
+            Some(policy) => {
+                // A NativeKeystore tree with no tpm2 pin gives up the default
+                // peer share. That is the author's call and is honored, but it
+                // is exactly the kind of thing someone hunts for in the install
+                // log after a host fails to unlock — so say it out loud.
+                if include_tpm2_peer && !policy.contains_kind("tpm2") {
+                    warn!(
+                        "Authored unlock_sss tree has no tpm2 pin; the default NativeKeystore \
+                         tpm2 peer share is NOT being added (tree wins). This host unlocks from \
+                         the authored factors alone."
+                    );
+                }
+                Self::build_clevis_policy_from_tree(policy, &advs)
+            }
+            None => {
+                let tang: Vec<TangAdv<'_>> = advs
+                    .iter()
+                    .map(|(url, adv)| TangAdv {
+                        url: url.as_str(),
+                        adv: adv.as_str(),
+                    })
+                    .collect();
+                let tpm2 = include_tpm2_peer.then_some(Tpm2Peer {
+                    pcr_ids: config.tpm2_pcr_ids.as_str(),
+                    pcr_bank: "sha256",
+                });
+                Self::build_clevis_sss_config(&tang, config.tang_threshold, tpm2)
+            }
+        };
 
         // Write the LUKS passphrase to a root-only tempfile so it never appears
         // in the clevis bind command line (visible in /proc/<pid>/cmdline) or in
@@ -1216,7 +1398,8 @@ impl<'a> SystemConfigurator<'a> {
         // Create empty 0600 file.
         //
         // FATAL, not "skip": this function is only reached when Tang enrollment is
-        // required (tang_servers non-empty). A silent `return Ok(())` here bypasses
+        // required (a non-empty tang_servers roster OR an authored unlock_sss
+        // tree). A silent `return Ok(())` here bypasses
         // the fatal bind below and lets the install report success on a keystore
         // with NO unattended-unlock binding — the exact silent-killer the bind's
         // fatal handling was added to prevent.
@@ -1350,10 +1533,14 @@ impl<'a> SystemConfigurator<'a> {
             String::new()
         };
         let nic_driver = nic_driver.as_str();
-        if !config.tang_servers.is_empty() {
+        // `uses_tang`, not the flat roster: a tree-only Tang host still needs the
+        // network + NIC driver baked into the initramfs or the bind is
+        // unsatisfiable at boot.
+        let uses_tang = Self::uses_tang(config);
+        if uses_tang {
             info!("Tang unlock: forcing NIC driver '{}' into initramfs", nic_driver);
         }
-        let conf = Self::build_dracut_crypt_conf(!config.tang_servers.is_empty(), nic_driver);
+        let conf = Self::build_dracut_crypt_conf(uses_tang, nic_driver);
         let cmd = format!(
             "mkdir -p /mnt/targetos/etc/dracut.conf.d && cat > /mnt/targetos/etc/dracut.conf.d/90-uaa-crypt.conf <<'UAA_DRACUT_EOF'\n{}UAA_DRACUT_EOF",
             conf
@@ -2104,6 +2291,407 @@ mod tests {
                 serde_json::from_str(&got).expect("emitted policy must be valid JSON");
             assert_eq!(parsed["t"], 2);
         }
+    }
+
+    // ---- authored-tree emitter -----------------------------------------
+
+    use super::super::unlock_sss::{Pkcs11Pin, SssPolicy, TangPin, Tpm2Pin, UnlockPin};
+
+    fn tang_pin(url: &str) -> UnlockPin {
+        UnlockPin::Tang(TangPin {
+            url: url.to_string(),
+        })
+    }
+
+    fn tpm2_pin() -> UnlockPin {
+        UnlockPin::Tpm2(Tpm2Pin {
+            pcr_ids: "7".to_string(),
+            pcr_bank: "sha256".to_string(),
+        })
+    }
+
+    /// The tree shape used by the bricking-regression tests: Tang lives TWO
+    /// levels down, so any emitter or pre-fetch that only looks at the top level
+    /// misses it. A tree with top-level-only Tang would pass under both the
+    /// correct walk and the naive one — it does not discriminate.
+    fn nested_tree() -> SssPolicy {
+        SssPolicy {
+            threshold: 2,
+            pins: vec![
+                tpm2_pin(),
+                UnlockPin::Sss(SssPolicy {
+                    threshold: 2,
+                    pins: vec![
+                        tang_pin("http://172.16.2.40"),
+                        tang_pin("http://172.16.2.41"),
+                        tang_pin("http://172.16.2.42"),
+                    ],
+                }),
+            ],
+        }
+    }
+
+    fn adv_pairs(urls: &[&str]) -> Vec<(String, String)> {
+        urls.iter()
+            .enumerate()
+            .map(|(i, u)| ((*u).to_string(), format!("/run/uaa-tang-{i}.adv")))
+            .collect()
+    }
+
+    /// The cheap proof the two emitters agree where they overlap: a tree that is
+    /// nothing but a flat Tang group must serialize byte-for-byte as the legacy
+    /// flat builder — the string len-serv-001/002 are bound with.
+    #[test]
+    fn test_tree_emitter_flat_tang_matches_legacy_emitter_byte_for_byte() {
+        for n in 1..=4usize {
+            for threshold in 1..=3u8 {
+                let pairs = tang(n);
+                let urls: Vec<&str> = pairs.iter().map(|(u, _)| u.as_str()).collect();
+                let tree = SssPolicy {
+                    threshold,
+                    pins: urls.iter().map(|u| tang_pin(u)).collect(),
+                };
+                let from_tree = SystemConfigurator::build_clevis_policy_from_tree(&tree, &pairs);
+                let legacy =
+                    SystemConfigurator::build_clevis_sss_config(&advs(&pairs), threshold, None);
+                assert_eq!(from_tree, legacy, "drift for n={n} t={threshold}");
+            }
+        }
+    }
+
+    /// Hardcoded golden for the nested tree. Note `"tpm2":[{…}]` — every kind is
+    /// emitted as an array, uniformly. An N-element array is N shares, so a
+    /// 1-element array is exactly one share: same semantics as the bare object
+    /// the flat emitter writes, with no per-kind special case to get wrong.
+    #[test]
+    fn test_tree_emitter_nested_and_golden() {
+        let pairs = adv_pairs(&[
+            "http://172.16.2.40",
+            "http://172.16.2.41",
+            "http://172.16.2.42",
+        ]);
+        let got = SystemConfigurator::build_clevis_policy_from_tree(&nested_tree(), &pairs);
+        assert_eq!(
+            got,
+            r#"{"t":2,"pins":{"tpm2":[{"pcr_ids":"7","pcr_bank":"sha256"}],"sss":[{"t":2,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"},{"url":"http://172.16.2.41","adv":"/run/uaa-tang-1.adv"},{"url":"http://172.16.2.42","adv":"/run/uaa-tang-2.adv"}]}}]}}"#
+        );
+        // The 2-of-4 bug: Tang must never appear as an OUTER sibling of tpm2.
+        assert!(!got.starts_with(r#"{"t":2,"pins":{"tang":"#));
+        assert!(got.contains(r#""sss":[{"t":2,"pins":{"tang":"#));
+        let parsed: serde_json::Value = serde_json::from_str(&got).expect("valid JSON");
+        assert_eq!(parsed["t"], 2);
+        // Exactly two outer shares — tpm2 and the collapsed Tang group.
+        assert_eq!(parsed["pins"]["tpm2"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["pins"]["sss"].as_array().unwrap().len(), 1);
+    }
+
+    /// Every authored kind round-trips through `kind()` into its own array key,
+    /// and same-kind pins at one level collapse into ONE key (clevis's `pins` is
+    /// an object; a duplicate key would be invalid JSON).
+    #[test]
+    fn test_tree_emitter_groups_same_kind_and_carries_pkcs11() {
+        let tree = SssPolicy {
+            threshold: 2,
+            pins: vec![
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:slot-id=0".to_string(),
+                }),
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:slot-id=1".to_string(),
+                }),
+                tang_pin("http://172.16.2.40"),
+            ],
+        };
+        let got = SystemConfigurator::build_clevis_policy_from_tree(
+            &tree,
+            &adv_pairs(&["http://172.16.2.40"]),
+        );
+        assert_eq!(
+            got,
+            r#"{"t":2,"pins":{"pkcs11":[{"uri":"pkcs11:slot-id=0"},{"uri":"pkcs11:slot-id=1"}],"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
+        );
+        serde_json::from_str::<serde_json::Value>(&got).expect("valid JSON");
+    }
+
+    // ---- the bricking regression ---------------------------------------
+
+    /// Config for a host that declares its Tang servers ONLY inside the tree —
+    /// `tang_servers` is empty, exactly the shape that used to install clean and
+    /// boot to an unsatisfiable LUKS prompt.
+    fn tree_only_config() -> InstallationConfig {
+        let mut cfg = sample_netplan_config("192.0.2.10/24", "networkd");
+        cfg.tang_servers = vec![];
+        cfg.unlock_sss = Some(nested_tree());
+        // Distinctive: the shared fixture's `"key"` is a substring of the
+        // `/run/.uaa-tang-enroll.key` tempfile path, which would make the
+        // passphrase-leak assertion below fire on the path instead of the key.
+        cfg.luks_key = "PASSPHRASE-must-never-appear".into();
+        cfg
+    }
+
+    /// THE regression. A tree-only host must still install clevis, still
+    /// pre-fetch EVERY nested Tang advertisement, and still run `clevis luks
+    /// bind` with the nested policy. Against the un-integrated code this test
+    /// fails on the very first assertion: the bind never happens at all.
+    #[tokio::test]
+    async fn test_tree_only_host_with_empty_tang_roster_still_prefetches_and_binds() {
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        let cfg = tree_only_config();
+        assert!(
+            cfg.tang_servers.is_empty(),
+            "fixture must exercise the EMPTY-roster path"
+        );
+
+        SystemConfigurator::new(&mut runner)
+            .enroll_tang_clevis(&cfg, "/dev/zvol/rpool/keystore", true)
+            .await
+            .expect("tree-only enrollment must succeed");
+
+        let cmds = log.lock().unwrap().clone();
+        let joined = cmds.join("\n");
+
+        // Every NESTED Tang URL got its advertisement pre-fetched. Without a
+        // pre-fetched adv, `clevis luks bind` prompts on /dev/tty and dies
+        // non-interactively over SSH — no unattended-unlock binding.
+        for (i, url) in [
+            "http://172.16.2.40",
+            "http://172.16.2.41",
+            "http://172.16.2.42",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let expected = format!("curl -sf --max-time 10 {url}/adv -o /run/uaa-tang-{i}.adv");
+            assert!(
+                cmds.iter().any(|c| c == &expected),
+                "missing nested adv pre-fetch: {expected}\n--- got ---\n{joined}"
+            );
+        }
+
+        // The bind actually ran, against the keystore, with the AUTHORED nested
+        // policy rather than a flattened one.
+        let bind = cmds
+            .iter()
+            .find(|c| c.starts_with("clevis luks bind"))
+            .unwrap_or_else(|| panic!("no clevis luks bind issued\n--- got ---\n{joined}"));
+        assert!(bind.contains("-d /dev/zvol/rpool/keystore"), "bind: {bind}");
+        assert!(
+            bind.contains(r#""sss":[{"t":2,"pins":{"tang":"#),
+            "Tang group must stay NESTED (an outer tang array is the 2-of-4 bug): {bind}"
+        );
+        assert!(
+            !bind.contains(r#"{"t":2,"pins":{"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"},{"url":"http://172.16.2.41""#)
+                || bind.contains(r#""sss":["#),
+            "policy must not be flattened: {bind}"
+        );
+        // The passphrase never reaches the bind command line.
+        assert!(!bind.contains(&cfg.luks_key), "passphrase leaked: {bind}");
+    }
+
+    /// The tree wins wholesale: `tang_threshold` and `include_tpm2_peer` are
+    /// ignored when a tree is authored. Grafting the default peer share on top
+    /// of an authored policy silently changes the share arithmetic its author
+    /// computed.
+    #[tokio::test]
+    async fn test_authored_tree_ignores_tang_threshold_and_forced_tpm2_peer() {
+        let mut cfg = tree_only_config();
+        // A tree with NO tpm2 pin, on the NativeKeystore path that would
+        // otherwise force one in.
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 3,
+            pins: vec![
+                tang_pin("http://172.16.2.40"),
+                tang_pin("http://172.16.2.41"),
+                tang_pin("http://172.16.2.42"),
+            ],
+        });
+        // Deliberately absurd, so a leak into the output is unmistakable.
+        cfg.tang_threshold = 9;
+        cfg.tpm2_pcr_ids = "0,1,2,3".into();
+
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        SystemConfigurator::new(&mut runner)
+            .enroll_tang_clevis(&cfg, "/dev/zvol/rpool/keystore", true)
+            .await
+            .expect("enrollment must succeed");
+
+        let cmds = log.lock().unwrap().clone();
+        let bind = cmds
+            .iter()
+            .find(|c| c.starts_with("clevis luks bind"))
+            .expect("bind issued");
+        assert!(
+            bind.contains(r#"{"t":3,"pins":{"tang":["#),
+            "authored threshold must win over config.tang_threshold: {bind}"
+        );
+        assert!(
+            !bind.contains("\"t\":9"),
+            "config.tang_threshold must not leak into an authored tree: {bind}"
+        );
+        assert!(
+            !bind.contains("tpm2"),
+            "include_tpm2_peer must not graft a share onto an authored tree: {bind}"
+        );
+    }
+
+    /// A tree naming the same Tang server twice fetches ONE advertisement and
+    /// references it from both pins — the url-keyed lookup, not a positional one.
+    #[tokio::test]
+    async fn test_repeated_tang_url_in_tree_fetches_one_adv() {
+        let mut cfg = tree_only_config();
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 1,
+            pins: vec![
+                tang_pin("http://172.16.2.40"),
+                UnlockPin::Sss(SssPolicy {
+                    threshold: 1,
+                    pins: vec![tang_pin("http://172.16.2.40")],
+                }),
+            ],
+        });
+
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        SystemConfigurator::new(&mut runner)
+            .enroll_tang_clevis(&cfg, "/dev/sda4", false)
+            .await
+            .expect("enrollment must succeed");
+
+        let cmds = log.lock().unwrap().clone();
+        assert_eq!(
+            cmds.iter().filter(|c| c.starts_with("curl -sf")).count(),
+            1,
+            "same server twice = one advertisement"
+        );
+        let bind = cmds
+            .iter()
+            .find(|c| c.starts_with("clevis luks bind"))
+            .expect("bind issued");
+        // Both pins resolve to the same adv path — and neither is empty, which
+        // is what an unresolved lookup would emit.
+        assert_eq!(bind.matches(r#""adv":"/run/uaa-tang-0.adv""#).count(), 2);
+        assert!(!bind.contains(r#""adv":"""#), "unresolved adv: {bind}");
+    }
+
+    /// The package gate, same bricking class one layer up: a tree-only host with
+    /// an EMPTY roster must still get clevis installed — and `clevis-tpm2` when
+    /// its tree carries a tpm2 pin, even on PlainLuks, since the tpm2 pin's
+    /// decrypter ships in that separate package and its absence only surfaces in
+    /// the initramfs at first boot.
+    #[tokio::test]
+    async fn test_tree_only_host_still_installs_clevis_packages() {
+        for (mode, tree, want_tpm2) in [
+            (StorageMode::PlainLuks, nested_tree(), true),
+            (
+                StorageMode::PlainLuks,
+                SssPolicy {
+                    threshold: 2,
+                    pins: vec![
+                        tang_pin("http://172.16.2.40"),
+                        tang_pin("http://172.16.2.41"),
+                    ],
+                },
+                false,
+            ),
+        ] {
+            let mut cfg = tree_only_config();
+            cfg.storage_mode = mode;
+            cfg.unlock_sss = Some(tree);
+
+            let mut runner = RecordingExecutor::default();
+            let log = runner.commands.clone();
+            SystemConfigurator::new(&mut runner)
+                .configure_system_in_chroot(&cfg)
+                .await
+                .expect("chroot configuration must succeed");
+
+            let cmds = log.lock().unwrap().clone();
+            let apt = cmds
+                .iter()
+                .find(|c| c.contains("apt install -y grub-efi-amd64"))
+                .expect("the real apt install line");
+            assert!(
+                apt.contains(" clevis clevis-luks"),
+                "tree-only host must still install clevis: {apt}"
+            );
+            assert_eq!(
+                apt.contains("clevis-tpm2"),
+                want_tpm2,
+                "clevis-tpm2 must follow the tree's tpm2 pin: {apt}"
+            );
+        }
+    }
+
+    /// The CALL-SITE guard, which the direct `enroll_tang_clevis` tests above
+    /// deliberately bypass. This is the literal bricking path: NativeKeystore
+    /// Phase 5 used to skip enrollment entirely on an empty `tang_servers`, so a
+    /// tree-only host finished Phase 5 with no binding and the install reported
+    /// success.
+    #[tokio::test]
+    async fn test_keystore_phase5_reaches_the_bind_for_a_tree_only_host() {
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        let mut cfg = tree_only_config();
+        cfg.storage_mode = StorageMode::NativeKeystore;
+
+        SystemConfigurator::new(&mut runner)
+            .setup_keystore_luks_in_chroot(&cfg)
+            .await
+            .expect("keystore phase 5 must succeed");
+
+        let cmds = log.lock().unwrap().clone();
+        assert!(
+            cmds.iter()
+                .any(|c| c.starts_with("clevis luks bind")
+                    && c.contains("-d /dev/zvol/rpool/keystore")),
+            "an empty tang_servers roster must NOT skip the keystore bind\n{}",
+            cmds.join("\n")
+        );
+    }
+
+    /// Same guard on the PlainLuks path.
+    #[tokio::test]
+    async fn test_plainluks_reaches_the_bind_for_a_tree_only_host() {
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        let mut cfg = tree_only_config();
+        cfg.storage_mode = StorageMode::PlainLuks;
+        // Not a real TPM2+PIN host; keep first-boot enrollment out of the way.
+        cfg.enroll_tpm2 = false;
+
+        SystemConfigurator::new(&mut runner)
+            .setup_luks_key_in_chroot(&cfg)
+            .await
+            .expect("plainluks crypttab phase must succeed");
+
+        let cmds = log.lock().unwrap().clone();
+        assert!(
+            cmds.iter().any(|c| c.starts_with("clevis luks bind")),
+            "an empty tang_servers roster must NOT skip the PlainLuks bind\n{}",
+            cmds.join("\n")
+        );
+    }
+
+    /// The initramfs network guards are the same class: a tree-only Tang host
+    /// with no `rd.neednet=1` / no forced NIC driver has a bind it can never
+    /// satisfy at boot.
+    #[tokio::test]
+    async fn test_tree_only_tang_host_gets_initramfs_network() {
+        let mut runner = RecordingExecutor::default();
+        let log = runner.commands.clone();
+        let cfg = tree_only_config();
+        SystemConfigurator::new(&mut runner)
+            .configure_dracut_crypt_modules(&cfg)
+            .await
+            .expect("dracut config must succeed");
+
+        let joined = log.lock().unwrap().join("\n");
+        assert!(
+            joined.contains("network"),
+            "tree-only Tang host needs the dracut network module: {joined}"
+        );
     }
 
     #[test]
