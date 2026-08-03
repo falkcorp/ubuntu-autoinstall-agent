@@ -1,5 +1,5 @@
 <!-- file: docs/status/2026-08-03-len-serv-003-e2e-readiness.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: e92d5377-bb20-4276-a50c-347fdbd7c92b -->
 <!-- last-edited: 2026-08-03 -->
 
@@ -62,21 +62,38 @@ The .92/.94 positive control answers on 623/664, so the .96 negative is a real
 absence of a listener, not a routing or firewall artifact. It also re-confirms
 the ports are 623/664 and **not** 16992/16993 (closed even on the live boxes).
 
-## Blockers
+## Blocked / deferred
 
-Split by ownership, as instructed. No remediation is proposed for the external
-column — only the state we need handed back.
+The blocker set, split by ownership. No remediation is proposed for the
+external column — only the state we need handed back.
 
 ### Ours — code / config
 
 | # | Blocker | Kind | Evidence | Unblocked by |
 |---|---|---|---|---|
-| O1 | **`main` emits a FLAT `sss` for native-keystore**: `{"t":2,"pins":{"tang":[3],"tpm2":{"pcr_ids":"7","pcr_bank":"sha256"}}}` — 4 shares, t=2. Two Tang alone satisfy it. This is the topology the nested design forbids. | code | `crates/uaa-core/src/network/ssh_installer/system_setup.rs:1064-1075` builds `tpm2_pin` and splices it into a single flat `pins` object | Merging the nested-`sss` emitter stack (O2) |
+| O1 | **`main` emits a FLAT `sss` for native-keystore**: `{"t":2,"pins":{"tang":[3],"tpm2":{"pcr_ids":"7","pcr_bank":"sha256"}}}` — 4 shares, t=2. Two Tang alone satisfy it. This is the topology the nested design forbids. See the note below on the decision this overturns. | code | `crates/uaa-core/src/network/ssh_installer/system_setup.rs:1064-1075` builds `tpm2_pin` and splices it into a single flat `pins` object | Merging the nested-`sss` emitter stack (O2) |
 | O2 | **The nested-`sss` stack is entirely unpushed and un-PR'd.** 9 local branches; `gh pr list --state open` returns exactly one PR (#168, dependabot). | code | `git rev-parse --verify origin/<branch>` fails for all nine; `gh pr list` | Push + PR + merge, in the order below |
 | O3 | **len-serv-003 has no authored `unlock_policy` on ANY branch.** `examples/configs/install/len-serv-003-native-keystore.yaml` is 140 lines on all four policy branches with **0** hits for `unlock_policy`/`unlock_sss`/`pkcs11` (positive control: `tang_threshold` matches 1× on each, so the file is present and grep-able). It authors flat `tang_servers` + `tang_threshold: 2` only. | config | `git show <branch>:examples/configs/install/len-serv-003-native-keystore.yaml` | Authoring the policy for this host; the reference shape is `unlock_policy.tpm2_clevis_peer` in `crates/uaa-core/tests/fixtures/components/unimatrixone.yaml:83` |
 | O4 | **The Cockroach cluster is down to one live node.** U0 is nodeID 4 and listening; rpi-serv-001/002/003 all report `cockroach`/`cockroachdb` `inactive` with nothing on 36257/36357/38080 and connection refused on the **host IP** (not just loopback). The installer's drain step (`origin/main` `feat(reinstall): U0 drains cluster membership before wiping a host`) targets a cluster that cannot currently serve. | config/ops | `systemctl is-active` + `ss -ltn` on .45/.46/.47; `ss -ltn` + `journalctl -u cockroachdb` on U0 | Restoring RPi nodes before any drain-dependent step |
-| O5 | **The old PXE seed is still the live one.** `/var/www/html/cloud-init/6c4b90bcf7f4/user-data`, md5 `97e49e6d4003df4e31341c68b839d09d`, 226 lines, `storage: layout: {name: lvm}`, packages `cryptsetup`+`lvm2`, and a bind of flat `sss t=2` over Tang ×3. | config | file on U0, read directly | Regenerating the seed from the native-keystore config (see [Netboot path](#netboot-path-today-vs-required)) |
+| O5 | **The old PXE seed is still the live one.** `/var/www/html/cloud-init/6c4b90bcf7f4/user-data`, md5 `97e49e6d4003df4e31341c68b839d09d`, 226 lines, `storage: layout: {name: lvm}`, packages `cryptsetup`+`lvm2`, and a bind of flat `sss t=2` over Tang ×3. | config | file on U0, read directly | **Retiring it, not regenerating it** — the NativeKeystore install does not use a nocloud seed at all (see [Netboot path](#netboot-path-today-vs-required)); `todo.d` item `seed-trap` |
 | O6 | **Cluster state is not independently verifiable by us.** `jdfalk` cannot authenticate to CockroachDB: the node cert is rejected as a SQL client cert (`DN: <nil>`, valid for `node`/`localhost`/`rpi-serv-00{1,2,3}`/`unimatrix*` — notably **no len-serv SANs**), the RPi `node.key` is `0600 cockroach`, and `sudo` on U0 needs a password for anything outside the NOPASSWD list. | config | four cert/user combinations tried, all rejected | A readable `client.root` cert or an operator-run `cockroach node status` |
+| O7 | **Netboot ≠ SSH-ready — there is no delivery mechanism for a NativeKeystore install.** NativeKeystore is installed by `ssh-install` (U0 debootstraps into a *running live target* over SSH), **not** by a nocloud seed. But `menu.ipxe :live-amd64` boots the stock ISO with **no `ds=` parameter at all** — no cloud-init datasource, so no `sshd`, no authorized key. U0 cannot connect, and the install cannot start. This is the single blocker that would strand the box on the first attempt. | code/config | `menu.ipxe :live-amd64` kernel line is `boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp netboot=http iso-url=…` — contrast `:autoinstall-amd64`, which *does* carry `ds=nocloud;s=…` | A per-MAC live entry that carries a nocloud datasource seeding `sshd` + U0's key (see [Netboot path](#netboot-path-today-vs-required)) |
+
+#### O1 overturns a deliberate decision, not a bug
+
+Worth stating fairly, because the flat form was argued for on purpose. The
+comment at `system_setup.rs:1046-1048` reads: *"A lone tpm2 share is 1 < t=2, so
+it improves availability (survives 2 Tang down) without weakening the off-LAN
+threat model."* That reasoning is internally sound — adding a 4th share at t=2
+does not create a new off-LAN path, since two Tang were already sufficient
+before.
+
+The objection is different: it **fails to implement the settled AND-semantics**,
+where tpm2 is a *required* factor in group 1 rather than one more
+interchangeable share. Under the flat form the TPM contributes nothing an
+attacker with LAN access must defeat. So O1 is a decision to be consciously
+overturned, with the availability benefit knowingly given up — not a defect to
+be quietly patched.
 
 ### External — hardware track (decommission → Windows → firmware → DASH)
 
@@ -96,11 +113,16 @@ handed back, not requests for how to get there.
 
 1. **Secure Boot enabled and in User Mode (PK enrolled) — not Setup Mode.**
    `main` binds the tpm2 share to `pcr_ids: "7"` in the `sha256` bank. In Setup
-   Mode PCR7 attests to nothing meaningful, so the share is theatre. Worse, the
-   *ordering* matters: if we bind while Secure Boot is off and the track (or
-   anyone) enables it afterwards, PCR7 changes and the tpm2 share is
-   permanently dead. **Secure Boot must be settled before we install, not
-   after.**
+   Mode PCR7 attests to nothing meaningful, so the share is theatre. The
+   *ordering* matters: if we bind while Secure Boot is off and anyone enables it
+   afterwards, PCR7 changes and the tpm2 share is permanently dead.
+   **The severity escalates once O1 is fixed.** Today the tpm2 share is 1 of 4
+   at t=2, so a PCR7 change is survivable — two Tang still unlock. Under the
+   settled nested policy tpm2 becomes a *required* factor in group 1, and then
+   **a PCR7 change strands the box**: no Tang quorum can compensate for a dead
+   mandatory share. So "settle Secure Boot before we install" is currently a
+   quality concern and becomes an availability-critical one the moment the
+   nested stack lands. Both point the same way: **settle it first.**
 2. **A YubiKey (or the intended PKCS#11 token) physically seated before we
    arrive**, if the token groups are ever to be exercised on this host. Binding
    with a token absent does not fail — it silently collapses shares onto
@@ -150,16 +172,48 @@ sibling directories `6c4b90bcf7f4_postinstall/`, `len-serv-003/`, and
 the iPXE chain references a hostname-named path. Treat them as dead weight
 unless something outside iPXE reads them.
 
-### What it must be
+### What it must be — and it is not "a better seed"
+
+**The `autoinstall` menu entry is the wrong path entirely for this install.**
+This is the most important correction in the report.
+
+There are two distinct install mechanisms in this repo, and NativeKeystore uses
+the second:
+
+| | PlainLuks (len-serv-001/002, and .96 today) | **NativeKeystore (what .96 must get)** |
+|---|---|---|
+| Mechanism | subiquity consumes a nocloud seed | **`ssh-install`: U0 debootstraps into a running live target over SSH** |
+| Config shape | `#cloud-config` / `autoinstall:` / `storage: layout:` | `storage_mode`, `disks:` roster, `debootstrap_release: resolute`, `initramfs_type: dracut`, `install_ca_cert` — **no subiquity keys at all** |
+| Code | `crates/uaa-core/src/autoinstall/{place,render}.rs`, `place_command` at `crates/uaa/src/cli/commands.rs:1147` | `crates/uaa-core/src/network/ssh_installer/*`; `chroot /mnt/targetos …` at `installer.rs:1020` |
+| Golden fixtures | `fixtures/golden/len-serv-00{1,2,3}.user-data` (all `#cloud-config autoinstall:`) | **none — there is no seed to golden** |
+
+Proof that the seed generator cannot do NativeKeystore: `git grep` for
+`storage_mode|NativeKeystore` under `crates/uaa-core/src/autoinstall/` returns
+**0 files**, while control greps in the same directory hit (`hexmac` 1,
+`layout` 2, `lvm` 2, `storage` 1, `crypto` 2, `tang` 2). The directory is
+present and grep-able; the support simply is not there.
+
+Consequences:
+
+- **Do not flip `menu-default` to `autoinstall`.** Doing so runs the *subiquity*
+  path, which is the old PlainLuks/LVM layout — i.e. arming the trap, not
+  escaping it.
+- **`ubuntu-autoinstall-agent … place` is the wrong command here.** It writes a
+  hexmac nocloud seed (and optionally flips the iPXE default and reboots) for
+  the PlainLuks path only. *(Note the binary is `ubuntu-autoinstall-agent`; the
+  crate is named `uaa` but `[[bin]] name` at `crates/uaa/Cargo.toml:13` is the
+  long form.)*
+- **What is actually required is a live-boot entry that is SSH-ready** — see O7.
 
 | Path | Today | Required |
 |---|---|---|
-| `/var/www/html/ipxe/boot/mac-6c4b90bcf7f4.ipxe` | `set menu-default boot-local-disk` | `set menu-default autoinstall` **only for the install window**, reverted immediately after (leaving it armed means any future reboot reinstalls) |
-| `/var/www/html/cloud-init/6c4b90bcf7f4/user-data` | md5 `97e49e6d…`, 226 lines, `layout: {name: lvm}` | regenerated from `examples/configs/install/len-serv-003-native-keystore.yaml` via `uaa config place`, with every `REPLACE_AT_PLACE_TIME` substituted (`validate_config_secrets` fails closed otherwise) |
-| unlock policy in the emitted seed | flat `sss t=2` over Tang ×3 | nested `sss` per the settled design (blocked on O1–O3) |
+| `/var/www/html/ipxe/boot/mac-6c4b90bcf7f4.ipxe` | `set menu-default boot-local-disk` | a **live** default that boots an SSH-ready environment for the install window, reverted immediately after. **Not `autoinstall`.** |
+| `menu.ipxe :live-amd64` | no `ds=` at all → no cloud-init, no `sshd`, no key | must carry `ds=nocloud;s=…` seeding `sshd` + U0's key, so `ssh-install` can connect (O7) |
+| `/var/www/html/cloud-init/6c4b90bcf7f4/user-data` | md5 `97e49e6d…`, 226 lines, `layout: {name: lvm}` | **not used by this install path.** Retire or clearly mark it (`todo.d` item `seed-trap`) so it cannot be reached by accident |
+| unlock policy | flat `sss t=2` over Tang ×3 | nested `sss` per the settled design, emitted by `ssh_installer` (blocked on O1–O3) |
 
-Note the file is `jdfalk`-writable with no sudo, so the flip is trivial — which
-is precisely why it is dangerous.
+Note `mac-6c4b90bcf7f4.ipxe` is `jdfalk`-writable with no sudo, so any flip is
+trivial — which is precisely why the old seed is dangerous.
 
 ## Cluster state
 
@@ -191,7 +245,9 @@ plain stop. **Someone with cluster credentials must run
 all three RPi nodes down and only U0 live, a decommission or drain issued now
 would run against a cluster that cannot reach quorum.
 
-## Branch and merge state
+## In flight
+
+### Branch and merge state
 
 `origin/main` = `1933d90`.
 
@@ -245,26 +301,29 @@ start until all of these are true:
 - [ ] Branches 1–8 merged to `main`; an `unlock_policy` authored for
       len-serv-003; `cargo test` green; the SoftHSM VM gate green on the merged
       tree, **not** on a branch.
+- [ ] **O7 fixed and proven in a VM**: an SSH-ready live netboot entry exists,
+      and a VM booted from it accepted an `ssh-install` connection. Per the
+      standing "always test in VMs" rule, boot-prove this in libvirt on U0
+      first — set the VM MAC to exercise the MAC-gated iPXE path, but on NAT
+      only, never bridged, so the duplicate MAC never reaches the physical LAN.
 
 Then:
 
 1. **Snapshot the current PXE state.** Copy `mac-6c4b90bcf7f4.ipxe` and
    `cloud-init/6c4b90bcf7f4/user-data` aside with today's date. Record md5s.
    *Abort/recovery: none needed — read-only.*
-2. **Place the config.** `uaa config place` from
-   `examples/configs/install/len-serv-003-native-keystore.yaml`, substituting
-   every `REPLACE_AT_PLACE_TIME` (system NVMe by-id — use the **full by-id
-   path**, never `/dev/nvme0n1`, because NativeKeystore appends `-partN`;
-   `luks_key`; `root_password`; `install_ca_cert`; livepatch key;
-   rollout-agent `database-url`).
+2. **Fill in the config** (do **not** run `place` — that is the PlainLuks seed
+   path, see above). Substitute every `REPLACE_AT_PLACE_TIME` in
+   `examples/configs/install/len-serv-003-native-keystore.yaml`: system NVMe
+   by-id — use the **full by-id path**, never `/dev/nvme0n1`, because
+   NativeKeystore appends `-partN`; `luks_key`; `root_password`;
+   `install_ca_cert`; livepatch key; rollout-agent `database-url`.
    *Abort: `validate_config_secrets` fails closed on a surviving placeholder.
-   Fix and re-place. No physical risk.*
-3. **Verify the emitted seed before arming anything.** Diff the newly written
-   `user-data` against the saved md5 `97e49e6d…`; confirm `storage:` no longer
-   says `layout: {name: lvm}`; confirm the clevis bind emits the **nested**
-   `sss`, not a flat four-share object. Grep for the literal
-   `"pins":{"tang":[` followed by `,"tpm2"` at the same nesting depth — that
-   pattern is the O1 defect.
+   Fix and retry. No physical risk.*
+3. **Dry-run `ssh-install` and inspect the command stream before touching the
+   machine.** Confirm the clevis bind emits the **nested** `sss`, not a flat
+   four-share object: grep the emitted bind for `"pins":{"tang":[` followed by
+   `,"tpm2"` at the *same* nesting depth — that pattern is the O1 defect.
    *Abort: stop here. Nothing has touched the machine. This is the last
    completely free abort point.*
 4. **Confirm Tang quorum.** All three of `172.16.2.45/.46/.47` must answer
@@ -275,18 +334,26 @@ Then:
 5. **Drain / confirm decommission.** Re-run `cockroach node status --all`.
    *Abort: if the cluster is unhealthy, stop. Wiping a node out of an
    already-degraded cluster risks the cluster, not just the host.*
-6. ⚠️ **Arm the netboot.** Flip `mac-6c4b90bcf7f4.ipxe` to
-   `set menu-default autoinstall`.
+6. ⚠️ **Arm the SSH-ready live boot.** Point `mac-6c4b90bcf7f4.ipxe` at the
+   live entry (O7 must be fixed first — the stock `:live` has no cloud-init
+   datasource and yields no `sshd`). **Never** point it at `autoinstall`; that
+   is the PlainLuks trap.
    **From here on, every failure is potentially a physical trip.**
    *Abort/recovery: flip the file back to `boot-local-disk` immediately. It is
    `jdfalk`-writable with no sudo, so this is fast — but only helps if the box
-   has not already started the install.*
-7. ⚠️ **Power-cycle via DASH** and watch the install.
-   *Abort/recovery: **requires DASH.** If DASH does not respond, this step
-   cannot be aborted remotely — it is a physical trip. Do not start this step
-   without having proven an authenticated DASH power action in the entry
-   preconditions.*
-8. ⚠️ **Install runs; the critical moment is the `clevis luks bind`.** The bind
+   has not already been rebooted.*
+7. ⚠️ **Power-cycle via DASH, then prove SSH from U0 before installing
+   anything.** The box must come up in the live environment and accept U0's
+   key. **Verify `ssh` succeeds before running `ssh-install`** — this is the
+   step O7 exists to protect, and it is cheap to check.
+   *Abort/recovery: **requires DASH.** If the live environment does not come up
+   SSH-ready, U0 cannot drive the install and the box sits in a live session
+   with its old disk still intact — recoverable by flipping the iPXE file back
+   and power-cycling, **if** DASH answers. Without DASH this is a physical trip.
+   Do not start this step without having proven an authenticated DASH power
+   action in the entry preconditions.*
+8. ⚠️ **Run `ssh-install` from U0.** The disk is wiped here — this is the point
+   of no return. The critical moment is the `clevis luks bind`. The bind
    is non-interactive only because the installer pre-fetches each Tang
    advertisement to `/run/uaa-tang-{i}.adv` and passes it via the `adv` key —
    without it, `clevis luks bind` prompts on `/dev/tty` and fails over SSH,
@@ -377,19 +444,22 @@ Windows install will replace it.
 1. **Fix O1 first** — it is the one defect that would let a "successful" e2e
    ship the wrong security property. Land branches 1, 2 and 5 (5 is the test
    that catches regressions of 1).
-2. **Author an `unlock_policy` for len-serv-003** (O3), modelled on
+2. **Fix O7** — build the SSH-ready live netboot entry and boot-prove it in a
+   VM. Without it there is no way to start a NativeKeystore install on .96 at
+   all, and discovering that at the machine costs a physical trip.
+3. **Author an `unlock_policy` for len-serv-003** (O3), modelled on
    `crates/uaa-core/tests/fixtures/components/unimatrixone.yaml:83`. Note that
    `lower()` currently drops the nested leaf and the installer derives the D2-B
    tpm2 peer from `storage_mode` — confirm the merged stack changes that, or the
    authored policy will be silently ignored.
-3. **Untangle the branch graph** before opening PRs; several branches contain
+4. **Untangle the branch graph** before opening PRs; several branches contain
    each other's commits via local merges.
-4. **Get cluster credentials** so `membership` is verifiable without an operator
+5. **Get cluster credentials** so `membership` is verifiable without an operator
    in the loop, and **restore RPi quorum**.
-5. **Retire the old seed** (`todo.d` item `seed-trap`) rather than relying on
+6. **Retire the old seed** (`todo.d` item `seed-trap`) rather than relying on
    `menu-default boot-local-disk` as the only guard — it is one keystroke deep
    and the file is writable without sudo.
-6. Correct `docs/netboot-autodeploy.md` (`todo.d` item `netboot-doc`); it still
+7. Correct `docs/netboot-autodeploy.md` (`todo.d` item `netboot-doc`); it still
    calls the len-serv-003 `user-data` the known-good template.
 
 ## Related
