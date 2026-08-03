@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/lower.rs
-// version: 1.1.0
+// version: 1.2.0
 // guid: 74997d1d-8349-4aaf-ac8a-b6ec886492a1
-// last-edited: 2026-08-02
+// last-edited: 2026-08-03
 
 //! Pure authoring->flat-wire bridge (PS-LOWER-12).
 //!
@@ -387,6 +387,14 @@ mod tests {
             base_image: Some(BaseImagePartial {
                 release: Some(Some("jammy".to_string())),
                 mirror: Some(Some("http://archive.ubuntu.com/ubuntu/".to_string())),
+                // Deliberately the UNSUPPORTED variant. `Dracut` is the
+                // default, so it is the only value that can prove the
+                // `base_image.initramfs` -> `initramfs_type` mapping actually
+                // fired rather than falling through to `wire_defaults()`.
+                // `lower` is documented pure and TOTAL — it maps, it does not
+                // judge — so the rejection of initramfs-tools lives in
+                // `validate_resolved` (rule 7), one layer up. See
+                // `test_lower_is_total_even_for_a_config_validate_rejects`.
                 initramfs: Some(InitramfsType::InitramfsTools),
                 fallback_mirror: Some("http://old-releases.ubuntu.com/ubuntu/".to_string()),
             }),
@@ -453,6 +461,32 @@ mod tests {
             config.firmware_quirks,
             vec![FirmwareQuirk::GrubRemovableFallback]
         );
+    }
+
+    /// The layering contract behind the fixture above: `lower` is TOTAL, so a
+    /// partial authoring `initramfs-tools` lowers cleanly — and is then refused
+    /// by `validate_resolved` rule 7. If someone later moves the rejection into
+    /// `lower`, this test fails and says why it should not have moved.
+    #[test]
+    fn test_lower_is_total_even_for_a_config_validate_rejects() {
+        use crate::network::ssh_installer::config::InitramfsType;
+        use crate::profile::validate::validate_resolved;
+
+        let config = lower(&fully_populated_via_components());
+        assert_eq!(
+            config.initramfs_type,
+            InitramfsType::InitramfsTools,
+            "lower must map the authored value through untouched, not sanitize it"
+        );
+
+        match validate_resolved(&config) {
+            Err(crate::error::AutoInstallError::ConfigError(msg)) => assert!(
+                msg.split("; ")
+                    .any(|v| v == InitramfsType::UNSUPPORTED_REASON),
+                "rule 7 must reject the lowered config; got: {msg}"
+            ),
+            other => panic!("expected a rule-7 ConfigError, got {other:?}"),
+        }
     }
 
     #[test]

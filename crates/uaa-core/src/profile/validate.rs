@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.5.2
+// version: 1.6.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
 // last-edited: 2026-08-03
 
@@ -32,7 +32,7 @@ use super::{HostGroupProfile, HostProfile};
 use crate::error::{AutoInstallError, Result};
 use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
 use crate::network::ssh_installer::config::{
-    ApplicationSpec, Arch, HostRole, InstallationConfig, StorageMode,
+    ApplicationSpec, Arch, HostRole, InitramfsType, InstallationConfig, StorageMode,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -102,6 +102,11 @@ pub fn validate(groups: &[HostGroupProfile], profiles: &[HostProfile]) -> Result
 ///    (`tang_servers` non-empty OR `enroll_tpm2` true OR an authored
 ///    `unlock_sss` policy tree) — an install target with a disk plan but no
 ///    unlock factor at all is a host nobody can unlock after first boot.
+/// 7. `initramfs_type` must be `Dracut`. `InitramfsTools` is unsupported
+///    fleet-wide — see [`InitramfsType::UNSUPPORTED_REASON`] for the
+///    mechanism (no `initrd.target`, therefore no bounded fail-closed on a
+///    failed unlock). Keyed on `initramfs_type` alone: it is a property of
+///    the build, not of the unlock policy, so no policy makes it safe.
 ///
 /// **Not checked here (PS-INSTALLER-29):** a resolved config carrying
 /// non-default disk sizes or `reset_enabled` would be unsupported today, but
@@ -210,6 +215,16 @@ pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
                 );
             }
         }
+    }
+
+    // Rule 7: dracut everywhere. See `InitramfsType::UNSUPPORTED_REASON` for
+    // the mechanism — this is a build-shape rule, not an unlock-policy rule,
+    // so it is keyed on `initramfs_type` ALONE and applies to every role and
+    // every policy. The enum variant is deliberately still deserializable so
+    // an old committed config lands here, with an explanation, instead of on
+    // an opaque serde "unknown variant" error.
+    if cfg.initramfs_type == InitramfsType::InitramfsTools {
+        violations.push(InitramfsType::UNSUPPORTED_REASON.to_string());
     }
 
     // The unlock policy tree is validated for EVERY role, not just
@@ -1031,5 +1046,106 @@ mod tests {
             msg.contains("tang_threshold 5 is out of range"),
             "got: {msg}"
         );
+    }
+
+    // -- Rule 7: initramfs-tools is unsupported, fleet-wide --
+
+    /// Splits a `validate_resolved` error back into the individual violation
+    /// strings it was assembled from, so a test can assert on a WHOLE
+    /// violation by equality instead of substring-matching the joined blob.
+    /// Three false-green assertions in this repo's history came from
+    /// `contains()`; this helper exists so rule 7 cannot become the fourth.
+    fn violations_of(err: &AutoInstallError) -> Vec<String> {
+        match err {
+            AutoInstallError::ConfigError(msg) => msg.split("; ").map(|s| s.to_string()).collect(),
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rule7_initramfs_tools_is_rejected() {
+        let mut cfg = base_config();
+        cfg.initramfs_type = InitramfsType::InitramfsTools;
+        let err = validate_resolved(&cfg).expect_err("initramfs-tools must not validate");
+        // `base_config()` is otherwise valid, so rule 7 must be the SOLE
+        // violation and the payload must equal the shared constant exactly —
+        // no substring matching, and no room for a near-miss message to pass.
+        assert_eq!(
+            violations_of(&err),
+            vec![InitramfsType::UNSUPPORTED_REASON.to_string()]
+        );
+
+        // ...and it survives being collected alongside other violations as ONE
+        // element, which is only true if the message carries no `"; "` of its
+        // own. (Rule 4's pre-existing message does contain one and therefore
+        // splits into two here — that is its bug, not this rule's, and is left
+        // alone deliberately rather than tangled into a validation change.)
+        let mut multi = cfg.clone();
+        multi.arch = Arch::Arm64;
+        multi.firmware_quirks = vec![FirmwareQuirk::GrubRemovableFallback];
+        let violations = violations_of(&validate_resolved(&multi).unwrap_err());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v == InitramfsType::UNSUPPORTED_REASON),
+            "rule 7 must survive collection intact, not split; got {violations:#?}"
+        );
+    }
+
+    /// Rule 7 is keyed on the initramfs implementation and NOTHING else. The
+    /// same config on dracut — including the nested policy tree that motivated
+    /// the rule — must sail through, or the guard has become a policy rule by
+    /// accident.
+    #[test]
+    fn test_rule7_does_not_fire_for_dracut() {
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        // (a) the plain default host
+        let mut cfg = base_config();
+        cfg.initramfs_type = InitramfsType::Dracut;
+        validate_resolved(&cfg).expect("dracut host must still validate");
+
+        // (b) the legacy flat N-of-M Tang host (len-serv-001/002's shape)
+        cfg.tang_servers = vec![
+            TangServer {
+                url: "http://tang1".into(),
+            },
+            TangServer {
+                url: "http://tang2".into(),
+            },
+            TangServer {
+                url: "http://tang3".into(),
+            },
+        ];
+        cfg.tang_threshold = 2;
+        validate_resolved(&cfg).expect("legacy flat Tang on dracut must still validate");
+
+        // (c) the nested policy tree
+        cfg.unlock_sss = Some(SssPolicy::tpm2_and_tang(
+            "7",
+            &[
+                TangServer {
+                    url: "http://tang1".into(),
+                },
+                TangServer {
+                    url: "http://tang2".into(),
+                },
+                TangServer {
+                    url: "http://tang3".into(),
+                },
+            ],
+            2,
+        ));
+        validate_resolved(&cfg).expect("nested policy on dracut must still validate");
+    }
+
+    /// Rule 7 rejects at VALIDATION time, not at parse time. The enum variant
+    /// stays deserializable on purpose so an old committed config yields this
+    /// rule's explanation rather than an opaque serde "unknown variant" error.
+    #[test]
+    fn test_rule7_variant_still_deserializes() {
+        let parsed: InitramfsType =
+            serde_yaml::from_str("initramfs-tools").expect("the variant must still parse");
+        assert_eq!(parsed, InitramfsType::InitramfsTools);
     }
 }

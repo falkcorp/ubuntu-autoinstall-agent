@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/config.rs
-// version: 2.16.0
+// version: 2.17.0
 // guid: sshcfg01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-08-02
+// last-edited: 2026-08-03
 
 //! Configuration structures for SSH/local installation
 
@@ -25,6 +25,30 @@ pub enum InitramfsType {
 }
 
 impl InitramfsType {
+    /// The single wording every rejection of [`InitramfsType::InitramfsTools`]
+    /// uses — shared so a caller can assert on the WHOLE violation by equality
+    /// rather than substring-matching a joined error blob.
+    ///
+    /// It names the mechanism, not just the verdict: the bound on a failed
+    /// unlock is a systemd drop-in on `initrd.target`
+    /// (`JobTimeoutSec` + `JobTimeoutAction=reboot-force`, shipped as
+    /// `dracut/92uaa-unlock-deadline/`). initramfs-tools has no systemd in the
+    /// initramfs, therefore no `initrd.target`, therefore no job to time out —
+    /// a failed unlock sits at an interactive prompt forever (measured: 902
+    /// seconds and still waiting). On a host with no remote power that is a
+    /// physical trip, so the combination is refused at authoring time.
+    ///
+    /// Contains no `"; "` on purpose: `validate_resolved` joins its violations
+    /// with that delimiter, so a semicolon here would split one violation into
+    /// two and make the collected error unparseable by a caller.
+    pub const UNSUPPORTED_REASON: &'static str = "initramfs_type is initramfs-tools, which is \
+         unsupported fleet-wide — dracut is required. initramfs-tools has no systemd in the \
+         initramfs, so there is no initrd.target to hang a JobTimeoutSec/JobTimeoutAction \
+         drop-in on (dracut/92uaa-unlock-deadline), which means a failed disk unlock cannot \
+         fail closed in bounded time — it waits at an interactive prompt indefinitely \
+         (measured 902s and still waiting). On a host with no remote power that is a physical \
+         trip. Set base_image.initramfs (or initramfs_type) to dracut";
+
     /// Shell command to regenerate the initramfs inside a chroot at `/mnt/targetos`.
     pub fn regenerate_cmd(&self) -> &'static str {
         match self {
@@ -809,10 +833,25 @@ fn default_report_status_webhook() -> String {
 
 impl InstallationConfig {
     /// Load configuration from a YAML file.
+    ///
+    /// Rejects `initramfs_type: initramfs-tools` here as well as in
+    /// [`crate::profile::validate::validate_resolved`]: this path is the
+    /// hand-written-YAML CLI entry (`uaa install --config …`) and never goes
+    /// through profile resolution, so a guard placed only in the profile
+    /// pipeline would leave the hazard fully live on the path actually used
+    /// to install a host. See [`InitramfsType::UNSUPPORTED_REASON`]. Only
+    /// this one rule is applied here — this is a loader, not a validator.
     pub fn from_yaml_file(path: &str) -> crate::Result<Self> {
         let content =
             std::fs::read_to_string(path).map_err(crate::error::AutoInstallError::IoError)?;
-        serde_yaml::from_str(&content).map_err(crate::error::AutoInstallError::SerdeError)
+        let cfg: Self =
+            serde_yaml::from_str(&content).map_err(crate::error::AutoInstallError::SerdeError)?;
+        if cfg.initramfs_type == InitramfsType::InitramfsTools {
+            return Err(crate::error::AutoInstallError::ConfigError(
+                InitramfsType::UNSUPPORTED_REASON.to_string(),
+            ));
+        }
+        Ok(cfg)
     }
 
     /// Create the production config for len-serv-003 (172.16.3.96).
@@ -1055,6 +1094,46 @@ mod tests {
             InitramfsType::InitramfsTools.regenerate_cmd(),
             "update-initramfs -u -k all"
         );
+    }
+
+    /// The hand-written-YAML CLI path (`uaa install --config …`) never reaches
+    /// `validate_resolved`, so the dracut-everywhere rule has to bite here too.
+    /// Asserted on the error ENUM and on whole-string equality with the shared
+    /// constant — no substring matching.
+    #[test]
+    fn test_from_yaml_file_rejects_initramfs_tools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let write = |name: &str, initramfs: &str| -> String {
+            let mut cfg = InstallationConfig::for_len_serv_003();
+            cfg.initramfs_type = match initramfs {
+                "dracut" => InitramfsType::Dracut,
+                _ => InitramfsType::InitramfsTools,
+            };
+            let path = dir.path().join(name);
+            std::fs::write(&path, serde_yaml::to_string(&cfg).expect("serialize")).expect("write");
+            path.to_str().expect("utf-8 path").to_string()
+        };
+
+        // The variant still SERIALIZES and PARSES — only loading is refused.
+        let bad = write("tools.yaml", "initramfs-tools");
+        let raw: InstallationConfig =
+            serde_yaml::from_str(&std::fs::read_to_string(&bad).expect("read"))
+                .expect("the variant must still deserialize");
+        assert_eq!(raw.initramfs_type, InitramfsType::InitramfsTools);
+
+        match InstallationConfig::from_yaml_file(&bad) {
+            Err(crate::error::AutoInstallError::ConfigError(msg)) => {
+                assert_eq!(msg, InitramfsType::UNSUPPORTED_REASON);
+            }
+            Err(other) => panic!("expected ConfigError, got {other:?}"),
+            Ok(_) => panic!("initramfs-tools config must not load"),
+        }
+
+        // ...and the dracut twin of the same file still loads unchanged.
+        let good = write("dracut.yaml", "dracut");
+        let cfg = InstallationConfig::from_yaml_file(&good).expect("dracut config must load");
+        assert_eq!(cfg.initramfs_type, InitramfsType::Dracut);
     }
 
     #[test]
