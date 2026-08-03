@@ -1,0 +1,211 @@
+#!/bin/bash
+# file: clevis/clevis-decrypt-pkcs11
+# version: 1.0.0
+# guid: 4e0b91c7-2a3f-4d58-9c61-7b8e05aa4d31
+# last-edited: 2026-08-03
+#
+# UAA FORK of clevis 23-1 /usr/bin/clevis-decrypt-pkcs11.
+# Upstream sha256: 63ef4486ea73122ed976b0a1c671f1200b54a501cb957d5d8dbbb4eb4d7d9081
+# See docs/research/2026-08-03-clevis-pkcs11-multitoken-pin-fork.md before
+# touching this file or reconciling it against a newer clevis.
+#
+# Everything below the upstream banner is verbatim upstream except the two
+# blocks marked "UAA FORK".
+#
+set -eo pipefail
+# vim: set ts=8 shiftwidth=4 softtabstop=4 expandtab smarttab colorcolumn=80:
+#
+# Copyright (c) 2024 Red Hat, Inc.
+# Author: Sergio Correia <scorreia@redhat.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+PIN_NAME=pkcs11
+PIN_FILE="/run/systemd/clevis-pkcs11.pin"
+. clevis-pkcs11-common
+
+[ $# -eq 1 ] && [ "$1" == "--summary" ] && exit 2
+
+if [ -t 0 ]; then
+    exec >&2
+    echo
+    echo "Usage: clevis decrypt pkcs11 < JWE > PLAINTEXT"
+    echo
+    exit 2
+fi
+
+on_exit() {
+    [ -d "${CLEVIS_PKCS11}" ] || exit 0
+    rm -rf "${CLEVIS_PKCS11}"
+}
+
+unset CLEVIS_PKCS11
+
+read -r -d . hdr64
+
+# Check for corruption in the header.
+if ! hdr="$(jose fmt --quote="${hdr64}" --string --b64load --object \
+            --output=- 2>/dev/null)" ; then
+    echo "JWE header corrupt" >&2
+    exit 1
+fi
+
+# Check if the pin is the expected one.
+if ! pin="$(jose fmt --json="${hdr}" --get clevis --get pin \
+            --unquote=- 2>/dev/null)" || [ -z "${pin}" ]; then
+    echo "Invalid JWE header: unable to identify 'pin'" >&2
+    exit 1
+fi
+if [ "${pin}" != "${PIN_NAME}" ]; then
+    echo "JWE pin mismatch: found: ${pin}; expected: ${PIN_NAME}" >&2
+    exit 1
+fi
+
+if ! uri="$(jose fmt -j- -Og clevis -g "${PIN_NAME}" -g uri -Su- <<< "${hdr}")"; then
+    echo "URI missing required 'clevis.pkcs11.uri' header parameter!" >&2
+    exit 1
+fi
+
+mechanism_option=""
+mechanism="$(jose fmt -j- -Og clevis -g "${PIN_NAME}" -g mechanism -Su- <<< "${hdr}")" \
+             2>/dev/null || :
+if [ -n "${mechanism}" ]; then
+    mechanism_option="--mechanism ${mechanism}"
+fi
+
+if ! clevis_valid_pkcs11_uri "${uri}"; then
+    echo "PKCS#11 URI with invalid format:[${uri}]" >&2
+    echo "PKCS#11 URI expected format:[${URI_EXPECTED_FORMAT}]" >&2
+    exit 1
+fi
+
+module_opt=""
+if module_path="$(clevis_get_module_path_from_uri ${uri})"; then
+     module_opt="--module ${module_path}"
+fi
+
+##### UAA FORK 1/2: slot resolution is MANDATORY. ############################
+# Upstream fell back to slot_opt="" when the URI did not resolve to a slot,
+# which makes pkcs11-tool pick whichever token enumerates first. With an sss
+# group of N pkcs11 shares that silently collapses every share onto one token
+# (rc=0, empty stderr), so a 2-of-3 group unlocks with ONE token inserted.
+# Failing here instead is what makes an absent token fail closed, and it is
+# also the gate that stops us prompting for a PIN for a token nobody inserted.
+if ! slot=$(clevis_get_pkcs11_final_slot_from_uri "${uri}"); then
+    echo "PKCS#11 token not present / URI does not resolve to a slot:[${uri}]" >&2
+    exit 1
+fi
+slot_opt=" --slot-index=${slot}"
+##### end UAA FORK 1/2 #######################################################
+
+# Check if key parameter is present.
+if ! enc_jwk="$(jose fmt --json="${hdr}" --get clevis --get "${PIN_NAME}" \
+                --get key --unquote=- 2>/dev/null)" \
+                || [ -z "${enc_jwk}" ]; then
+    echo "JWE missing 'clevis.${PIN_NAME}.key' header parameter" >&2
+    exit 1
+fi
+
+if ! CLEVIS_PKCS11="$(mktemp -d)" || [ -z "${CLEVIS_PKCS11}" ]; then
+    echo "Creating a temporary dir for PKCS11 files failed" >&2
+    exit 1
+fi
+trap 'on_exit' EXIT
+
+# Error file
+ERR="${CLEVIS_PKCS11}/decerr"
+
+# Decrypt the key.
+ENC="${CLEVIS_PKCS11}/enc"
+if ! printf '%s' "${enc_jwk}" | jose b64 dec -i- > "${ENC}"  2>"${ERR}"; then
+    cat "${ERR}" >&2
+    echo "Unable to base64-decode the JWK" >&2
+    exit 1
+fi
+
+##### UAA FORK 2/2: per-token PIN state instead of one shared one-shot file. ##
+# Upstream read one PIN from ${PIN_FILE} and `rm`-ed it after the first
+# SUCCESSFUL decrypt (the failure path exits before the rm). That allows
+# exactly one pkcs11 share per unlock; a second share in the same sss group
+# gets an empty PIN, `pkcs11-tool -p` swallows the next flag and dies with
+# "error: invalid option(s) given".
+#
+# Here each share keeps its own PIN state keyed by serial+token from its own
+# URI, so different tokens may have different PINs. The PIN is never written
+# to the JWE, so it never reaches the LUKS2 header.
+#
+# clevis-decrypt-sss forks its shares CONCURRENTLY (measured: three shares
+# entered within 10us of each other), so the prompt and the login are held
+# under one lock; without it N systemd-ask-password queries race and their
+# timeouts run down together while the operator types the first one.
+UAA_ID="$(printf '%s|%s' "$(clevis_get_serial_from_uri "${uri}" || :)" \
+          "$(clevis_get_token_from_uri "${uri}" || :)" | sha256sum | cut -c1-32)"
+UAA_PIN_FILE="${PIN_FILE}.${UAA_ID}"
+UAA_TRY_FILE="${PIN_FILE}.${UAA_ID}.tries"
+# A hardware PIV token bricks after 3 wrong PINs. Cap prompts below that so a
+# typo storm cannot burn the last retry: the trade is that after 2 wrong PINs
+# this token is unusable until reboot, which is recoverable; a locked token is
+# not. Override for tokens with a larger counter.
+UAA_MAX_TRIES="${CLEVIS_PKCS11_MAX_PIN_TRIES:-2}"
+UAA_TIMEOUT="${CLEVIS_PKCS11_PIN_TIMEOUT:-120}"
+UAA_LABEL="$(clevis_get_token_from_uri "${uri}" 2>/dev/null || \
+             clevis_get_serial_from_uri "${uri}" 2>/dev/null || echo "${uri}")"
+
+# Serialise prompt+login across the concurrent sss children. Best effort: if
+# flock is missing the unlock still works, the prompts just interleave.
+exec 9>"${PIN_FILE}.lock" 2>/dev/null && flock -w 300 9 2>/dev/null || :
+
+PIN_value=""
+if ! PIN_value="$(clevis_get_pin_value_from_uri ${uri})"; then
+    PIN_value="$(cat "${UAA_PIN_FILE}" 2>/dev/null || :)"
+fi
+if [ -z "${PIN_value}" ]; then
+    uaa_tries="$(cat "${UAA_TRY_FILE}" 2>/dev/null || echo 0)"
+    if [ "${uaa_tries}" -ge "${UAA_MAX_TRIES}" ]; then
+        echo "PIN attempts exhausted for PKCS#11 token '${UAA_LABEL}'" >&2
+        exit 1
+    fi
+    ( umask 077; echo $((uaa_tries + 1)) > "${UAA_TRY_FILE}" )
+    if ! PIN_value="$(systemd-ask-password --timeout="${UAA_TIMEOUT}" \
+                      --id="clevis-pkcs11:${UAA_LABEL}" \
+                      "Please enter PIN for PKCS#11 token '${UAA_LABEL}':")" \
+       || [ -z "${PIN_value}" ]; then
+        echo "No PIN supplied for PKCS#11 token '${UAA_LABEL}'" >&2
+        exit 1
+    fi
+fi
+
+if ! jwk="$(pkcs11-tool --login --decrypt --input-file ${ENC} \
+            -p "${PIN_value}" ${module_opt} ${mechanism_option} ${slot_opt} 2>${ERR})" \
+            || [ -z "${jwk}" ]; then
+    cat "${ERR}" >&2
+    echo "Unable to decrypt the JWK for token '${UAA_LABEL}'" >&2
+    # TODO: Verify invalid PIN more accurately
+    echo "Invalid PIN?" >&2
+    # Drop the cached PIN so a retry re-prompts rather than replaying a bad
+    # PIN; the try counter deliberately survives so retries stay bounded.
+    rm -f "${UAA_PIN_FILE}" 2>/dev/null || :
+    exit 1
+fi
+
+# Cache for the rest of this boot: clevis-luks-pkcs11-askpin retries the whole
+# device, and a second LUKS device may reuse the same token. Neither should
+# re-prompt. tmpfs, mode 0600, gone at reboot.
+( umask 077; printf '%s' "${PIN_value}" > "${UAA_PIN_FILE}" )
+rm -f "${UAA_TRY_FILE}" 2>/dev/null || :
+flock -u 9 2>/dev/null || :
+##### end UAA FORK 2/2 #######################################################
+
+# Decrypt the data using the decrypted JWK.
+( printf '%s' "${jwk}${hdr64}." ; cat ) | exec jose jwe dec --key=- --input=-
