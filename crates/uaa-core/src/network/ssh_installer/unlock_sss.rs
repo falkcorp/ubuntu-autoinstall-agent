@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.2.0
+// version: 1.3.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
 // last-edited: 2026-08-02
 
@@ -888,6 +888,39 @@ pins:
             hinted.validate().is_ok(),
             "serial= plus a slot-id hint must be accepted"
         );
+    }
+
+    #[test]
+    fn test_reject_pkcs11_uri_that_is_not_an_rfc7512_uri() {
+        // A bare serial or a mistyped separator is not a PKCS#11 URI. clevis
+        // hands it to pkcs11-tool as a token filter, where it silently matches
+        // nothing — and a filter that matches nothing is exactly the state that
+        // makes `pkcs11-tool -O` enumerate EVERY slot and encrypt every share to
+        // whichever token happens to be first. See
+        // docs/research/2026-08-02-pkcs11-share-binding-hazard.md.
+        for bad in ["YK0000001", "pkcs11-serial=YK0000001", ""] {
+            let policy = SssPolicy {
+                threshold: 1,
+                pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: bad.to_string(),
+                })],
+            };
+            assert!(
+                errors_of(&policy).iter().any(|e| e.contains("RFC 7512")),
+                "`{bad}` must be rejected as a non-URI"
+            );
+        }
+
+        // Case is not an escape hatch, and a well-formed URI still passes.
+        for good in ["pkcs11:serial=YK0000001", "PKCS11:serial=YK0000001"] {
+            let policy = SssPolicy {
+                threshold: 1,
+                pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: good.to_string(),
+                })],
+            };
+            assert!(policy.validate().is_ok(), "`{good}` must be accepted");
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 <!-- file: changelog.d/pkcs11-share-emission-and-policy-validation.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 3f8b21c9-5e47-4a06-9d13-c7a0e6b482f5 -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -19,15 +19,22 @@ group 1; the RPis have no TPM and deliberately get none anywhere.
 thief who steals the server already holds it; if it counted there, reaching a
 single Tang server would open the disk. Two tests fail if someone adds it back.
 
-New `SssPolicy::validate`, wired into `validate_resolved` so it gates installs
-rather than merely existing. It walks the whole tree recursively and reports
-every violation at once:
+New `SssPolicy::validate`, enforced in **two** places so it cannot be walked
+around: `validate_resolved` (the registry/profile-resolution path) and
+`enroll_tang_clevis` itself, immediately before the bind, which is the only gate
+a hand-authored `InstallationConfig` handed straight to the installer must pass.
+Each rule below describes a policy that produces a host which *looks* bound and
+is not — strictly worse than a failed install — so the bind fails closed and
+early, before any command runs. The walk is recursive and reports every
+violation at once:
 
 - a `pin-value=` in a PKCS#11 URI — the URI is stored in the LUKS header in the
   clear, so a stored PIN silently reduces the factor to something-you-have
 - a URI keyed on `slot-id=` with no `serial=` — slot IDs are reassigned between
   insertions, so the binding addresses the wrong token at the next boot
-- a URI that is not an RFC 7512 `pkcs11:` URI
+- a URI that is not an RFC 7512 `pkcs11:` URI — clevis passes it to
+  `pkcs11-tool` as a token filter, where it matches nothing, which is precisely
+  the state that triggers the `head -1` hazard below
 - a threshold outside `1 <= t <= shares` **at any level**, or an empty group;
   clevis enforces this per level and a nested violation kills the bind half-way
 - the same Tang URL or token URI twice **within one level** — it counts twice

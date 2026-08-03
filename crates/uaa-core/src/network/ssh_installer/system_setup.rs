@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.31.0
+// version: 2.32.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-08-02
 
@@ -1368,6 +1368,35 @@ impl<'a> SystemConfigurator<'a> {
         luks_part: &str,
         include_tpm2_peer: bool,
     ) -> Result<()> {
+        // LAST GATE, and the only one on this path that cannot be walked around.
+        //
+        // `validate_resolved` runs the same rules, but only in
+        // `uaa-control`'s `resolve_from_registry` — so a hand-authored
+        // `InstallationConfig` handed straight to the installer never sees them.
+        // The rules this enforces (a PIN stored in the LUKS header, a
+        // `slot-id=`-keyed binding that addresses the wrong token after the next
+        // reboot, a threshold clevis will reject mid-bind, a duplicated share
+        // that makes a group weaker than it reads) all describe policies that
+        // are WORSE than not installing at all, because each of them produces a
+        // host that looks bound and is not. So this fails CLOSED, immediately
+        // before the bind, rather than trusting an upstream caller to have
+        // checked.
+        if let Some(policy) = &config.unlock_sss {
+            match policy.validate() {
+                Ok(warnings) => {
+                    for warning in warnings {
+                        warn!("unlock_sss policy: {warning}");
+                    }
+                }
+                Err(errors) => {
+                    return Err(crate::error::AutoInstallError::ConfigError(format!(
+                        "refusing to bind an invalid unlock_sss policy: {}",
+                        errors.join("; ")
+                    )));
+                }
+            }
+        }
+
         // Which Tang servers does this host actually use? An authored tree
         // carries its own — possibly NESTED, so not reachable by iterating the
         // flat roster, and possibly with the roster left entirely empty.
@@ -2675,6 +2704,63 @@ mod tests {
         assert_ne!(got["pins"]["sss"][0], rpi["pins"]["sss"][0]);
     }
 
+    /// The fleet policy is the first tree that names the SAME Tang peer twice —
+    /// once in group 1 and again inside group 3 — so `tang_urls()` returns
+    /// `[peerA, peerB, peerA, peerB]`.
+    ///
+    /// Every other emitter test hands `build_clevis_policy_from_tree` a
+    /// hand-written `adv_pairs(&[PEER_A, PEER_B])`, which quietly papers over
+    /// what `enroll_tang_clevis` actually does with a repeating list. This test
+    /// builds `advs` the way the installer builds them — by walking
+    /// `tang_urls()` and skipping a URL already fetched — and asserts the
+    /// emitted JSON is still the golden one. If the pre-fetch loop ever stops
+    /// deduplicating (four fetches numbered 0..3, so group 3's peerA resolves to
+    /// `/run/uaa-tang-2.adv` instead of `-0`), or starts erroring on a repeat,
+    /// this fails instead of the bind failing on real hardware.
+    #[test]
+    fn test_adv_prefetch_survives_a_peer_named_in_two_groups() {
+        let policy = SssPolicy::fleet_three_group(
+            &[PEER_A, PEER_B],
+            2,
+            NANO,
+            &[CARRIED_A, CARRIED_B],
+            2,
+            None,
+        );
+
+        let urls = policy.tang_urls();
+        assert_eq!(
+            urls,
+            vec![PEER_A, PEER_B, PEER_A, PEER_B],
+            "the fixture must actually repeat, or this test is vacuous"
+        );
+
+        // Mirror of the loop in `enroll_tang_clevis`: skip a URL already
+        // fetched, number by fetch order.
+        let mut advs: Vec<(String, String)> = Vec::new();
+        for url in &urls {
+            if advs.iter().any(|(u, _)| u == url) {
+                continue;
+            }
+            let path = format!("/run/uaa-tang-{}.adv", advs.len());
+            advs.push(((*url).to_string(), path));
+        }
+        assert_eq!(advs.len(), 2, "one advertisement per DISTINCT server");
+
+        let got: serde_json::Value = serde_json::from_str(
+            &SystemConfigurator::build_clevis_policy_from_tree(&policy, &advs),
+        )
+        .expect("valid JSON");
+        assert_eq!(got, emit_fleet_policy(None));
+
+        // No Tang share may carry an empty adv — that is how this fails on real
+        // hardware, since clevis then prompts on /dev/tty and the bind dies.
+        assert!(
+            !got.to_string().contains(r#""adv":"""#),
+            "every Tang share must resolve to a fetched advertisement: {got}"
+        );
+    }
+
     /// SECURITY PROPERTY — the nano is not a group-3 factor, in the EMITTED
     /// JSON.
     ///
@@ -2753,6 +2839,95 @@ mod tests {
         // passphrase-leak assertion below fire on the path instead of the key.
         cfg.luks_key = "PASSPHRASE-must-never-appear".into();
         cfg
+    }
+
+    /// The unlock-policy rules must gate the BIND, not merely the registry.
+    ///
+    /// `validate_resolved` runs the same rules, but only inside `uaa-control`'s
+    /// `resolve_from_registry` — so a hand-authored `InstallationConfig` handed
+    /// straight to the installer would never see them. Each of these policies
+    /// produces a host that looks bound and is not, which is strictly worse than
+    /// a failed install, so `enroll_tang_clevis` fails CLOSED before touching
+    /// the device.
+    #[tokio::test]
+    async fn test_enroll_refuses_an_invalid_policy_before_binding() {
+        let bad_policies = [
+            // PIN written into the LUKS header in the clear.
+            (
+                "pin-value=",
+                SssPolicy {
+                    threshold: 1,
+                    pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                        uri: "pkcs11:serial=YK1;pin-value=1234".to_string(),
+                    })],
+                },
+            ),
+            // Threshold clevis would reject part-way through the bind.
+            (
+                "threshold 4",
+                SssPolicy {
+                    threshold: 4,
+                    pins: vec![tang_pin("http://172.16.2.40")],
+                },
+            ),
+            // Same token twice: reads as 2-of-2, satisfiable by one token.
+            (
+                "duplicate pkcs11",
+                SssPolicy {
+                    threshold: 2,
+                    pins: vec![
+                        UnlockPin::Pkcs11(Pkcs11Pin {
+                            uri: "pkcs11:serial=YK1".to_string(),
+                        }),
+                        UnlockPin::Pkcs11(Pkcs11Pin {
+                            uri: "pkcs11:serial=YK1".to_string(),
+                        }),
+                    ],
+                },
+            ),
+        ];
+
+        for (needle, policy) in bad_policies {
+            let mut runner = RecordingExecutor::default();
+            let log = runner.commands.clone();
+            let mut cfg = tree_only_config();
+            cfg.unlock_sss = Some(policy);
+
+            let err = SystemConfigurator::new(&mut runner)
+                .enroll_tang_clevis(&cfg, "/dev/zvol/rpool/keystore", true)
+                .await
+                .expect_err("an invalid policy must not be bound");
+            assert!(
+                err.to_string().contains(needle),
+                "error must name the violation `{needle}`: {err}"
+            );
+
+            // Fails CLOSED and EARLY: nothing was fetched, nothing was bound.
+            // A refusal that happens after `clevis luks bind` is not a refusal.
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "no command may run before the policy is accepted: {:?}",
+                log.lock().unwrap()
+            );
+        }
+
+        // Positive control: the settled fleet policy binds. Without this the
+        // assertions above would also pass if `enroll_tang_clevis` simply
+        // refused every tree.
+        let mut runner = RecordingExecutor::default();
+        let mut cfg = tree_only_config();
+        cfg.unlock_sss = Some(SssPolicy::fleet_three_group(
+            &[PEER_A, PEER_B],
+            2,
+            NANO,
+            &[CARRIED_A, CARRIED_B],
+            2,
+            None,
+        ));
+        SystemConfigurator::new(&mut runner)
+            .enroll_tang_clevis(&cfg, "/dev/zvol/rpool/keystore", true)
+            .await
+            .expect("the settled fleet policy must bind");
     }
 
     /// THE regression. A tree-only host must still install clevis, still
