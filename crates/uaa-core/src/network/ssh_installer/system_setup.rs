@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.32.0
+// version: 2.33.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
 // last-edited: 2026-08-02
 
@@ -85,9 +85,18 @@ struct NestedPolicy<'a> {
 }
 
 /// The clevis `pkcs11` pin parameters (e.g. a YubiKey PIV slot URI).
+///
+/// `mechanism` is the only optional key clevis 23 reads besides `uri`, and it is
+/// `skip_serializing_if` so an unset one does not appear in the binding at all —
+/// `clevis-decrypt-pkcs11` passes `--mechanism` only when non-empty, and an
+/// explicit `"mechanism":""` would be a gratuitous diff against every binding
+/// authored before the field existed. Module path and slot are NOT keys here:
+/// clevis derives both from the URI. See [`super::unlock_sss::Pkcs11Pin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 struct Pkcs11Peer<'a> {
     uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mechanism: Option<&'a str>,
 }
 
 pub struct SystemConfigurator<'a> {
@@ -1346,6 +1355,7 @@ impl<'a> SystemConfigurator<'a> {
                     UnlockPin::Pkcs11(p) => out.push_str(
                         &serde_json::to_string(&Pkcs11Peer {
                             uri: p.uri.as_str(),
+                            mechanism: p.mechanism.as_deref(),
                         })
                         .unwrap_or_default(),
                     ),
@@ -2546,9 +2556,11 @@ mod tests {
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000001".to_string(),
+                    mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000002".to_string(),
+                    mechanism: None,
                 }),
                 tang_pin("http://172.16.2.40"),
             ],
@@ -2761,6 +2773,80 @@ mod tests {
         );
     }
 
+    /// GOLDEN — `mechanism` is emitted when set and ABSENT when not.
+    ///
+    /// The config shape clevis 23 actually reads is `{"uri":…,"mechanism":…}`,
+    /// and `clevis-decrypt-pkcs11` passes `--mechanism` only when the value is
+    /// non-empty. So an unset mechanism must vanish from the binding entirely,
+    /// not appear as `"mechanism":""` or `"mechanism":null` — both would be a
+    /// gratuitous diff against every binding authored before the field existed,
+    /// and `null` in particular is not a string clevis can hand to
+    /// `pkcs11-tool`.
+    #[test]
+    fn test_golden_pkcs11_mechanism_emitted_only_when_set() {
+        let tree = SssPolicy {
+            threshold: 1,
+            pins: vec![
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    mechanism: None,
+                }),
+                UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000002".to_string(),
+                    mechanism: Some("RSA-PKCS-OAEP".to_string()),
+                }),
+            ],
+        };
+        tree.validate().expect("both shares must be valid");
+
+        let raw = SystemConfigurator::build_clevis_policy_from_tree(&tree, &[]);
+        let got: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "t": 1,
+                "pins": {"pkcs11": [
+                    // No `mechanism` key AT ALL for the unset share.
+                    {"uri": "pkcs11:serial=YK0000001"},
+                    {"uri": "pkcs11:serial=YK0000002", "mechanism": "RSA-PKCS-OAEP"},
+                ]}
+            })
+        );
+
+        // `assert_eq!` on Values already proves absence, but say it in the form
+        // the failure would take, so a regression names itself.
+        let unset = &got["pins"]["pkcs11"][0];
+        assert!(
+            unset.get("mechanism").is_none(),
+            "an unset mechanism must not serialize at all, got: {unset}"
+        );
+        assert!(
+            !raw.contains("null"),
+            "a None mechanism must be skipped, never emitted as null: {raw}"
+        );
+
+        // Module path and slot are URI attributes, never config keys — clevis
+        // derives both from the uri. A struct field for either would serialize
+        // into the binding and be silently ignored.
+        let with_module = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001;module-path=/usr/lib/opensc-pkcs11.so".to_string(),
+                mechanism: None,
+            })],
+        };
+        with_module
+            .validate()
+            .expect("a module-path= attribute is a normal part of the URI");
+        let got: serde_json::Value = serde_json::from_str(
+            &SystemConfigurator::build_clevis_policy_from_tree(&with_module, &[]),
+        )
+        .expect("valid JSON");
+        let share = &got["pins"]["pkcs11"][0];
+        assert_eq!(share.as_object().unwrap().len(), 1, "uri is the only key");
+        assert!(share["uri"].as_str().unwrap().contains("module-path="));
+    }
+
     /// SECURITY PROPERTY — the nano is not a group-3 factor, in the EMITTED
     /// JSON.
     ///
@@ -2859,6 +2945,7 @@ mod tests {
                     threshold: 1,
                     pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                         uri: "pkcs11:serial=YK1;pin-value=1234".to_string(),
+                        mechanism: None,
                     })],
                 },
             ),
@@ -2878,9 +2965,11 @@ mod tests {
                     pins: vec![
                         UnlockPin::Pkcs11(Pkcs11Pin {
                             uri: "pkcs11:serial=YK1".to_string(),
+                            mechanism: None,
                         }),
                         UnlockPin::Pkcs11(Pkcs11Pin {
                             uri: "pkcs11:serial=YK1".to_string(),
+                            mechanism: None,
                         }),
                     ],
                 },
@@ -3221,9 +3310,11 @@ mod tests {
                 pins: vec![
                     UnlockPin::Pkcs11(Pkcs11Pin {
                         uri: "pkcs11:serial=YK0000001".to_string(),
+                        mechanism: None,
                     }),
                     UnlockPin::Pkcs11(Pkcs11Pin {
                         uri: "pkcs11:serial=YK0000002".to_string(),
+                        mechanism: None,
                     }),
                 ],
             },

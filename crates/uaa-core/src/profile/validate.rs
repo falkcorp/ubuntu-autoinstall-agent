@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.5.0
+// version: 1.5.1
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
 // last-edited: 2026-08-02
 
@@ -951,6 +951,7 @@ mod tests {
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+                mechanism: None,
             })],
         });
         let err = validate_resolved(&cfg).unwrap_err();
@@ -966,6 +967,7 @@ mod tests {
                 threshold: 4,
                 pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000001".to_string(),
+                    mechanism: None,
                 })],
             })],
         });

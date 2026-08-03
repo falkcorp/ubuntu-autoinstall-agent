@@ -1,5 +1,5 @@
 <!-- file: changelog.d/pkcs11-share-emission-and-policy-validation.md -->
-<!-- version: 1.1.0 -->
+<!-- version: 1.2.0 -->
 <!-- guid: 3f8b21c9-5e47-4a06-9d13-c7a0e6b482f5 -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -18,6 +18,16 @@ group 1; the RPis have no TPM and deliberately get none anywhere.
 **The chassis-resident nano token is deliberately excluded from group 3.** A
 thief who steals the server already holds it; if it counted there, reaching a
 single Tang server would open the disk. Two tests fail if someone adds it back.
+
+`Pkcs11Pin` carries an optional `mechanism`, the only pin-config key clevis 23
+reads besides `uri`. It is skipped entirely when unset, so a binding that does
+not set it is byte-identical to one authored before the field existed —
+`clevis-decrypt-pkcs11` passes `--mechanism` only when non-empty. The **module
+path and slot are URI attributes** (`module-path=`, resolved by
+`clevis_get_module_path_from_uri`), deliberately **not** struct fields: such a
+field would be authored in YAML, serialized into the binding, and then silently
+ignored by clevis. `deny_unknown_fields` turns an attempt to add one into a
+loud parse error.
 
 New `SssPolicy::validate`, enforced in **two** places so it cannot be walked
 around: `validate_resolved` (the registry/profile-resolution path) and

@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-08-02-pkcs11-share-binding-hazard.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 9c1f4a72-6d05-4b38-a4e7-1f2c8b3d5e60 -->
 <!-- last-edited: 2026-08-02 -->
 
@@ -82,6 +82,25 @@ perfectly correct on paper. Static validation cannot see it. Only unlocking can.
 - A single successful unlock proves nothing. If you bind three tokens and then
   unlock with `{nano, carriedA}`, that succeeds *both* when the bind was correct
   *and* when everything encrypted to the nano's key.
+
+## What is, and is not, a pin-config key
+
+Read off clevis 23's `clevis-encrypt-pkcs11`. This matters here because putting
+a token attribute in the wrong place is one of the ways `slot_opt` fails to
+resolve, which is the trigger for everything above.
+
+| What | Where it goes | How clevis gets it |
+|---|---|---|
+| token identity | `serial=` in the URI | filter passed to `pkcs11-tool` |
+| PKCS#11 module | **`module-path=` in the URI** | `clevis_get_module_path_from_uri` → `--module` |
+| slot | **in the URI** | `clevis_get_pkcs11_final_slot_from_uri` |
+| mechanism | top-level `mechanism` config key | `jose fmt -Og mechanism`, written into the JWE |
+
+So the pin config is exactly `{"uri":…}` or `{"uri":…,"mechanism":…}`. Module
+path and slot are **URI attributes, not config keys** — `Pkcs11Pin` deliberately
+has no field for either, because such a field would be authored in YAML,
+serialized into the binding, and then silently ignored by clevis. Decrypt passes
+`--mechanism` only when non-empty, so omitting it is safe and is the default.
 
 ## Mitigations before binding
 

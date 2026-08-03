@@ -1,5 +1,5 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
 // last-edited: 2026-08-02
 
@@ -121,10 +121,47 @@ pub struct Tpm2Pin {
 }
 
 /// One PKCS#11 token share (e.g. a YubiKey PIV slot URI).
+///
+/// # The config shape is EXACTLY `{"uri":…}` (+ optional `mechanism`)
+///
+/// Read off clevis 23's `clevis-encrypt-pkcs11`, not inferred. Only two things
+/// are top-level pin-config keys; **everything else about the token is
+/// expressed INSIDE the URI** as RFC 7512 attributes:
+///
+/// | What | Where it goes | How clevis gets it |
+/// |---|---|---|
+/// | token identity | `serial=` in the URI | filter passed to `pkcs11-tool` |
+/// | PKCS#11 module | **`module-path=` in the URI** | `clevis_get_module_path_from_uri` → `--module` |
+/// | slot | **in the URI** | `clevis_get_pkcs11_final_slot_from_uri` |
+/// | mechanism | [`Self::mechanism`], a real config key | `jose fmt -Og mechanism`, written into the JWE |
+///
+/// **Do not add a `module_path` or `slot` field to this struct.** clevis never
+/// reads such a key: it derives both from the URI. A struct field for either
+/// would be authored in YAML, serialized into the binding, and silently ignored
+/// by clevis — an authoring field that never reaches the emitted JSON, which is
+/// the exact failure this module's `kind()`-is-authoritative design exists to
+/// prevent. Put them in the `uri`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pkcs11Pin {
+    /// The RFC 7512 token URI. Key it on `serial=` — see
+    /// [`SssPolicy::validate`], which rejects a `slot-id=`-only URI because slot
+    /// indices are reassigned between insertions. That rule is load-bearing for
+    /// the three-token design precisely BECAUSE the slot is URI-derived: a
+    /// binding whose slot no longer resolves is the trigger for the `head -1`
+    /// hazard in
+    /// `docs/research/2026-08-02-pkcs11-share-binding-hazard.md`.
     pub uri: String,
+    /// Optional PKCS#11 mechanism, e.g. `RSA-PKCS-OAEP`.
+    ///
+    /// clevis writes this straight into the JWE protected header alongside the
+    /// URI, and `clevis-decrypt-pkcs11` passes `--mechanism` only when it is
+    /// non-empty — so omitting it lets the token's default apply and is the
+    /// right choice unless a specific token demands otherwise. Skipped entirely
+    /// when `None`, so a binding that does not set it is byte-identical to one
+    /// authored before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanism: Option<String>,
 }
 
 /// A clevis `sss` threshold group: `threshold`-of-`pins.len()`.
@@ -253,6 +290,7 @@ impl SssPolicy {
                 .map(|u| {
                     UnlockPin::Pkcs11(Pkcs11Pin {
                         uri: (*u).to_string(),
+                        mechanism: None,
                     })
                 })
                 .collect(),
@@ -558,6 +596,7 @@ mod tests {
             (
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:token=a".to_string(),
+                    mechanism: None,
                 }),
                 "pkcs11",
             ),
@@ -835,6 +874,7 @@ pins:
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+                mechanism: None,
             })],
         };
         let errors = errors_of(&policy);
@@ -850,6 +890,7 @@ pins:
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "PKCS11:SERIAL=YK1;PIN-VALUE=123456".to_string(),
+                mechanism: None,
             })],
         };
         assert!(
@@ -866,6 +907,7 @@ pins:
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "pkcs11:slot-id=0".to_string(),
+                mechanism: None,
             })],
         };
         let errors = errors_of(&policy);
@@ -882,12 +924,57 @@ pins:
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "pkcs11:serial=YK0000001;slot-id=0".to_string(),
+                mechanism: None,
             })],
         };
         assert!(
             hinted.validate().is_ok(),
             "serial= plus a slot-id hint must be accepted"
         );
+    }
+
+    /// `mechanism` is optional in the AUTHORING format too — omitting it must
+    /// parse, and a `module_path`/`slot` field must NOT, because clevis derives
+    /// both from the URI and a struct field for either would be authored,
+    /// serialized, and then silently ignored.
+    #[test]
+    fn test_pkcs11_mechanism_is_optional_and_module_path_is_not_a_field() {
+        let bare: UnlockPin =
+            serde_yaml::from_str("kind: pkcs11\nuri: \"pkcs11:serial=YK1\"\n").unwrap();
+        match &bare {
+            UnlockPin::Pkcs11(p) => assert_eq!(p.mechanism, None, "omitted mechanism is None"),
+            other => panic!("expected pkcs11, got {}", other.kind()),
+        }
+
+        let with_mech: UnlockPin = serde_yaml::from_str(
+            "kind: pkcs11\nuri: \"pkcs11:serial=YK1\"\nmechanism: RSA-PKCS-OAEP\n",
+        )
+        .unwrap();
+        match &with_mech {
+            UnlockPin::Pkcs11(p) => assert_eq!(p.mechanism.as_deref(), Some("RSA-PKCS-OAEP")),
+            other => panic!("expected pkcs11, got {}", other.kind()),
+        }
+
+        // Round-trip, since YAML is the authoring format.
+        for pin in [&bare, &with_mech] {
+            let again: UnlockPin =
+                serde_yaml::from_str(&serde_yaml::to_string(pin).unwrap()).unwrap();
+            assert_eq!(&again, pin, "YAML round-trip must be lossless");
+        }
+
+        // `deny_unknown_fields` makes the wrong shape a loud parse error rather
+        // than a silently dropped setting.
+        for bad in ["module_path: /usr/lib/opensc-pkcs11.so", "slot: 0"] {
+            let err = serde_yaml::from_str::<UnlockPin>(&format!(
+                "kind: pkcs11\nuri: \"pkcs11:serial=YK1\"\n{bad}\n"
+            ))
+            .expect_err("module path and slot belong in the URI, not in a field");
+            let key = bad.split(':').next().unwrap();
+            assert!(
+                err.to_string().contains(key),
+                "error must name the offending key `{key}`, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -903,6 +990,7 @@ pins:
                 threshold: 1,
                 pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: bad.to_string(),
+                    mechanism: None,
                 })],
             };
             assert!(
@@ -917,6 +1005,7 @@ pins:
                 threshold: 1,
                 pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: good.to_string(),
+                    mechanism: None,
                 })],
             };
             assert!(policy.validate().is_ok(), "`{good}` must be accepted");
@@ -1005,12 +1094,15 @@ pins:
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000001".to_string(),
+                    mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000001".to_string(),
+                    mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK0000002".to_string(),
+                    mechanism: None,
                 }),
             ],
         };
@@ -1095,9 +1187,11 @@ pins:
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:slot-id=0".to_string(),
+                    mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
                     uri: "pkcs11:serial=YK1;pin-value=1234".to_string(),
+                    mechanism: None,
                 }),
             ],
         };
@@ -1170,6 +1264,7 @@ pins:
             }),
             UnlockPin::Pkcs11(Pkcs11Pin {
                 uri: "pkcs11:x".to_string(),
+                mechanism: None,
             }),
             UnlockPin::Sss(SssPolicy {
                 threshold: 1,
