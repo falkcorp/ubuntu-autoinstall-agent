@@ -102,6 +102,8 @@ pub fn validate(groups: &[HostGroupProfile], profiles: &[HostProfile]) -> Result
 ///    (`tang_servers` non-empty OR `enroll_tpm2` true OR an authored
 ///    `unlock_sss` policy tree) — an install target with a disk plan but no
 ///    unlock factor at all is a host nobody can unlock after first boot.
+/// 6. (Not a separate entry — the decommission-policy check is documented and
+///    implemented inside rule 5's `InstallTarget` arm.)
 /// 7. `initramfs_type` must be `Dracut`. `InitramfsTools` is unsupported
 ///    fleet-wide — see [`InitramfsType::UNSUPPORTED_REASON`] for the
 ///    mechanism (no `initrd.target`, therefore no bounded fail-closed on a
