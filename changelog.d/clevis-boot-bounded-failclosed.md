@@ -39,3 +39,15 @@
   measurements behind that module, plus proof that interactive PKCS#11 PIN
   entry **does** work for the root device in the initramfs, and two upstream
   clevis bugs found on the way.
+
+### Measured
+
+- `clevis-luks-pkcs11-askpin` calls `systemd-ask-password` with no `--timeout`,
+  so each PIN query dies after systemd's 90 s default and clevis counts the
+  empty answer against `too_many_errors=3`. With zero keystrokes sent, a boot
+  fails at 99 s / 191 s / 283 s and prints `Too many errors !!!`, then falls
+  through to the unbounded plain-passphrase prompt. An operator therefore has
+  ~90 s per prompt, not the length of the outer deadline.
+- Both the PKCS#11 PIN query and the plain LUKS passphrase query are live on the
+  same console during cold recovery; keystrokes land on whichever systemd is
+  currently displaying.

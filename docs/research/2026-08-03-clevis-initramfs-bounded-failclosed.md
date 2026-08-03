@@ -140,6 +140,60 @@ to root unlock.
 transcript shows `Started clevis-luks-askpass.path` — that is the Tang/TPM2
 path, and it is not the one that prompts.)
 
+### Operator hazard: two live prompts compete for the same console
+
+During cold recovery both queries are pending at once and systemd's console
+agent shows them one at a time. Measured in run `B3`:
+
+```
+Please enter passphrase for disk rootluks (cryptroot): (press TAB for no echo)
+ERROR:Unknown error. Please, insert PIN for device with serial number:16cb4581ed58a6fb (UUID=…): (press TAB for no echo)
+```
+
+Keystrokes land on whichever query is currently displayed, so a PIN typed while
+the *passphrase* query has the console is consumed by the wrong prompt — and,
+because of the attempt accounting below, still costs the operator a PKCS#11
+attempt. In `B3` three PINs were typed and only two registered against the
+pkcs11 query. Runs `B6`/`B7` were both spoiled by this and are reported as
+inconclusive rather than as results.
+
+Operationally: at a physical console, read which prompt is on screen before
+typing, and expect to have to answer the passphrase query (with a deliberate
+wrong value, or by waiting it out) to get the PIN query back.
+
+### The tightest bound is not ours: `systemd-ask-password` defaults to 90 s
+
+`clevis-luks-pkcs11-askpin` calls `systemd-ask-password` with **no**
+`--timeout`, and the default is 90 s (`man systemd-ask-password`: "Defaults to
+90s"). An expired query returns empty, which clevis treats as a failed unlock
+and counts against its `too_many_errors=3` budget.
+
+Run `B7`, with **zero keystrokes sent** for the first 235 s:
+
+```
+[    7.381242] dracut-initqueue[623]: Detected PKCS11 device:
+[   99.070172] dracut-initqueue[623]: Could not unlock device:/dev/disk/by-uuid/80f22691-…
+[   99.336197] dracut-initqueue[623]: Detected PKCS11 device:
+[  191.295325] dracut-initqueue[623]: Could not unlock device:/dev/disk/by-uuid/80f22691-…
+[  191.684199] dracut-initqueue[623]: Detected PKCS11 device:
+[  283.420079] dracut-initqueue[623]: Could not unlock device:/dev/disk/by-uuid/80f22691-…
+[  283.456101] dracut-initqueue[623]: Too many errors !!!
+```
+
+~92 s apart, three times, then exhausted. Consequences:
+
+- An **operator has ~90 s per prompt**, not the length of the outer deadline.
+  The outer deadline is therefore never the binding constraint on a human
+  mid-entry — this is the honest answer to "must not fire while someone is
+  typing": something else fires first, and it is not ours.
+- An **unattended** host burns clevis's entire retry budget in ~283 s and then
+  falls through to the unbounded plain-passphrase prompt. That fall-through is
+  precisely what the outer deadline exists to catch.
+- The concurrently-developed `clevis-decrypt-pkcs11` fork sets
+  `systemd-ask-password --timeout=120` explicitly, which raises the per-prompt
+  budget to 120 s. **That constant and the outer deadline must be tuned
+  together.**
+
 ### Two upstream bugs found on the way
 
 1. **`clevis_detect_pkcs11_device` cannot use a non-default PKCS#11 module in
@@ -287,44 +341,69 @@ cryptroot UUID=<luks-uuid> /run/systemd/clevis-pkcs11.sock luks
 
 ```
 add_dracutmodules+=" uaa-unlock-deadline "
-uaa_unlock_deadline_sec=600
+uaa_unlock_deadline_sec=900
 ```
 
-### Why 600 s
+### Why 900 s
 
-- The measured successful unlock is ~30 s (non-interactive Tang path); in this
-  rig the PIN prompt appeared at 8.1 s and the unlock completed 1.5 s after the
-  PIN was submitted. 600 s is 20× that.
-- It must be an **outer** bound that exceeds the inner budget of the
-  concurrently-developed `clevis-decrypt-pkcs11` fork
-  (`docs/research/2026-08-03-clevis-pkcs11-multitoken-pin-fork.md`), which sets
-  `systemd-ask-password --timeout=120`, `UAA_MAX_TRIES=2` and `flock -w 300`.
-  Worst-case legitimate human time under those constants is ~240 s of prompts,
-  and a concurrent-`sss` share can wait up to 300 s on the lock. A 300 s outer
-  bound would leave no margin and would fire before their own retry logic
-  finished; 600 s clears it. **These two numbers must be changed together.**
-- With RPi POST + GRUB (~30–45 s), 600 s yields an unattended Tang-outage retry
-  roughly every 10–11 minutes. Fast enough that a Tang server coming back is
-  picked up within one cycle; slow enough not to be a reboot storm.
+This value is **arithmetic, not a measurement** — say so when quoting it. The
+outer deadline must be strictly larger than everything that legitimately runs
+inside it, or it pre-empts the recovery it exists to protect.
 
-### "Is a human typing?" — honest answer: partly, and we do not use it
+- Measured successful unlock is ~30 s (non-interactive Tang path); in this rig
+  the PIN prompt appeared at 8.1 s and the unlock completed 1.5 s after the PIN
+  was submitted. Any bound in this range is two orders of magnitude above the
+  happy path, so the happy path does not constrain the choice.
+- The inner budget does. clevis gives the operator `too_many_errors=3` prompts,
+  each capped by `systemd-ask-password`. At the stock 90 s default that is
+  ~283 s (measured, run `B7`). With the concurrent fork's
+  `--timeout=120`/`UAA_MAX_TRIES=2` and `flock -w 300`
+  (`docs/research/2026-08-03-clevis-pkcs11-multitoken-pin-fork.md`) the
+  worst case is ~240 s of prompts plus up to 300 s of lock wait, i.e. ~540 s
+  before their logic gives up on its own.
+- 600 s clears that by only ~60 s, which is not margin — it is a coin flip
+  against detection overhead and a slow POST. **600 s was considered and
+  rejected on this arithmetic.** 900 s leaves ~360 s of headroom over the
+  fork's worst case, still fits inside a single unattended retry cycle, and with
+  RPi POST + GRUB (~30–45 s) yields a Tang-outage retry roughly every 16
+  minutes — fast enough to pick up a Tang server that came back, slow enough not
+  to be a reboot storm.
+- **These constants must be changed together.** If the fork's per-prompt timeout
+  or try count moves, recompute this number.
+
+### "Is a human typing?" — honest answer: the question is moot here
 
 `JobTimeoutSec` is a fixed wall clock from the `initrd.target` job start. **It
-cannot be reset.** It will fire on an operator who walks up at minute 9 and
-types slowly. The consequence is a reboot and a fresh prompt about a minute
-later, not a lockout, which is why the value is sized generously instead of made
-adaptive.
+cannot be reset**, and it cannot distinguish a person thinking at minute 12 from
+an empty room.
 
-A reset-capable variant is possible: a watchdog could stat the newest
-`/run/systemd/ask-password/ask.*` (a new file means a query was answered and
-re-armed) or the fork's `${PIN_FILE}.${UAA_ID}.tries` file, and restart its
-timer on each **submitted attempt**. That detects attempts only — it still
-cannot distinguish a person mid-keystroke on their *first* attempt from an empty
-room, which is the case that actually matters. It was rejected here because a
-bespoke watchdog process that survives `switch-root` could reboot a healthy
-machine, and `JobTimeoutSec` is systemd-native and structurally cannot leak past
-the initramfs. Do not read the console tty to detect keystrokes: the password
-prompt owns it in raw mode and a second reader steals input.
+That turns out not to matter, because **it is never the constraint a human hits
+first**. `systemd-ask-password` closes each individual query after 90 s (120 s
+with the fork), and clevis allows three of them. An operator who cannot answer
+within a single 90/120 s query has already lost that attempt to a timeout that
+is not ours, long before the outer deadline is anywhere near. Sizing the outer
+bound above the whole inner budget is therefore sufficient; making it adaptive
+would buy nothing.
+
+A reset-capable variant was considered and rejected: a watchdog could stat the
+newest `/run/systemd/ask-password/ask.*` (a new file means a query was answered
+and re-armed) or the fork's `${PIN_FILE}.${UAA_ID}.tries` file and restart its
+timer on each **submitted attempt**. It detects attempts only, still cannot see
+a person mid-keystroke on their first one, and a bespoke watchdog process that
+survived `switch-root` could reboot a healthy machine. `JobTimeoutSec` is
+systemd-native and structurally cannot leak past the initramfs. Do not read the
+console tty to detect keystrokes: the password prompt owns it in raw mode and a
+second reader steals input.
+
+### Late-but-legitimate entry: attempted, inconclusive
+
+Runs `B6` (180 s deadline, PIN at 150 s) and `B7` (300 s deadline, PIN at 235 s)
+were intended to prove that a PIN typed late in the window still unlocks. Both
+were spoiled by the two-prompt race and by the 90 s query expiry described
+above: by the time the PIN was typed, the pkcs11 query the operator was aiming
+at had already been re-armed at least once, and the keystrokes did not land on
+it. **Not proven either way.** What *is* proven (run `B2`) is that a PIN
+answered while its query is live unlocks and the deadline does not disturb it.
 
 ## Not determined
 

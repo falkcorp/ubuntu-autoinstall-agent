@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: dracut/92uaa-unlock-deadline/module-setup.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 8b2f6d14-0e77-4a3c-9d51-6f4c8a2b7e93
 # last-edited: 2026-08-03
 #
@@ -44,21 +44,40 @@
 #   PIN prompt -- an unattended retry loop).
 #
 # HONEST LIMITATION: JobTimeoutSec is a fixed wall clock measured from the
-# initrd.target job start. It CANNOT be reset by "a human is typing". It will
-# fire on someone who walks up at minute 9 and types slowly. The consequence is
-# a reboot and a fresh prompt about a minute later, not a lockout -- which is
-# why the value is sized generously rather than made adaptive. See the research
-# doc for the alternatives that were considered and rejected.
+# initrd.target job start. It CANNOT be reset by "a human is typing".
+#
+# That turns out not to matter, because it is never the constraint a human hits
+# first. `clevis-luks-pkcs11-askpin` calls systemd-ask-password with no
+# --timeout, whose default is 90 s; an expired query returns empty and clevis
+# counts it against too_many_errors=3. Measured with ZERO keystrokes sent
+# (run B7): failures at 99 s / 191 s / 283 s, ~92 s apart, then
+# "Too many errors !!!". So an operator gets ~90 s per prompt (120 s under the
+# UAA clevis-decrypt-pkcs11 fork) regardless of this deadline, and an
+# unattended host exhausts clevis in ~283 s and then falls through to the
+# UNBOUNDED plain-passphrase prompt -- which is exactly what this module
+# catches. Sizing the deadline above the whole inner budget is sufficient;
+# making it adaptive would buy nothing. See the research doc.
 
 # Deadline in seconds. Override from dracut.conf.d with
-#   uaa_unlock_deadline_sec=900
-# See the research doc for why 600 is the default.
-: "${uaa_unlock_deadline_sec:=600}"
+#   uaa_unlock_deadline_sec=600
+# See the research doc for why 900 is the default: it must exceed clevis's own
+# inner budget (3 prompts x systemd-ask-password's 90 s default = ~283 s
+# measured; ~540 s worst case with the UAA clevis-decrypt-pkcs11 fork's 120 s
+# per-prompt timeout and flock -w 300), or the outer bound pre-empts the very
+# recovery it exists to protect.
+: "${uaa_unlock_deadline_sec:=900}"
 
 # dracut hook: decide whether to include this module.
 check() {
     # No host prerequisites -- a deadline is useful on any encrypted root.
-    # Included only when explicitly listed in add_dracutmodules.
+    # 255 == "usable, but never pulled in by default": the module lands ONLY
+    # when something asks for it. VERIFIED on dracut 110-11, because a module
+    # that auto-included itself would silently put a reboot deadline into every
+    # len-serv rebuild, which must stay byte-identical:
+    #   hostonly="no"  build, module present on disk, not requested -> absent
+    #   hostonly="yes" build, module present on disk, not requested -> absent
+    #   -a uaa-unlock-deadline                                      -> present,
+    #     and 10-uaa-unlock-deadline.conf is in the image
     return 255
 }
 
