@@ -352,6 +352,26 @@ pub fn count_shares(pins: &serde_json::Map<String, serde_json::Value>) -> usize 
 /// greater than the number of shares, missing `t`/`pins`) — such a policy can
 /// never unlock unattended, so it fails closed rather than scoring 0.
 pub fn min_satisfying_shares(policy: &serde_json::Value) -> std::result::Result<usize, String> {
+    min_satisfying_shares_at(policy, 0)
+}
+
+/// Deepest policy tree this module will evaluate.
+///
+/// The settled policy is 3 levels. The input is the JSON `clevis luks list`
+/// printed from the host under test, so an absurdly deep tree must return a
+/// `CheckResult::fail` — the module's contract is to fail CLOSED, and a stack
+/// overflow aborts the process instead.
+const MAX_POLICY_DEPTH: usize = 8;
+
+fn min_satisfying_shares_at(
+    policy: &serde_json::Value,
+    depth: usize,
+) -> std::result::Result<usize, String> {
+    if depth > MAX_POLICY_DEPTH {
+        return Err(format!(
+            "policy nests deeper than {MAX_POLICY_DEPTH} levels — refusing to evaluate"
+        ));
+    }
     let obj = policy
         .as_object()
         .ok_or_else(|| "sss policy is not a JSON object".to_string())?;
@@ -376,7 +396,7 @@ pub fn min_satisfying_shares(policy: &serde_json::Value) -> std::result::Result<
         };
         for entry in entries {
             if key == "sss" {
-                costs.push(min_satisfying_shares(entry)?);
+                costs.push(min_satisfying_shares_at(entry, depth + 1)?);
             } else {
                 costs.push(1);
             }
@@ -446,6 +466,13 @@ fn collect_tang_urls(value: &serde_json::Value, out: &mut Vec<String>) {
 /// - `"sss"` arrays are never flattened: each element is a real group whose cost
 ///   is computed on its own.
 fn lint_flattened_groups(policy: &serde_json::Value, path: &str) -> std::result::Result<(), String> {
+    // Same depth bound as `min_satisfying_shares`, and for the same reason: this
+    // runs FIRST, on JSON read off the host under test.
+    if path.matches("/sss[").count() > MAX_POLICY_DEPTH {
+        return Err(format!(
+            "policy nests deeper than {MAX_POLICY_DEPTH} levels — refusing to evaluate"
+        ));
+    }
     let Some(pins) = policy.get("pins").and_then(|p| p.as_object()) else {
         return Ok(());
     };
@@ -1189,16 +1216,39 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// volume.
     #[test]
     fn clevis_binding_accepts_and_of_tpm2_and_a_single_tang_group() {
-        let policy = "1: sss '{\"t\":2,\"pins\":{\"tpm2\":[{\"pcr_ids\":\"7\"}],\"sss\":[{\"t\":1,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'";
+        let policy = serde_json::json!({
+            "t": 2,
+            "pins": {
+                "tpm2": [{"pcr_ids": "7"}],
+                "sss": [{"t": 1, "pins": {"tang": [
+                    tang_entry(PEER_A, 0), tang_entry(PEER_B, 1),
+                ]}}],
+            }
+        });
         assert_eq!(
-            min_satisfying_shares(&policy_of(
-                &policy[policy.find('{').unwrap()..policy.rfind('}').unwrap() + 1]
-            )),
+            min_satisfying_shares(&policy),
             Ok(2),
             "tpm2 + one Tang = two factors"
         );
-        let r = evaluate_clevis_binding(policy);
+        let r = evaluate_clevis_binding(&clevis_line(&policy));
         assert!(r.passed, "{}", r.detail);
+    }
+
+    /// The policy JSON is read off the host under test, so a pathologically
+    /// deep tree must produce a FAILED check — not a stack overflow, which
+    /// aborts the process instead of failing closed.
+    #[test]
+    fn clevis_binding_fails_closed_on_a_pathologically_deep_policy() {
+        // Deeper than MAX_POLICY_DEPTH, but under serde_json's own 128-level
+        // parse limit — otherwise this would prove the parser fails closed
+        // rather than proving OUR guard does.
+        let mut policy = tang_group(2);
+        for _ in 0..40 {
+            policy = serde_json::json!({"t": 1, "pins": {"sss": [policy]}});
+        }
+        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        assert!(!r.passed, "{}", r.detail);
+        assert!(r.detail.contains("nests deeper"), "{}", r.detail);
     }
 
     #[test]
