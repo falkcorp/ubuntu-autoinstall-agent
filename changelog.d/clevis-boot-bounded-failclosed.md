@@ -23,3 +23,19 @@
   installs only the shim, so the initramfs printed
   `loading "libpcsclite_real.so.1" failed` / `No slots.` and pcscd could
   enumerate no readers. Measured 2026-08-03 in the root-LUKS gate VM.
+
+### Added
+
+- `dracut/92uaa-unlock-deadline` — a dracut module that puts a hard deadline on
+  the whole initramfs (`JobTimeoutSec=` + `JobTimeoutAction=reboot-force` as a
+  drop-in on `initrd.target`) so a clevis unlock that cannot be satisfied
+  **reboots and retries** instead of sitting at an interactive prompt forever.
+  A 902 s unbounded hang was measured previously with both
+  `x-systemd.device-timeout=90` and `rd.timeout=120` set; neither governs an
+  ask-password wait. Requires `rd.shell=0 rd.emergency=reboot` on the kernel
+  cmdline — without it dracut's emergency shell cancels the `initrd.target` job
+  and the deadline never fires. Boot-proven in a root-on-LUKS VM.
+- `docs/research/2026-08-03-clevis-initramfs-bounded-failclosed.md` — the
+  measurements behind that module, plus proof that interactive PKCS#11 PIN
+  entry **does** work for the root device in the initramfs, and two upstream
+  clevis bugs found on the way.
