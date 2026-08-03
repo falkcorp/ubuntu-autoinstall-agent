@@ -1,5 +1,5 @@
 <!-- file: docs/research/2026-08-03-clevis-pkcs11-multitoken-pin-fork.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 2b7f14ce-9a03-4d6b-8e52-c1806f3ad947 -->
 <!-- last-edited: 2026-08-03 -->
 
@@ -152,9 +152,30 @@ SoftHSM2 tokens `nano` / `carriedA` / `carriedB` with PINs `111111` / `222222` /
 | **P2-RED** | bind WITH `pin-value=` | PIN present in header | **PRESENT** | `111111`, `222222`, `333333` and the literal `pin-value` all recovered from `cryptsetup luksDump --dump-json-metadata` after recursive base64url decoding. No passphrase used. |
 | **P2** | bind WITHOUT `pin-value=` | PIN absent | **ABSENT** | Same probe over the same 28 KB decoded blob: all four needles absent, plaintext and base64. |
 
-Bounded-retry check: three consecutive interactive attempts with an agent that
-always answers wrongly produced **4 prompts total across 2 tokens** — exactly
-the cap of 2 per token — then stopped prompting.
+**Bounded-retry check** (this is the PIV-lockout bound, so it is measured
+per token, not in aggregate). Four consecutive interactive attempts with an
+agent that always answers wrongly:
+
+| Attempt | wrong-PIN logins on `carriedA` | on `carriedB` | stderr |
+|---|---|---|---|
+| 1 | 1 | 1 | `Invalid PIN?` + `CKR_PIN_INCORRECT` |
+| 2 | 2 | 2 | as above |
+| 3 | 2 | 2 | `PIN attempts exhausted for PKCS#11 token 'carriedA'` / `'carriedB'` |
+| 4 | 2 | 2 | as above |
+
+Exactly **two** wrong-PIN `C_Login` calls per token, then a hard stop with no
+further prompt. On a PIV token with a 3-strike counter that leaves one retry.
+
+**`2>/dev/null` on a bare `exec` is a stderr trap** and was caught here: the
+first version of the lock line was `exec 9>"${PIN_FILE}.lock" 2>/dev/null && …`.
+`exec` with no command applies its redirections to the *current shell*, so that
+silently discarded every diagnostic below it — `Invalid PIN?`, the `pkcs11-tool`
+error text, `PIN attempts exhausted` — for the rest of the script. The symptom
+in the table above was `exhausted_msgs=0` on a run that had definitely
+exhausted. Fixed by scoping the redirect to a brace group, which is not a
+subshell, so fd 9 still persists:
+`{ exec 9>"${PIN_FILE}.lock"; } 2>/dev/null || :`. If you ever touch that line,
+re-run the wrong-PIN rows and confirm the messages are still *loud*.
 
 Initramfs check: `dracut -f` rc=0 with 0 error lines; the initramfs copy of
 `usr/bin/clevis-decrypt-pkcs11` has sha256
@@ -218,6 +239,11 @@ The vehicle already exists: `dracut/91uaa-keystore-wait/` is embedded with
 
 ## What is NOT proven
 
+- **`clevis/clevis-luks-pkcs11-askpin` was never executed.** It is `bash -n`
+  syntax-checked only. Every gate row calls `clevis decrypt` directly, which
+  bypasses askpin entirely, so the retry / `errors` / `continue` flow that
+  surrounds the deleted 5 lines is completely unexercised. **Test this first
+  next session.**
 - **No boot-time proof.** Everything above is userspace on a running guest. The
   boot path adds dracut's `initqueue/settled` hook, the AF_UNIX control socket
   and a real console password agent. A boot row cannot be driven by the existing
@@ -232,7 +258,7 @@ The vehicle already exists: `dracut/91uaa-keystore-wait/` is embedded with
   is a proposal; no Rust changed in this branch.
 - **No hardware.** Nothing was bound or tested on `len-serv-*`, the RPis or U1.
 - One early interactive run logged **3** logins instead of 2 (an extra login
-  with the already-cached correct PIN). It did not reproduce across five
-  subsequent runs. A duplicate login with a *correct* cached PIN does not
-  decrement a PIV counter, so it is benign, but it is recorded here rather than
-  swept up.
+  with the already-cached *correct* PIN). It did not reproduce across six
+  subsequent runs, all of which were a stable 2 prompts / 2 logins. A duplicate
+  login with a correct cached PIN does not decrement a PIV counter, so it is
+  benign, but it is recorded here rather than swept up.

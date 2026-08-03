@@ -1,5 +1,5 @@
 <!-- file: changelog.d/clevis-pkcs11-multitoken-pin-fork.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 6d1a3f92-84be-4c07-a5d1-30e9b7c2418f -->
 <!-- last-edited: 2026-08-03 -->
 
