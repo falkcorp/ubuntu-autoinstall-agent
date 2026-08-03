@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/disk_ops.rs
-// version: 2.6.0
+// version: 2.7.0
 // guid: sshdisk1-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-23
+// last-edited: 2026-08-03
 
 //! Disk operations for SSH installation
 
@@ -9,6 +9,7 @@ use super::config::InstallationConfig;
 use super::installer::WipeAuthorization;
 use super::partitions::partition_path;
 use crate::network::CommandExecutor;
+use crate::security::luks::LUKS2_FORMAT_HEADER_FLAGS;
 use crate::Result;
 use tracing::info;
 
@@ -548,10 +549,15 @@ impl<'a> DiskManager<'a> {
     // the passphrase — so the secret cannot leak through the command string.
 
     /// Build the `cryptsetup luksFormat` command using a keyfile.
+    ///
+    /// Carries [`LUKS2_FORMAT_HEADER_FLAGS`] because the metadata area size is
+    /// fixed at format time and cannot be raised afterwards — a default 16 KiB
+    /// header silently caps how large a clevis binding this volume can ever
+    /// hold. See that constant for the measurements.
     fn build_luks_format_cmd(part: &str, key_path: &str) -> String {
         format!(
-            "cryptsetup luksFormat --batch-mode --key-file {} {}",
-            key_path, part
+            "cryptsetup luksFormat {} --batch-mode --key-file {} {}",
+            LUKS2_FORMAT_HEADER_FLAGS, key_path, part
         )
     }
 
@@ -590,12 +596,43 @@ mod tests {
         let cmd =
             DiskManager::build_luks_format_cmd("/dev/nvme0n1p4", DiskManager::LUKS_SETUP_KEY_PATH);
         // Happy path preserved: still formats the same partition, now via keyfile.
-        assert!(cmd.contains("luksFormat --batch-mode"));
+        assert!(cmd.contains("luksFormat "));
+        assert!(cmd.contains("--batch-mode"));
         assert!(cmd.contains("--key-file /run/.uaa-luks-setup.key"));
         assert!(cmd.contains("/dev/nvme0n1p4"));
         // The secret channel is closed: no echo-pipe interpolation.
         assert!(!cmd.contains("echo"));
         assert!(!cmd.contains('\n'));
+    }
+
+    /// The rpool LUKS partition must be formatted with a 1 MiB metadata area.
+    ///
+    /// This is a FORMAT-TIME-ONLY property: `cryptsetup` offers no way to grow
+    /// the metadata area of an existing header, so a host installed without
+    /// this flag can never hold the fleet's ~22 KB nested-`sss` binding and
+    /// must be reinstalled. Measured: with the default 16 KiB area a 22064-byte
+    /// token import fails with `Failed to import token from file.`; with `1m`
+    /// it succeeds, and the payload offset is unchanged at 16 MiB.
+    #[test]
+    fn test_build_luks_format_cmd_sets_luks2_metadata_size() {
+        let cmd =
+            DiskManager::build_luks_format_cmd("/dev/nvme0n1p4", DiskManager::LUKS_SETUP_KEY_PATH);
+        assert!(
+            cmd.contains("--luks2-metadata-size 1m"),
+            "luksFormat must reserve a 1 MiB metadata area or the nested-sss \
+             clevis binding will not fit: {cmd}"
+        );
+        assert!(
+            cmd.contains("--type luks2"),
+            "the metadata-size flag is LUKS2-only; state the type explicitly: {cmd}"
+        );
+        // Measured: raising the keyslots area MOVES the payload offset
+        // (16 MiB -> 6 MiB) for no benefit. Do not add it.
+        assert!(
+            !cmd.contains("--luks2-keyslots-size"),
+            "keyslots area must be left at its default — raising it changes the \
+             data offset: {cmd}"
+        );
     }
 
     #[test]

@@ -268,7 +268,8 @@ fn to_arr32(bytes: &[u8]) -> Option<[u8; 32]> {
 /// concurrent appends serialize on the tip row instead of forking the chain;
 /// `test_pg_tip_sql_has_for_update` asserts it textually. Never executed by
 /// `cargo test` — [`PgAuditStore`] requires a live CockroachDB connection.
-const SQL_SELECT_TIP: &str = "SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1 FOR UPDATE";
+const SQL_SELECT_TIP: &str =
+    "SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1 FOR UPDATE";
 const SQL_SELECT_ONE_TIP: &str = "SELECT seq, hash FROM audit_events ORDER BY seq DESC LIMIT 1";
 const SQL_INSERT_EVENT: &str = "INSERT INTO audit_events \
     (at, actor, role, action, target, outcome, detail, prev_hash, hash) \
@@ -292,7 +293,9 @@ pub struct PgAuditStore {
 }
 
 impl PgAuditStore {
-    async fn connect(&self) -> anyhow::Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+    async fn connect(
+        &self,
+    ) -> anyhow::Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
         let (client, connection) =
             tokio_postgres::connect(&self.conninfo, tokio_postgres::NoTls).await?;
         let handle = tokio::spawn(async move {
@@ -456,7 +459,10 @@ pub struct BackfillArgs {
 
 /// Runs [`backfill`] from parsed CLI args — the body of the `audit backfill`
 /// subcommand, exposed here so `main.rs`'s clap wiring is a one-line call.
-pub async fn run_backfill(store: &dyn AuditStore, args: BackfillArgs) -> anyhow::Result<AuditEventRow> {
+pub async fn run_backfill(
+    store: &dyn AuditStore,
+    args: BackfillArgs,
+) -> anyhow::Result<AuditEventRow> {
     backfill(
         store,
         args.actor,
@@ -657,9 +663,17 @@ mod tests {
     #[tokio::test]
     async fn test_genesis_prev_hash_is_zero() {
         let store = MemAuditStore::new();
-        let row = record(&store, "alice", "operator", "test.action", None, "success", None)
-            .await
-            .unwrap();
+        let row = record(
+            &store,
+            "alice",
+            "operator",
+            "test.action",
+            None,
+            "success",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(row.seq, 1);
         assert_eq!(row.prev_hash, GENESIS_PREV_HASH.to_vec());
     }
@@ -667,9 +681,15 @@ mod tests {
     #[tokio::test]
     async fn test_append_links_prev_hash() {
         let store = MemAuditStore::new();
-        let e1 = record(&store, "a", "operator", "act1", None, "ok", None).await.unwrap();
-        let e2 = record(&store, "a", "operator", "act2", None, "ok", None).await.unwrap();
-        let e3 = record(&store, "a", "operator", "act3", None, "ok", None).await.unwrap();
+        let e1 = record(&store, "a", "operator", "act1", None, "ok", None)
+            .await
+            .unwrap();
+        let e2 = record(&store, "a", "operator", "act2", None, "ok", None)
+            .await
+            .unwrap();
+        let e3 = record(&store, "a", "operator", "act3", None, "ok", None)
+            .await
+            .unwrap();
 
         assert_eq!(e1.prev_hash, GENESIS_PREV_HASH.to_vec());
         assert_eq!(e2.prev_hash, e1.hash, "e2 must link to e1's hash");
@@ -727,7 +747,9 @@ mod tests {
     #[tokio::test]
     async fn test_verify_detects_tamper() {
         let store = MemAuditStore::new();
-        record(&store, "a", "operator", "act1", None, "ok", None).await.unwrap();
+        record(&store, "a", "operator", "act1", None, "ok", None)
+            .await
+            .unwrap();
         record(
             &store,
             "a",
@@ -739,7 +761,9 @@ mod tests {
         )
         .await
         .unwrap();
-        record(&store, "a", "operator", "act3", None, "ok", None).await.unwrap();
+        record(&store, "a", "operator", "act3", None, "ok", None)
+            .await
+            .unwrap();
 
         let mut events = store.list_events(0).await.unwrap();
         // Tamper the middle event's detail WITHOUT recomputing its hash.
@@ -768,14 +792,20 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_signs_tip() {
         let store = MemAuditStore::new();
-        record(&store, "a", "operator", "act1", None, "ok", None).await.unwrap();
-        let last = record(&store, "a", "operator", "act2", None, "ok", None).await.unwrap();
+        record(&store, "a", "operator", "act1", None, "ok", None)
+            .await
+            .unwrap();
+        let last = record(&store, "a", "operator", "act2", None, "ok", None)
+            .await
+            .unwrap();
 
         let dir = tempdir().unwrap();
         let signing_key = load_or_create_audit_key(dir.path()).unwrap();
         let verifying_key = signing_key.verifying_key();
 
-        let checkpoint = daily_checkpoint(&store, &signing_key, "2026-07-10").await.unwrap();
+        let checkpoint = daily_checkpoint(&store, &signing_key, "2026-07-10")
+            .await
+            .unwrap();
         assert_eq!(checkpoint.tip_seq, last.seq);
         assert_eq!(checkpoint.tip_hash, last.hash);
 
@@ -792,7 +822,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let signing_key = load_or_create_audit_key(dir.path()).unwrap();
 
-        let err = daily_checkpoint(&store, &signing_key, "2026-07-10").await.unwrap_err();
+        let err = daily_checkpoint(&store, &signing_key, "2026-07-10")
+            .await
+            .unwrap_err();
         assert_eq!(
             err.downcast_ref::<CheckpointError>(),
             Some(&CheckpointError::EmptyChain),
@@ -826,7 +858,10 @@ mod tests {
             row.action.starts_with("backfill:"),
             "backfill action must be prefixed"
         );
-        assert_eq!(row.seq, 2, "backfill goes through the SAME serialized append (no side door)");
+        assert_eq!(
+            row.seq, 2,
+            "backfill goes through the SAME serialized append (no side door)"
+        );
 
         let all = store.list_events(0).await.unwrap();
         assert!(verify_chain(&all).is_ok());

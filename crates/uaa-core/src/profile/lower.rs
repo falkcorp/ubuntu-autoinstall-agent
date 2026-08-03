@@ -148,10 +148,7 @@ pub fn lower(resolved: &InstallationConfigPartial) -> InstallationConfig {
 /// and total, so a disagreement between the two is a validate-layer concern
 /// (PS-VALIDATE-14), not an error here.
 fn lower_unlock_sss(resolved: &InstallationConfigPartial) -> Option<SssPolicy> {
-    resolved
-        .unlock_policy
-        .as_ref()
-        .and_then(|u| u.sss.clone())
+    resolved.unlock_policy.as_ref().and_then(|u| u.sss.clone())
 }
 
 /// Lowers the `network` component (falling back to the flat

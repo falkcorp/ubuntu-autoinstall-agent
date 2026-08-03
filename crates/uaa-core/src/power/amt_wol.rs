@@ -351,15 +351,13 @@ mod tests {
     #[tokio::test]
     async fn test_amt_denies_unimatrixone_on() {
         let mut mock = MockExecutor::new(&[]);
-        let result =
-            run_amt_action(&mut mock, "unimatrixone", Some(SECRET), PowerAction::On).await;
+        let result = run_amt_action(&mut mock, "unimatrixone", Some(SECRET), PowerAction::On).await;
         let err = result.expect_err("unimatrixone power-on must be denied");
         assert!(err.to_string().contains("unimatrixone"));
         assert_eq!(mock.recorded.len(), 0);
 
         let mut mock = MockExecutor::new(&[]);
-        let result =
-            run_amt_action(&mut mock, "UNIMATRIXONE", Some(SECRET), PowerAction::On).await;
+        let result = run_amt_action(&mut mock, "UNIMATRIXONE", Some(SECRET), PowerAction::On).await;
         let err = result.expect_err("uppercase UNIMATRIXONE power-on must also be denied");
         assert!(err.to_string().to_lowercase().contains("unimatrixone"));
         assert_eq!(mock.recorded.len(), 0);
@@ -423,13 +421,23 @@ mod tests {
     async fn test_amt_status_happy_path() {
         // Anti-over-suppression: a legitimate Status request against a
         // non-denied host must flow through every guard and return Ok.
-        let status_cmd =
-            build_amt_power_command("some-intel-host", AMT_DEFAULT_USERNAME, SECRET, PowerAction::Status)
-                .unwrap();
-        let mut mock = MockExecutor::new(&[(status_cmd.as_str(), "<p:PowerState>2</p:PowerState>")]);
+        let status_cmd = build_amt_power_command(
+            "some-intel-host",
+            AMT_DEFAULT_USERNAME,
+            SECRET,
+            PowerAction::Status,
+        )
+        .unwrap();
+        let mut mock =
+            MockExecutor::new(&[(status_cmd.as_str(), "<p:PowerState>2</p:PowerState>")]);
 
-        let result =
-            run_amt_action(&mut mock, "some-intel-host", Some(SECRET), PowerAction::Status).await;
+        let result = run_amt_action(
+            &mut mock,
+            "some-intel-host",
+            Some(SECRET),
+            PowerAction::Status,
+        )
+        .await;
         assert_eq!(result.unwrap(), "<p:PowerState>2</p:PowerState>");
         assert_eq!(mock.recorded, vec![status_cmd]);
     }

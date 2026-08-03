@@ -199,10 +199,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// non-canonical signatures / small-order points) rather than plain
 /// `verify` — appropriate for a security-critical signature gate.
 fn verify_dual(msg: &[u8], sig_b64: &str, pubkeys: &[VerifyingKey; 2]) -> Result<bool> {
-    let raw = base64_decode(sig_b64)
-        .map_err(|e| AutoInstallError::ValidationError(format!("signature is not valid base64: {e}")))?;
-    let signature = Signature::from_slice(&raw)
-        .map_err(|e| AutoInstallError::ValidationError(format!("signature has invalid length: {e}")))?;
+    let raw = base64_decode(sig_b64).map_err(|e| {
+        AutoInstallError::ValidationError(format!("signature is not valid base64: {e}"))
+    })?;
+    let signature = Signature::from_slice(&raw).map_err(|e| {
+        AutoInstallError::ValidationError(format!("signature has invalid length: {e}"))
+    })?;
     Ok(pubkeys
         .iter()
         .any(|pk| pk.verify_strict(msg, &signature).is_ok()))
@@ -446,10 +448,9 @@ mod tests {
                 .lock()
                 .expect("mock mutex poisoned")
                 .push(url.to_string());
-            self.payloads
-                .get(url)
-                .cloned()
-                .ok_or_else(|| AutoInstallError::NetworkError(format!("mock: no payload for {url}")))
+            self.payloads.get(url).cloned().ok_or_else(|| {
+                AutoInstallError::NetworkError(format!("mock: no payload for {url}"))
+            })
         }
     }
 
@@ -457,7 +458,13 @@ mod tests {
         SigningKey::generate(&mut OsRng)
     }
 
-    fn entry(name: &str, version: &str, target: &str, bytes: &[u8], key: &SigningKey) -> BinaryEntry {
+    fn entry(
+        name: &str,
+        version: &str,
+        target: &str,
+        bytes: &[u8],
+        key: &SigningKey,
+    ) -> BinaryEntry {
         let digest = hex_encode(&Sha256::digest(bytes));
         let sig: Signature = key.sign(bytes);
         BinaryEntry {
@@ -556,10 +563,7 @@ mod tests {
         let fetcher = MockFetcher::new()
             .with("https://manifest.invalid/manifest.json", manifest_bytes)
             .with("https://manifest.invalid/manifest.json.sig", sig_bytes)
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let outcome = self_update(
             &current,
@@ -580,13 +584,7 @@ mod tests {
         let artifact = b"binary-v1".to_vec();
 
         for entry_version in ["1.0.0", "0.9.0"] {
-            let entries = vec![entry(
-                "uaa-agent",
-                entry_version,
-                "x86_64",
-                &artifact,
-                &key,
-            )];
+            let entries = vec![entry("uaa-agent", entry_version, "x86_64", &artifact, &key)];
             let (manifest_bytes, sig_bytes) = signed_manifest(entries, "0.1.0", &key);
 
             let dir = tempdir().expect("tempdir");
@@ -652,13 +650,7 @@ mod tests {
         // min_version floor -> hard Err, never applied.
         {
             let artifact_13 = b"binary-v1.3".to_vec();
-            let entries = vec![entry(
-                "uaa-agent",
-                "1.3.0",
-                "x86_64",
-                &artifact_13,
-                &key,
-            )];
+            let entries = vec![entry("uaa-agent", "1.3.0", "x86_64", &artifact_13, &key)];
             let (manifest_bytes, sig_bytes) = signed_manifest(entries, "2.0.0", &key);
 
             let dir = tempdir().expect("tempdir");
@@ -702,10 +694,7 @@ mod tests {
         let fetcher = MockFetcher::new()
             .with("https://manifest.invalid/manifest.json", manifest_bytes)
             .with("https://manifest.invalid/manifest.json.sig", sig_bytes)
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let result = self_update(
             &current,
@@ -717,7 +706,11 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().to_lowercase().contains("sha256"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .to_lowercase()
+            .contains("sha256"));
         assert!(!install_path.with_extension("new").exists());
     }
 
@@ -750,10 +743,7 @@ mod tests {
         let fetcher = MockFetcher::new()
             .with("https://manifest.invalid/manifest.json", manifest_bytes)
             .with("https://manifest.invalid/manifest.json.sig", sig_bytes)
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let result = self_update(
             &current,
@@ -791,10 +781,7 @@ mod tests {
                 "https://manifest.invalid/manifest.json.sig",
                 sig_bytes.clone(),
             )
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let outcome = self_update(
             &current,
@@ -807,7 +794,10 @@ mod tests {
         .expect("held is not an error");
 
         assert_eq!(outcome, UpdateOutcome::Held);
-        assert!(fetcher.calls().is_empty(), "hold must be checked before any fetch");
+        assert!(
+            fetcher.calls().is_empty(),
+            "hold must be checked before any fetch"
+        );
 
         // StageOnly ignores the hold and stages normally.
         let outcome = self_update(
@@ -840,10 +830,7 @@ mod tests {
         let fetcher = MockFetcher::new()
             .with("https://manifest.invalid/manifest.json", manifest_bytes)
             .with("https://manifest.invalid/manifest.json.sig", sig_bytes)
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let outcome = self_update(
             &current,
@@ -885,10 +872,7 @@ mod tests {
         let fetcher = MockFetcher::new()
             .with("https://manifest.invalid/manifest.json", manifest_bytes)
             .with("https://manifest.invalid/manifest.json.sig", sig_bytes)
-            .with(
-                "https://example.invalid/uaa-agent-2.0.0",
-                artifact.clone(),
-            );
+            .with("https://example.invalid/uaa-agent-2.0.0", artifact.clone());
 
         let outcome = self_update(
             &current,

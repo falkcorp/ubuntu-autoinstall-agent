@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.5.1
+// version: 1.5.2
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
-// last-edited: 2026-08-02
+// last-edited: 2026-08-03
 
 //! Validation logic for `HostGroupProfile` / `HostProfile` (DS-PRF-03).
 //!
@@ -966,7 +966,7 @@ mod tests {
             pins: vec![UnlockPin::Sss(SssPolicy {
                 threshold: 4,
                 pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
                     mechanism: None,
                 })],
             })],
@@ -983,8 +983,11 @@ mod tests {
         cfg.unlock_sss = Some(SssPolicy::fleet_three_group(
             &["http://172.16.2.45", "http://172.16.2.46"],
             2,
-            "pkcs11:serial=NANO0001",
-            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            "pkcs11:serial=NANO0001;token=TOKNANO0001",
+            &[
+                "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A",
+                "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B",
+            ],
             2,
             None,
         ));

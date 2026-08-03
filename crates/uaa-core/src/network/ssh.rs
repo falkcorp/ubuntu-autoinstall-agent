@@ -138,7 +138,10 @@ impl SshClient {
         // live installer env grants NOPASSWD sudo to that user. Root needs none.
         self.sudo = username != "root";
         if self.sudo {
-            info!("Non-root login '{}': commands will run via sudo -n", username);
+            info!(
+                "Non-root login '{}': commands will run via sudo -n",
+                username
+            );
         }
 
         info!("SSH connection established to {}", host);
@@ -541,7 +544,10 @@ mod tests {
 
     #[test]
     fn test_wrap_sudo_disabled_is_passthrough() {
-        assert_eq!(wrap_sudo(false, "zpool create rpool /dev/mapper/luks"), "zpool create rpool /dev/mapper/luks");
+        assert_eq!(
+            wrap_sudo(false, "zpool create rpool /dev/mapper/luks"),
+            "zpool create rpool /dev/mapper/luks"
+        );
     }
 
     #[test]

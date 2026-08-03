@@ -1108,7 +1108,11 @@ mod tests {
         ];
         for (host, disk, addr) in plain {
             let cfg = load(host);
-            assert_eq!(cfg.storage_mode, StorageMode::PlainLuks, "{host}: PlainLuks");
+            assert_eq!(
+                cfg.storage_mode,
+                StorageMode::PlainLuks,
+                "{host}: PlainLuks"
+            );
             assert_eq!(cfg.hostname, host, "{host}: hostname");
             assert_eq!(cfg.disk_device, disk, "{host}: disk_device");
             assert_eq!(cfg.network_address, addr, "{host}: network_address");
@@ -1122,8 +1126,14 @@ mod tests {
                 Some("REPLACE_AT_PLACE_TIME"),
                 "{host}: tpm2_pin placeholder"
             );
-            assert_eq!(cfg.luks_key, "REPLACE_AT_PLACE_TIME", "{host}: luks_key placeholder");
-            assert_eq!(cfg.root_password, "REPLACE_AT_PLACE_TIME", "{host}: root_password");
+            assert_eq!(
+                cfg.luks_key, "REPLACE_AT_PLACE_TIME",
+                "{host}: luks_key placeholder"
+            );
+            assert_eq!(
+                cfg.root_password, "REPLACE_AT_PLACE_TIME",
+                "{host}: root_password"
+            );
         }
 
         // unimatrixone is the NativeKeystore (ZFS native-encryption) path — the
@@ -1135,33 +1145,54 @@ mod tests {
         // fleet-topology/MAC exposure). We assert the NativeKeystore *shape* and
         // that the host-unique fields are placeholders, not real values.
         let u1 = load("unimatrixone");
-        assert_eq!(u1.storage_mode, StorageMode::NativeKeystore, "u1: NativeKeystore");
+        assert_eq!(
+            u1.storage_mode,
+            StorageMode::NativeKeystore,
+            "u1: NativeKeystore"
+        );
         assert_eq!(u1.initramfs_type, InitramfsType::Dracut, "u1: dracut");
         // 4-disk roster shape: 2 system (bootable SATA SSD) + 2 special (Optane).
         assert_eq!(u1.disks.len(), 4, "u1: 4-disk roster");
         assert_eq!(
-            u1.disks.iter().filter(|d| d.role == DiskRole::System).count(),
+            u1.disks
+                .iter()
+                .filter(|d| d.role == DiskRole::System)
+                .count(),
             2,
             "u1: 2 system (SSD) disks"
         );
         assert_eq!(
-            u1.disks.iter().filter(|d| d.role == DiskRole::Special).count(),
+            u1.disks
+                .iter()
+                .filter(|d| d.role == DiskRole::Special)
+                .count(),
             2,
             "u1: 2 special (Optane) disks"
         );
         assert_eq!(u1.tang_servers.len(), 3, "u1: 3 tang servers");
         assert_eq!(u1.tang_threshold, 2, "u1: tang threshold (D2-B t=2)");
-        assert!(!u1.enroll_tpm2, "u1: enroll_tpm2 OFF (clevis tpm2 pin instead)");
+        assert!(
+            !u1.enroll_tpm2,
+            "u1: enroll_tpm2 OFF (clevis tpm2 pin instead)"
+        );
         assert!(!u1.expect_fido2, "u1: expect_fido2 OFF");
         // Host-unique fleet data (IP, disk serials) must be sanitized
         // placeholders — never real topology / spoofable identifiers committed
         // to the repo. (hostname is just a name, not sensitive; it's also what
         // the registry derives on resolve, so it stays real.)
         assert_eq!(u1.hostname, "unimatrixone", "u1: hostname");
-        assert_eq!(u1.network_address, "REPLACE_AT_PLACE_TIME", "u1: address placeholder");
-        assert_eq!(u1.luks_key, "REPLACE_AT_PLACE_TIME", "u1: luks_key placeholder");
+        assert_eq!(
+            u1.network_address, "REPLACE_AT_PLACE_TIME",
+            "u1: address placeholder"
+        );
+        assert_eq!(
+            u1.luks_key, "REPLACE_AT_PLACE_TIME",
+            "u1: luks_key placeholder"
+        );
         assert!(
-            u1.disks.iter().all(|d| d.id.starts_with("REPLACE_AT_PLACE_TIME")),
+            u1.disks
+                .iter()
+                .all(|d| d.id.starts_with("REPLACE_AT_PLACE_TIME")),
             "u1: disk ids must be place-time placeholders, not real serials"
         );
     }
@@ -1226,7 +1257,10 @@ network_search: local
 network_nameservers: ["10.0.0.1"]
 "#;
         let err = serde_yaml::from_str::<InstallationConfig>(yaml).unwrap_err();
-        assert!(err.to_string().contains("disk_devise"), "error must name the unknown key: {err}");
+        assert!(
+            err.to_string().contains("disk_devise"),
+            "error must name the unknown key: {err}"
+        );
     }
 
     #[test]
@@ -1267,7 +1301,9 @@ network_nameservers: ["10.0.0.1"]
 
     #[test]
     fn test_applications_empty_is_todays_behavior() {
-        assert!(InstallationConfig::for_len_serv_003().applications.is_empty());
+        assert!(InstallationConfig::for_len_serv_003()
+            .applications
+            .is_empty());
     }
 
     #[test]
@@ -1293,7 +1329,10 @@ network_nameservers: ["10.0.0.1"]
         // no Cockroach application (every committed host today) must
         // serialize WITHOUT a `cockroach_members:` key at all.
         let cfg = InstallationConfig::for_len_serv_003();
-        assert!(cfg.cockroach_members.is_empty(), "fixture must be cockroach-free");
+        assert!(
+            cfg.cockroach_members.is_empty(),
+            "fixture must be cockroach-free"
+        );
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(
             !yaml.contains("cockroach_members"),
@@ -1324,7 +1363,10 @@ network_nameservers: ["10.0.0.1"]
         let mut cfg = InstallationConfig::for_len_serv_003();
         cfg.cockroach_members = vec!["172.16.3.92".to_string(), "172.16.3.94".to_string()];
         let yaml = serde_yaml::to_string(&cfg).unwrap();
-        assert!(yaml.contains("cockroach_members"), "non-empty cockroach_members must serialize, got:\n{yaml}");
+        assert!(
+            yaml.contains("cockroach_members"),
+            "non-empty cockroach_members must serialize, got:\n{yaml}"
+        );
         let back: InstallationConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back.cockroach_members, cfg.cockroach_members);
     }
@@ -1338,7 +1380,11 @@ network_nameservers: ["10.0.0.1"]
         // placed file byte-for-byte as it did before U1. Only unimatrixone,
         // which sets NativeKeystore, emits these keys.
         let cfg = InstallationConfig::for_len_serv_003();
-        assert_eq!(cfg.storage_mode, StorageMode::PlainLuks, "fixture is PlainLuks");
+        assert_eq!(
+            cfg.storage_mode,
+            StorageMode::PlainLuks,
+            "fixture is PlainLuks"
+        );
         assert!(cfg.disks.is_empty(), "fixture has no multi-disk roster");
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(
@@ -1368,7 +1414,10 @@ network_nameservers: ["10.0.0.1"]
             yaml.contains("storage_mode: native-keystore"),
             "NativeKeystore must serialize the discriminator (kebab-case value), got:\n{yaml}"
         );
-        assert!(yaml.contains("disks"), "a NativeKeystore host must emit its disks roster");
+        assert!(
+            yaml.contains("disks"),
+            "a NativeKeystore host must emit its disks roster"
+        );
     }
 
     #[test]
@@ -1397,7 +1446,10 @@ seed_ip: 172.16.3.92
 kind: redis
 "#;
         let err = serde_yaml::from_str::<ApplicationSpec>(yaml).unwrap_err();
-        assert!(err.to_string().contains("redis"), "error must name the unknown kind: {err}");
+        assert!(
+            err.to_string().contains("redis"),
+            "error must name the unknown kind: {err}"
+        );
     }
 
     #[test]
@@ -1461,13 +1513,19 @@ typo_field: oops
         let deserialized: HostRole = serde_yaml::from_str(install_target_yaml).unwrap();
         assert_eq!(deserialized, HostRole::InstallTarget);
         let serialized = serde_yaml::to_string(&deserialized).unwrap();
-        assert!(serialized.contains("install-target"), "serialized should contain 'install-target', got: {serialized}");
+        assert!(
+            serialized.contains("install-target"),
+            "serialized should contain 'install-target', got: {serialized}"
+        );
 
         let tang_server_yaml = "tang-server";
         let deserialized: HostRole = serde_yaml::from_str(tang_server_yaml).unwrap();
         assert_eq!(deserialized, HostRole::TangServer);
         let serialized = serde_yaml::to_string(&deserialized).unwrap();
-        assert!(serialized.contains("tang-server"), "serialized should contain 'tang-server', got: {serialized}");
+        assert!(
+            serialized.contains("tang-server"),
+            "serialized should contain 'tang-server', got: {serialized}"
+        );
     }
 
     #[test]
@@ -1514,20 +1572,36 @@ key-directory: /etc/tang/keys
         // file byte-for-byte as it did before this brief.
         let cfg = InstallationConfig::for_len_serv_003();
         assert_eq!(cfg.arch, Arch::Amd64, "fixture is amd64");
-        assert_eq!(cfg.role, HostRole::InstallTarget, "fixture is install-target");
-        assert!(cfg.firmware_quirks.is_empty(), "fixture has no firmware quirks");
+        assert_eq!(
+            cfg.role,
+            HostRole::InstallTarget,
+            "fixture is install-target"
+        );
+        assert!(
+            cfg.firmware_quirks.is_empty(),
+            "fixture has no firmware quirks"
+        );
         assert!(cfg.hooks.is_empty(), "fixture has no hooks");
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         // Match on the YAML key form (`\nkey:`), not a bare substring — several
         // existing keys (`debootstrap_mirror: http://archive...`) contain
         // "arch" as a substring of unrelated text.
-        assert!(!yaml.contains("\narch:"), "a default-arch host must omit the arch key entirely, got:\n{yaml}");
-        assert!(!yaml.contains("\nrole:"), "an install-target host must omit the role key entirely, got:\n{yaml}");
+        assert!(
+            !yaml.contains("\narch:"),
+            "a default-arch host must omit the arch key entirely, got:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("\nrole:"),
+            "an install-target host must omit the role key entirely, got:\n{yaml}"
+        );
         assert!(
             !yaml.contains("\nfirmware_quirks:"),
             "a quirk-free host must omit the firmware_quirks key entirely, got:\n{yaml}"
         );
-        assert!(!yaml.contains("\nhooks:"), "a hook-free host must omit the hooks key entirely, got:\n{yaml}");
+        assert!(
+            !yaml.contains("\nhooks:"),
+            "a hook-free host must omit the hooks key entirely, got:\n{yaml}"
+        );
     }
 
     #[test]
@@ -1550,10 +1624,22 @@ key-directory: /etc/tang/keys
         cfg.hooks = hooks;
 
         let yaml = serde_yaml::to_string(&cfg).unwrap();
-        assert!(yaml.contains("arch: arm64"), "arm64 arch must serialize, got:\n{yaml}");
-        assert!(yaml.contains("role: tang-server"), "tang-server role must serialize, got:\n{yaml}");
-        assert!(yaml.contains("firmware_quirks"), "non-empty firmware_quirks must serialize, got:\n{yaml}");
-        assert!(yaml.contains("hooks"), "non-empty hooks must serialize, got:\n{yaml}");
+        assert!(
+            yaml.contains("arch: arm64"),
+            "arm64 arch must serialize, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("role: tang-server"),
+            "tang-server role must serialize, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("firmware_quirks"),
+            "non-empty firmware_quirks must serialize, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("hooks"),
+            "non-empty hooks must serialize, got:\n{yaml}"
+        );
 
         let back: InstallationConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back.arch, cfg.arch);

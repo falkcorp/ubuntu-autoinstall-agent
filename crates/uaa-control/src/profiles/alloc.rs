@@ -45,9 +45,9 @@ pub fn render_hostname(pattern: &str, name: &str, index: i64) -> Result<String> 
     let start = with_name
         .find("{index")
         .ok_or_else(|| anyhow!("hostname pattern {pattern:?} has no {{index}} placeholder"))?;
-    let rel_end = with_name[start..]
-        .find('}')
-        .ok_or_else(|| anyhow!("hostname pattern {pattern:?} has an unterminated {{index placeholder"))?;
+    let rel_end = with_name[start..].find('}').ok_or_else(|| {
+        anyhow!("hostname pattern {pattern:?} has an unterminated {{index placeholder")
+    })?;
     let token = &with_name[start..=start + rel_end];
     // Strip the leading "{index" and trailing "}" -> "" or ":03".
     let spec = &token[6..token.len() - 1];
@@ -93,7 +93,12 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    fn alloc_row(group_id: Uuid, identity: &str, index: i64, hostname: &str) -> HostnameAllocationRow {
+    fn alloc_row(
+        group_id: Uuid,
+        identity: &str,
+        index: i64,
+        hostname: &str,
+    ) -> HostnameAllocationRow {
         HostnameAllocationRow {
             group_id,
             identity: identity.to_string(),
@@ -183,7 +188,8 @@ mod tests {
     fn test_taken_hostnames_unions_allocations_and_overrides() {
         let g = Uuid::new_v4();
         let mut doc = empty_doc();
-        doc.hostname_allocations.push(alloc_row(g, "a", 1, "len-001"));
+        doc.hostname_allocations
+            .push(alloc_row(g, "a", 1, "len-001"));
         doc.host_profiles.push(crate::db::HostProfileRow {
             id: Uuid::new_v4(),
             group_id: g,

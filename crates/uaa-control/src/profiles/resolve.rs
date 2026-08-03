@@ -182,7 +182,8 @@ async fn cockroach_member_ips(
         let Some(prow) = profiles.iter().find(|p| p.identity == alloc.identity) else {
             continue;
         };
-        let mut member_profile = profile_row_to_profile(prow, &group.name).map_err(|e| anyhow!(e))?;
+        let mut member_profile =
+            profile_row_to_profile(prow, &group.name).map_err(|e| anyhow!(e))?;
         member_profile.hostname_override = Some(alloc.hostname.clone());
         let (member_config, _provenance) =
             merge(group_profile, &member_profile).map_err(|e| anyhow!(e.to_string()))?;
@@ -260,11 +261,16 @@ mod tests {
         // Bootstrap the snapshot with one unrelated group so the store is
         // readable (a genuinely missing snapshot is a different failure).
         store
-            .put_group(group_row(Uuid::new_v4(), "len-serv", "{name}-{index:03}"), "op")
+            .put_group(
+                group_row(Uuid::new_v4(), "len-serv", "{name}-{index:03}"),
+                "op",
+            )
             .await
             .unwrap();
 
-        let err = resolve_from_registry(&store, "no-such-host").await.unwrap_err();
+        let err = resolve_from_registry(&store, "no-such-host")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("not in the profile registry"),
             "expected a named not-in-registry error, got: {err}"
@@ -283,10 +289,15 @@ mod tests {
             .await
             .unwrap();
         // Allocate a hostname WITHOUT ever creating a matching profile row.
-        let alloc = store.allocate_index(gid, "aa:bb:cc:dd:ee:01").await.unwrap();
+        let alloc = store
+            .allocate_index(gid, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
         assert_eq!(alloc.hostname, "len-serv-001");
 
-        let err = resolve_from_registry(&store, "len-serv-001").await.unwrap_err();
+        let err = resolve_from_registry(&store, "len-serv-001")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("has no host profile"),
             "expected a missing-profile error, got: {err}"
@@ -319,7 +330,8 @@ mod tests {
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
-            decommission: uaa_core::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
+            decommission:
+                uaa_core::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         });
 
         let mut group = group_row(gid, "len-serv", "{name}-{index:03}");
@@ -475,7 +487,8 @@ mod tests {
             "the host's base_image.mirror leaf override must flow through"
         );
 
-        validate_resolved(&resolved).expect("component-authored fixture must pass validate_resolved");
+        validate_resolved(&resolved)
+            .expect("component-authored fixture must pass validate_resolved");
     }
 
     /// A resolved config that is legal field-by-field pre-merge but an
@@ -514,7 +527,9 @@ mod tests {
             .await
             .unwrap();
 
-        let err = resolve_from_registry(&store, "bad-native-001").await.unwrap_err();
+        let err = resolve_from_registry(&store, "bad-native-001")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("native-keystore requires a non-empty disk roster"),
@@ -567,6 +582,7 @@ mod tests {
         );
         assert_eq!(resolved.storage_mode, StorageMode::PlainLuks);
         assert_eq!(resolved.disk_device, "/dev/nvme0n1");
-        validate_resolved(&resolved).expect("flat-authored fleet-shaped host must pass validate_resolved");
+        validate_resolved(&resolved)
+            .expect("flat-authored fleet-shaped host must pass validate_resolved");
     }
 }

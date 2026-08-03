@@ -292,17 +292,26 @@ impl SshInstaller {
         }
 
         if selection.contains(0) {
-            run_phase!("Phase 0: Setup variables", self.setup_installation_variables(config));
+            run_phase!(
+                "Phase 0: Setup variables",
+                self.setup_installation_variables(config)
+            );
         } else {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", self.phase_1_package_installation(config));
+            run_phase!(
+                "Phase 1: Package installation",
+                self.phase_1_package_installation(config)
+            );
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
         if let Some(wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config, &wipe_auth));
+            run_phase!(
+                "Phase 2: Disk preparation",
+                self.phase_2_disk_preparation(config, &wipe_auth)
+            );
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
@@ -364,12 +373,18 @@ impl SshInstaller {
         let mut failed_phases: Vec<String> = Vec::new();
         let mut successful_phases: Vec<&str> = Vec::new();
 
-        self.report(config, "running", 5, "Installation starting").await;
+        self.report(config, "running", 5, "Installation starting")
+            .await;
 
         macro_rules! run_phase {
             ($label:expr, $progress:expr, $fut:expr) => {{
-                self.report(config, "running", $progress, &format!("{} — starting", $label))
-                    .await;
+                self.report(
+                    config,
+                    "running",
+                    $progress,
+                    &format!("{} — starting", $label),
+                )
+                .await;
                 match $fut.await {
                     Ok(_) => {
                         info!("✓ Phase completed: {}", $label);
@@ -402,22 +417,38 @@ impl SshInstaller {
         }
 
         if selection.contains(0) {
-            run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
+            run_phase!(
+                "Phase 0: Setup variables",
+                10,
+                self.setup_installation_variables(config)
+            );
         } else {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation(config));
+            run_phase!(
+                "Phase 1: Package installation",
+                20,
+                self.phase_1_package_installation(config)
+            );
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
         if let Some(wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config, &wipe_auth));
+            run_phase!(
+                "Phase 2: Disk preparation",
+                35,
+                self.phase_2_disk_preparation(config, &wipe_auth)
+            );
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
         if selection.contains(3) {
-            run_phase!("Phase 3: ZFS creation", 50, self.phase_3_zfs_creation(config));
+            run_phase!(
+                "Phase 3: ZFS creation",
+                50,
+                self.phase_3_zfs_creation(config)
+            );
         } else {
             info!("Phase 3: ZFS creation — SKIPPED (--phases)");
         }
@@ -449,8 +480,13 @@ impl SshInstaller {
                 "🎉 Installation completed successfully for {}",
                 config.hostname
             );
-            self.report(config, "success", 100, &format!("{} installed", config.hostname))
-                .await;
+            self.report(
+                config,
+                "success",
+                100,
+                &format!("{} installed", config.hostname),
+            )
+            .await;
             Ok(())
         } else {
             error!(
@@ -461,7 +497,11 @@ impl SshInstaller {
                 config,
                 "failed",
                 100,
-                &format!("{} install failed: {} phase(s)", config.hostname, failed_phases.len()),
+                &format!(
+                    "{} install failed: {} phase(s)",
+                    config.hostname,
+                    failed_phases.len()
+                ),
             )
             .await;
             Err(crate::error::AutoInstallError::InstallationError(format!(
@@ -479,7 +519,10 @@ impl SshInstaller {
     /// unchanged. NEVER runs preflight_checks (it wipes residual state),
     /// Phases 1-4 (packages/disk prep/ZFS/debootstrap), or Phase 6
     /// (final_cleanup would zpool-export / cryptsetup-close the RUNNING root).
-    pub async fn perform_in_target_configuration(&mut self, config: &InstallationConfig) -> Result<()> {
+    pub async fn perform_in_target_configuration(
+        &mut self,
+        config: &InstallationConfig,
+    ) -> Result<()> {
         self.require_connected()?;
 
         if self
@@ -886,7 +929,10 @@ impl SshInstaller {
         config: &InstallationConfig,
         auth: &WipeAuthorization,
     ) -> Result<()> {
-        info!("Phase 2: Disk preparation (storage_mode = {:?})", config.storage_mode);
+        info!(
+            "Phase 2: Disk preparation (storage_mode = {:?})",
+            config.storage_mode
+        );
         // storage_mode selects the disk path; PlainLuks (default) is the proven
         // single-disk Lenovo path, byte-identical to before; NativeKeystore is
         // the multi-disk U1 / server-profile partitioner.
@@ -905,7 +951,10 @@ impl SshInstaller {
     }
 
     async fn phase_3_zfs_creation(&mut self, config: &InstallationConfig) -> Result<()> {
-        info!("Phase 3: ZFS creation (storage_mode = {:?})", config.storage_mode);
+        info!(
+            "Phase 3: ZFS creation (storage_mode = {:?})",
+            config.storage_mode
+        );
         match config.storage_mode {
             StorageMode::PlainLuks => {
                 let mut zm = ZfsManager::new(&mut *self.runner, &mut self.variables);
@@ -1303,7 +1352,11 @@ mod tests {
             _desc: &str,
         ) -> Result<(i32, String, String)> {
             self.commands.lock().unwrap().push(cmd.to_string());
-            Ok((0, self.responses.get(cmd).cloned().unwrap_or_default(), String::new()))
+            Ok((
+                0,
+                self.responses.get(cmd).cloned().unwrap_or_default(),
+                String::new(),
+            ))
         }
         async fn check_silent(&mut self, cmd: &str) -> Result<bool> {
             self.commands.lock().unwrap().push(cmd.to_string());
@@ -1403,7 +1456,10 @@ mod tests {
         cfg.install_ca_cert = crate::config_place::PLACEHOLDER.to_string();
 
         let result = installer.perform_installation(&cfg, &selection).await;
-        assert!(result.is_ok(), "phase 5 must not fail on an unplaced CA: {result:?}");
+        assert!(
+            result.is_ok(),
+            "phase 5 must not fail on an unplaced CA: {result:?}"
+        );
 
         let cmds = mock.recorded();
         assert!(
@@ -1427,8 +1483,8 @@ mod tests {
         let zpool = position_cmd(&cmds, "zpool create").expect("zpool create expected");
         // Match the Phase-4 debootstrap *invocation*, not the "debootstrap"
         // package name apt installs back in Phase 1.
-        let debootstrap =
-            position_cmd(&cmds, "debootstrap resolute /mnt/targetos").expect("debootstrap expected");
+        let debootstrap = position_cmd(&cmds, "debootstrap resolute /mnt/targetos")
+            .expect("debootstrap expected");
         let grub = position_cmd(&cmds, "grub-install").expect("grub-install expected");
 
         assert!(
@@ -1440,10 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_selective_no_wipe_on_residual() {
         // Residual rpool present, but --phases 5 omits Phase 2 → guard refuses.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1465,10 +1519,8 @@ mod tests {
     async fn test_default_run_still_wipes_on_residual() {
         // ANTI-OVER-SUPPRESSION: the same residual state under the flagless full
         // selection MUST still wipe — the guard must never block the normal path.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::full();
         let cfg = sample_config();
@@ -1494,10 +1546,8 @@ mod tests {
         // Residual rpool present + --phases 5 (omits Phase 2): preflight must
         // BYPASS the recovery-wipe (log + continue), returning Ok, and issue no
         // destructive command.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1506,7 +1556,12 @@ mod tests {
         assert!(result.is_ok(), "selective preflight must bypass, not error");
 
         let cmds = mock.recorded();
-        for forbidden in ["wipefs", "sgdisk --zap-all", "zpool destroy", "cryptsetup close"] {
+        for forbidden in [
+            "wipefs",
+            "sgdisk --zap-all",
+            "zpool destroy",
+            "cryptsetup close",
+        ] {
             assert!(
                 !contains_cmd(&cmds, forbidden),
                 "selective preflight bypass must not issue {forbidden:?}"
@@ -1559,10 +1614,8 @@ mod tests {
     async fn test_prep_mount_order_root_then_boot_then_esp() {
         // THE faea48e regression test: / (rpool ROOT) before /boot (bpool BOOT)
         // before the ESP.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1570,10 +1623,10 @@ mod tests {
         let _ = installer.perform_installation(&cfg, &selection).await;
 
         let cmds = mock.recorded();
-        let root = position_cmd(&cmds, "zfs mount rpool/ROOT/ubuntu_abc123")
-            .expect("root mount expected");
-        let boot = position_cmd(&cmds, "zfs mount bpool/BOOT/ubuntu_abc123")
-            .expect("boot mount expected");
+        let root =
+            position_cmd(&cmds, "zfs mount rpool/ROOT/ubuntu_abc123").expect("root mount expected");
+        let boot =
+            position_cmd(&cmds, "zfs mount bpool/BOOT/ubuntu_abc123").expect("boot mount expected");
         // Match the ESP *mount* specifically (the normalize step umounts the same
         // path first, so an unqualified `/mnt/targetos/boot/efi` would mis-match).
         let esp = position_cmd(&cmds, "mount /dev/nvme0n1p1 /mnt/targetos/boot/efi")
@@ -1588,10 +1641,8 @@ mod tests {
     async fn test_prep_normalizes_partial_mounts_first() {
         // The umount inverse ops run BEFORE any import/mount, and prep never
         // exports a pool.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1631,10 +1682,8 @@ mod tests {
     #[tokio::test]
     async fn test_prep_import_uses_altroot_no_automount() {
         // Every zpool import must carry -N (no automount) and -R /mnt/targetos.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1642,8 +1691,7 @@ mod tests {
         let _ = installer.perform_installation(&cfg, &selection).await;
 
         let cmds = mock.recorded();
-        let imports: Vec<&String> =
-            cmds.iter().filter(|c| c.contains("zpool import")).collect();
+        let imports: Vec<&String> = cmds.iter().filter(|c| c.contains("zpool import")).collect();
         assert!(!imports.is_empty(), "prep must import at least one pool");
         for cmd in imports {
             assert!(

@@ -239,7 +239,10 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .seed_ip
             .clone()
             .unwrap_or_else(|| base.seed_ip.clone()),
-        cache: overrides.cache.clone().unwrap_or_else(|| base.cache.clone()),
+        cache: overrides
+            .cache
+            .clone()
+            .unwrap_or_else(|| base.cache.clone()),
         max_sql_memory: overrides
             .max_sql_memory
             .clone()
@@ -248,7 +251,10 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .locality
             .clone()
             .unwrap_or_else(|| base.locality.clone()),
-        store: overrides.store.clone().unwrap_or_else(|| base.store.clone()),
+        store: overrides
+            .store
+            .clone()
+            .unwrap_or_else(|| base.store.clone()),
         decommission: overrides
             .decommission
             .clone()
@@ -293,7 +299,10 @@ fn merge_single_luks(
         esp_size: host.esp_size.clone().or_else(|| group.esp_size.clone()),
         reset_size: host.reset_size.clone().or_else(|| group.reset_size.clone()),
         bpool_size: host.bpool_size.clone().or_else(|| group.bpool_size.clone()),
-        disk_device: host.disk_device.clone().or_else(|| group.disk_device.clone()),
+        disk_device: host
+            .disk_device
+            .clone()
+            .or_else(|| group.disk_device.clone()),
         reset_enabled: host.reset_enabled.or(group.reset_enabled),
     }
 }
@@ -329,7 +338,9 @@ fn resolve_disk_layout(
             Some(h.clone())
         }
         (None, Some(g)) => {
-            provenance.0.insert("disk-layout".to_string(), Source::Group);
+            provenance
+                .0
+                .insert("disk-layout".to_string(), Source::Group);
             Some(g.clone())
         }
         (Some(h), Some(g)) => {
@@ -543,9 +554,7 @@ fn resolve_firmware_quirks(
     } else {
         Source::Default
     };
-    provenance
-        .0
-        .insert("firmware-quirks".to_string(), source);
+    provenance.0.insert("firmware-quirks".to_string(), source);
 
     Some(by_kind.into_values().collect())
 }
@@ -554,7 +563,10 @@ fn resolve_firmware_quirks(
 /// into a concrete `InstallationConfig`, plus the per-field `Provenance` of
 /// how it got there. See the module doc for precedence, the fail-closed
 /// scope, the double-`Option` trap, and the applications union.
-pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(InstallationConfig, Provenance)> {
+pub fn merge(
+    group: &HostGroupProfile,
+    host: &HostProfile,
+) -> Result<(InstallationConfig, Provenance)> {
     let mut provenance = Provenance::default();
     let mut missing: Vec<String> = Vec::new();
 
@@ -851,7 +863,8 @@ mod tests {
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
-            decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
+            decommission:
+                crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         }
     }
 
@@ -988,15 +1001,13 @@ mod tests {
         let mut group_only = base_group();
         group_only.applications = vec![cockroach.clone()];
         let host_none = base_host();
-        let (config, _provenance) =
-            merge(&group_only, &host_none).expect("merge should succeed");
+        let (config, _provenance) = merge(&group_only, &host_none).expect("merge should succeed");
         assert_eq!(config.applications, vec![cockroach.clone()]);
 
         let group_none = base_group();
         let mut host_only = base_host();
         host_only.applications = vec![cockroach.clone()];
-        let (config, _provenance) =
-            merge(&group_none, &host_only).expect("merge should succeed");
+        let (config, _provenance) = merge(&group_none, &host_only).expect("merge should succeed");
         assert_eq!(config.applications, vec![cockroach]);
     }
 

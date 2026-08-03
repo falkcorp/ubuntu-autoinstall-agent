@@ -5,6 +5,8 @@
 
 //! Command implementations for the CLI
 
+use std::io::Write;
+use tracing::{error, info, warn};
 use uaa_core::{
     config::{loader::ConfigLoader, Architecture, ImageSpec},
     image::deployer::ImageDeployer,
@@ -13,8 +15,6 @@ use uaa_core::{
     utils::system::SystemUtils,
     Result,
 };
-use std::io::Write;
-use tracing::{error, info, warn};
 
 /// Create a golden Ubuntu image
 pub async fn create_image_command(
@@ -290,12 +290,10 @@ pub async fn ssh_install_command(
     // Build the phase selection up front so a bad --phases/--from-phase spec
     // fails BEFORE any connection or investigation side effects.
     let selection = match (phases.as_deref(), from_phase) {
-        (Some(spec), _) => {
-            PhaseSelection::parse(spec).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
-        (None, Some(n)) => {
-            PhaseSelection::from_phase(n).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
+        (Some(spec), _) => PhaseSelection::parse(spec)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
+        (None, Some(n)) => PhaseSelection::from_phase(n)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
         (None, None) => PhaseSelection::full(),
     };
 
@@ -435,12 +433,10 @@ pub async fn local_install_command(
     // Build the phase selection up front so a bad --phases/--from-phase spec
     // fails BEFORE any root check or destructive work.
     let selection = match (phases.as_deref(), from_phase) {
-        (Some(spec), _) => {
-            PhaseSelection::parse(spec).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
-        (None, Some(n)) => {
-            PhaseSelection::from_phase(n).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
+        (Some(spec), _) => PhaseSelection::parse(spec)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
+        (None, Some(n)) => PhaseSelection::from_phase(n)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
         (None, None) => PhaseSelection::full(),
     };
 
@@ -518,8 +514,11 @@ pub async fn local_install_command(
     } else {
         uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config)
     };
-    let credentials_report =
-        render_credentials_report(&generated_credentials, &config.hostname, &config.network_address);
+    let credentials_report = render_credentials_report(
+        &generated_credentials,
+        &config.hostname,
+        &config.network_address,
+    );
 
     if in_target {
         if dry_run {
@@ -637,7 +636,8 @@ fn render_credentials_report(
 /// log file couldn't be written would be strictly worse.
 fn persist_credentials_report(report: &Option<String>, host_label: &str) {
     let Some(report) = report else { return };
-    match uaa_core::network::ssh_installer::credentials::write_credentials_file(host_label, report) {
+    match uaa_core::network::ssh_installer::credentials::write_credentials_file(host_label, report)
+    {
         Ok(path) => info!(
             "Recorded generated password(s) to {} (0600) before install",
             path.display()
@@ -1050,8 +1050,7 @@ fn detect_network_config(
     let global_inet = iface_entry.and_then(|entry| {
         entry["addr_info"].as_array().and_then(|addr_info| {
             addr_info.iter().find(|info| {
-                info["family"].as_str() == Some("inet")
-                    && info["scope"].as_str() == Some("global")
+                info["family"].as_str() == Some("inet") && info["scope"].as_str() == Some("global")
             })
         })
     });
@@ -1110,7 +1109,8 @@ fn prompt_for_luks_passphrase() -> Result<String> {
         // stdin EOF (non-interactive) or bare Enter — never format with an
         // empty passphrase.
         return Err(uaa_core::error::AutoInstallError::ValidationError(
-            "Empty LUKS passphrase (non-interactive stdin?) — use --config with a luks_key instead".to_string(),
+            "Empty LUKS passphrase (non-interactive stdin?) — use --config with a luks_key instead"
+                .to_string(),
         ));
     }
     Ok(passphrase)
@@ -1188,7 +1188,9 @@ pub async fn place_command(
 
     let report = place_and_drive(
         &mut server_conn,
-        target_opt.as_mut().map(|t| t as &mut dyn uaa_core::network::executor::CommandExecutor),
+        target_opt
+            .as_mut()
+            .map(|t| t as &mut dyn uaa_core::network::executor::CommandExecutor),
         &spec,
         &opts,
     )
@@ -1197,10 +1199,7 @@ pub async fn place_command(
     report.print();
 
     if !report.dry_run {
-        info!(
-            "Seed written for {} → hexmac {}",
-            hostname, report.hexmac
-        );
+        info!("Seed written for {} → hexmac {}", hostname, report.hexmac);
     }
 
     Ok(())
@@ -1229,9 +1228,10 @@ pub async fn verify_command(
     report.print();
 
     if strict && !report.all_passed() {
-        return Err(uaa_core::error::AutoInstallError::ValidationError(
-            format!("{} check(s) failed on {host}", report.checks.iter().filter(|c| !c.passed).count()),
-        ));
+        return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+            "{} check(s) failed on {host}",
+            report.checks.iter().filter(|c| !c.passed).count()
+        )));
     }
 
     Ok(())
@@ -1326,8 +1326,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join("etc")).unwrap();
-        std::fs::write(root.join("etc").join("uaa-target-marker"), b"installed-by=uaa\n")
-            .unwrap();
+        std::fs::write(
+            root.join("etc").join("uaa-target-marker"),
+            b"installed-by=uaa\n",
+        )
+        .unwrap();
 
         assert!(target_marker_present(&root));
 

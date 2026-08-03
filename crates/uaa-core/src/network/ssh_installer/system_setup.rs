@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.33.0
+// version: 2.34.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-08-02
+// last-edited: 2026-08-03
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -12,7 +12,7 @@
 use super::config::{Arch, DiskRole, InitramfsType, InstallationConfig, StorageMode, UserAccount};
 use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix};
 use super::partitions::partition_path;
-use super::unlock_sss::{SssPolicy, UnlockPin};
+use super::unlock_sss::{SssPolicy, UnlockPin, DEFAULT_PKCS11_MECHANISM};
 use crate::network::CommandExecutor;
 use crate::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -1355,7 +1355,15 @@ impl<'a> SystemConfigurator<'a> {
                     UnlockPin::Pkcs11(p) => out.push_str(
                         &serde_json::to_string(&Pkcs11Peer {
                             uri: p.uri.as_str(),
-                            mechanism: p.mechanism.as_deref(),
+                            // NEVER `None` in the emitted JSON. A binding with
+                            // no mechanism succeeds and then dies at unlock
+                            // with `Decrypt mechanism not supported`, so the
+                            // default is applied here as well as at
+                            // deserialization — this is the last point at which
+                            // a `None` reaching the wire can be caught.
+                            mechanism: Some(
+                                p.mechanism.as_deref().unwrap_or(DEFAULT_PKCS11_MECHANISM),
+                            ),
                         })
                         .unwrap_or_default(),
                     ),
@@ -2555,11 +2563,11 @@ mod tests {
             threshold: 2,
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
                     mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000002".to_string(),
+                    uri: "pkcs11:serial=YK0000002;token=TOKYK0000002".to_string(),
                     mechanism: None,
                 }),
                 tang_pin("http://172.16.2.40"),
@@ -2571,7 +2579,7 @@ mod tests {
         );
         assert_eq!(
             got,
-            r#"{"t":2,"pins":{"pkcs11":[{"uri":"pkcs11:serial=YK0000001"},{"uri":"pkcs11:serial=YK0000002"}],"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
+            r#"{"t":2,"pins":{"pkcs11":[{"uri":"pkcs11:serial=YK0000001;token=TOKYK0000001","mechanism":"RSA-PKCS"},{"uri":"pkcs11:serial=YK0000002;token=TOKYK0000002","mechanism":"RSA-PKCS"}],"tang":[{"url":"http://172.16.2.40","adv":"/run/uaa-tang-0.adv"}]}}"#
         );
         serde_json::from_str::<serde_json::Value>(&got).expect("valid JSON");
     }
@@ -2580,9 +2588,9 @@ mod tests {
 
     const PEER_A: &str = "http://172.16.2.45";
     const PEER_B: &str = "http://172.16.2.46";
-    const NANO: &str = "pkcs11:serial=NANO0001";
-    const CARRIED_A: &str = "pkcs11:serial=CARRIED0A";
-    const CARRIED_B: &str = "pkcs11:serial=CARRIED0B";
+    const NANO: &str = "pkcs11:serial=NANO0001;token=TOKNANO0001";
+    const CARRIED_A: &str = "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A";
+    const CARRIED_B: &str = "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B";
 
     /// Emit the settled fleet policy, parsed to a `Value`.
     ///
@@ -2617,8 +2625,11 @@ mod tests {
         serde_json::json!({"url": url, "adv": format!("/run/uaa-tang-{index}.adv")})
     }
 
+    /// `{"uri":…,"mechanism":…}` for one token share. The mechanism is NOT
+    /// optional in a binding — omit it and the policy binds cleanly and then
+    /// fails at unlock with `Decrypt mechanism not supported`.
     fn pkcs11_entry(uri: &str) -> serde_json::Value {
-        serde_json::json!({"uri": uri})
+        serde_json::json!({"uri": uri, "mechanism": DEFAULT_PKCS11_MECHANISM})
     }
 
     /// The two peer Tang servers as a `t`-of-2 group.
@@ -2773,26 +2784,31 @@ mod tests {
         );
     }
 
-    /// GOLDEN — `mechanism` is emitted when set and ABSENT when not.
+    /// GOLDEN — `mechanism` is ALWAYS emitted, and is never `null`.
     ///
-    /// The config shape clevis 23 actually reads is `{"uri":…,"mechanism":…}`,
-    /// and `clevis-decrypt-pkcs11` passes `--mechanism` only when the value is
-    /// non-empty. So an unset mechanism must vanish from the binding entirely,
-    /// not appear as `"mechanism":""` or `"mechanism":null` — both would be a
-    /// gratuitous diff against every binding authored before the field existed,
-    /// and `null` in particular is not a string clevis can hand to
-    /// `pkcs11-tool`.
+    /// The config shape clevis 23 reads is `{"uri":…,"mechanism":…}`, and
+    /// `clevis-decrypt-pkcs11` passes `--mechanism` only when the value is
+    /// non-empty. Measured: omit it and the policy binds cleanly and then never
+    /// unlocks — `error: Decrypt mechanism not supported`, i.e. a green install
+    /// and a dead host. So an unset mechanism is filled in here with
+    /// [`DEFAULT_PKCS11_MECHANISM`] rather than being skipped.
+    ///
+    /// `skip_serializing_if` on the struct field stays, and stays load-bearing
+    /// in the other direction: without it a `None` that somehow reached the
+    /// wire would serialize as `"mechanism": null`, which clevis cannot hand to
+    /// `pkcs11-tool` at all. The emitter's job is to make sure `None` never
+    /// gets that far.
     #[test]
-    fn test_golden_pkcs11_mechanism_emitted_only_when_set() {
+    fn test_golden_pkcs11_mechanism_is_always_emitted() {
         let tree = SssPolicy {
             threshold: 1,
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    uri: "pkcs11:serial=YK0000001;token=Yubi1".to_string(),
                     mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000002".to_string(),
+                    uri: "pkcs11:serial=YK0000002;token=Yubi2".to_string(),
                     mechanism: Some("RSA-PKCS-OAEP".to_string()),
                 }),
             ],
@@ -2806,23 +2822,15 @@ mod tests {
             serde_json::json!({
                 "t": 1,
                 "pins": {"pkcs11": [
-                    // No `mechanism` key AT ALL for the unset share.
-                    {"uri": "pkcs11:serial=YK0000001"},
-                    {"uri": "pkcs11:serial=YK0000002", "mechanism": "RSA-PKCS-OAEP"},
+                    // Unset -> filled with the working default, NOT skipped.
+                    {"uri": "pkcs11:serial=YK0000001;token=Yubi1", "mechanism": DEFAULT_PKCS11_MECHANISM},
+                    {"uri": "pkcs11:serial=YK0000002;token=Yubi2", "mechanism": "RSA-PKCS-OAEP"},
                 ]}
             })
         );
-
-        // `assert_eq!` on Values already proves absence, but say it in the form
-        // the failure would take, so a regression names itself.
-        let unset = &got["pins"]["pkcs11"][0];
-        assert!(
-            unset.get("mechanism").is_none(),
-            "an unset mechanism must not serialize at all, got: {unset}"
-        );
         assert!(
             !raw.contains("null"),
-            "a None mechanism must be skipped, never emitted as null: {raw}"
+            "mechanism must never be emitted as null: {raw}"
         );
 
         // Module path and slot are URI attributes, never config keys — clevis
@@ -2831,7 +2839,8 @@ mod tests {
         let with_module = SssPolicy {
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
-                uri: "pkcs11:serial=YK0000001;module-path=/usr/lib/opensc-pkcs11.so".to_string(),
+                uri: "pkcs11:serial=YK0000001;token=Yubi1;module-path=/usr/lib/opensc-pkcs11.so"
+                    .to_string(),
                 mechanism: None,
             })],
         };
@@ -2843,8 +2852,62 @@ mod tests {
         )
         .expect("valid JSON");
         let share = &got["pins"]["pkcs11"][0];
-        assert_eq!(share.as_object().unwrap().len(), 1, "uri is the only key");
+        assert_eq!(
+            share.as_object().unwrap().len(),
+            2,
+            "uri and mechanism are the only keys: {share}"
+        );
         assert!(share["uri"].as_str().unwrap().contains("module-path="));
+    }
+
+    /// TOPOLOGY — EVERY pkcs11 share, at EVERY depth of the settled fleet tree,
+    /// carries a non-empty `mechanism`.
+    ///
+    /// Walks the parsed JSON rather than scanning the string: a `contains()`
+    /// check would pass as soon as ONE share had a mechanism, which is exactly
+    /// the shape of the bug (one good share, four silently unusable ones).
+    #[test]
+    fn test_every_pkcs11_share_in_the_fleet_policy_has_a_mechanism() {
+        fn walk(node: &serde_json::Value, found: &mut usize) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    for (key, val) in map {
+                        if key == "pkcs11" {
+                            let entries: Vec<&serde_json::Value> = match val {
+                                serde_json::Value::Array(items) => items.iter().collect(),
+                                other => vec![other],
+                            };
+                            for entry in entries {
+                                let mech = entry.get("mechanism").unwrap_or_else(|| {
+                                    panic!("pkcs11 share has no mechanism: {entry}")
+                                });
+                                let mech = mech.as_str().unwrap_or_else(|| {
+                                    panic!("mechanism is not a string: {entry}")
+                                });
+                                assert!(!mech.is_empty(), "empty mechanism: {entry}");
+                                *found += 1;
+                            }
+                        }
+                        walk(val, found);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|i| walk(i, found)),
+                _ => {}
+            }
+        }
+
+        for tpm2 in [None, Some("7")] {
+            let got = emit_fleet_policy(tpm2);
+            let mut found = 0usize;
+            walk(&got, &mut found);
+            // The absence assertion above is vacuous if the walk found nothing,
+            // so pin the count: group 2 holds nano + 2 carried, group 3 holds
+            // the 2 carried again = 5 pkcs11 shares.
+            assert_eq!(
+                found, 5,
+                "expected 5 pkcs11 shares in the fleet tree (tpm2={tpm2:?}): {got}"
+            );
+        }
     }
 
     /// SECURITY PROPERTY — the nano is not a group-3 factor, in the EMITTED
@@ -2964,11 +3027,11 @@ mod tests {
                     threshold: 2,
                     pins: vec![
                         UnlockPin::Pkcs11(Pkcs11Pin {
-                            uri: "pkcs11:serial=YK1".to_string(),
+                            uri: "pkcs11:serial=YK1;token=TOKYK1".to_string(),
                             mechanism: None,
                         }),
                         UnlockPin::Pkcs11(Pkcs11Pin {
-                            uri: "pkcs11:serial=YK1".to_string(),
+                            uri: "pkcs11:serial=YK1;token=TOKYK1".to_string(),
                             mechanism: None,
                         }),
                     ],
@@ -3309,11 +3372,11 @@ mod tests {
                 threshold: 1,
                 pins: vec![
                     UnlockPin::Pkcs11(Pkcs11Pin {
-                        uri: "pkcs11:serial=YK0000001".to_string(),
+                        uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
                         mechanism: None,
                     }),
                     UnlockPin::Pkcs11(Pkcs11Pin {
-                        uri: "pkcs11:serial=YK0000002".to_string(),
+                        uri: "pkcs11:serial=YK0000002;token=TOKYK0000002".to_string(),
                         mechanism: None,
                     }),
                 ],

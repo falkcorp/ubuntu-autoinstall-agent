@@ -273,9 +273,7 @@ mod tests {
         let mut client = LocalClient::new();
 
         // stderr present: it wins.
-        let result = client
-            .execute_with_output("echo oops >&2; exit 3")
-            .await;
+        let result = client.execute_with_output("echo oops >&2; exit 3").await;
         match result {
             Err(crate::error::AutoInstallError::ProcessError {
                 exit_code, stderr, ..

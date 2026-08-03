@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.4.0
+// version: 1.5.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
-// last-edited: 2026-08-02
+// last-edited: 2026-08-03
 
 //! Composable clevis SSS unlock policy — the shared wire type.
 //!
@@ -65,6 +65,26 @@ use serde::{Deserialize, Serialize};
 /// on a Secure Boot host, so this type defaults to the bank the fleet uses.
 fn default_pcr_bank() -> String {
     "sha256".to_string()
+}
+
+/// The PKCS#11 mechanism every binding must carry.
+///
+/// Measured: omit `mechanism` and the policy binds cleanly, then never unlocks
+/// — `clevis-decrypt-pkcs11` fails at boot with
+/// `error: Decrypt mechanism not supported`. That is the worst possible failure
+/// shape (green install, dead host), so the mechanism is no longer left to the
+/// token's default. `RSA-PKCS` is what the fleet's PIV tokens implement.
+pub const DEFAULT_PKCS11_MECHANISM: &str = "RSA-PKCS";
+
+/// serde `default` for [`Pkcs11Pin::mechanism`] — see [`DEFAULT_PKCS11_MECHANISM`].
+///
+/// The field stays `Option<String>` with `skip_serializing_if` (emitting
+/// `"mechanism": null` would be worse than emitting nothing: clevis cannot use
+/// it), but an *unset* one now deserializes to the default rather than to
+/// `None`, so authored YAML that predates this field still produces a binding
+/// that can actually decrypt.
+fn default_pkcs11_mechanism() -> Option<String> {
+    Some(DEFAULT_PKCS11_MECHANISM.to_string())
 }
 
 /// A single share in an [`SssPolicy`]. Closed-but-growing by design, mirroring
@@ -152,15 +172,24 @@ pub struct Pkcs11Pin {
     /// hazard in
     /// `docs/research/2026-08-02-pkcs11-share-binding-hazard.md`.
     pub uri: String,
-    /// Optional PKCS#11 mechanism, e.g. `RSA-PKCS-OAEP`.
+    /// The PKCS#11 mechanism, defaulting to [`DEFAULT_PKCS11_MECHANISM`].
     ///
     /// clevis writes this straight into the JWE protected header alongside the
     /// URI, and `clevis-decrypt-pkcs11` passes `--mechanism` only when it is
-    /// non-empty — so omitting it lets the token's default apply and is the
-    /// right choice unless a specific token demands otherwise. Skipped entirely
-    /// when `None`, so a binding that does not set it is byte-identical to one
-    /// authored before this field existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// non-empty. **Leaving it unset does not fall back to something sensible**
+    /// — measured, the resulting binding succeeds and then fails at unlock with
+    /// `error: Decrypt mechanism not supported`, i.e. a green install and a
+    /// host that never boots. So this deserializes to `RSA-PKCS` when the YAML
+    /// omits it, and the emitter substitutes the same default for a `None` that
+    /// reached it by any other route.
+    ///
+    /// The type stays `Option<String>` and keeps `skip_serializing_if`: that
+    /// attribute is load-bearing in the *other* direction — without it a `None`
+    /// serializes to `"mechanism": null`, which clevis cannot parse at all.
+    #[serde(
+        default = "default_pkcs11_mechanism",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mechanism: Option<String>,
 }
 
@@ -290,7 +319,7 @@ impl SssPolicy {
                 .map(|u| {
                     UnlockPin::Pkcs11(Pkcs11Pin {
                         uri: (*u).to_string(),
-                        mechanism: None,
+                        mechanism: default_pkcs11_mechanism(),
                     })
                 })
                 .collect(),
@@ -480,7 +509,23 @@ impl SssPolicy {
         for (i, pin) in self.pins.iter().enumerate() {
             let child = format!("{path}.pins[{i}]");
             match pin {
-                UnlockPin::Pkcs11(p) => lint_pkcs11_uri(&child, &p.uri, lint),
+                UnlockPin::Pkcs11(p) => {
+                    lint_pkcs11_uri(&child, &p.uri, lint);
+                    // A mechanism that is present-but-empty is worse than an
+                    // absent one: the emitter's default only fires on `None`,
+                    // and `clevis-decrypt-pkcs11` skips `--mechanism` when the
+                    // value is empty — reproducing exactly the
+                    // `Decrypt mechanism not supported` boot failure the
+                    // default exists to prevent.
+                    if p.mechanism.as_deref().is_some_and(|m| m.trim().is_empty()) {
+                        lint.errors.push(format!(
+                            "{child}: pkcs11 `mechanism` is empty — omit the key to \
+                             take the `{DEFAULT_PKCS11_MECHANISM}` default, or name a \
+                             mechanism. An empty one binds fine and then fails at boot \
+                             with `Decrypt mechanism not supported`."
+                        ));
+                    }
+                }
                 UnlockPin::Sss(nested) => {
                     // --- rule (warn): a 1-of-1 wrapper is a no-op nesting.
                     // Harmless to clevis, but it is almost always a half-edited
@@ -511,9 +556,55 @@ pub struct PolicyLint {
     pub warnings: Vec<String>,
 }
 
+/// The RFC 7512 attribute names present in a `pkcs11:` URI, lowercased.
+///
+/// Structural, not substring: the URI is split into its path component
+/// (`;`-separated) and its query component (`?`, then `&`-separated), and each
+/// attribute is split on its FIRST `=`. That distinction matters — a substring
+/// test for `token=` also fires on a URI that only carries
+/// `slot-description=…token=…` inside a value, and a substring test for
+/// `serial=` fires on `x-vendor-serial=`. Both would wave through a URI that
+/// cannot resolve a slot.
+///
+/// Returns an empty vec for anything that is not a `pkcs11:` URI.
+pub fn pkcs11_attribute_names(uri: &str) -> Vec<String> {
+    // Attribute NAMES are case-insensitive per RFC 7512, and only names are
+    // returned, so lowercasing the whole URI up front is lossless here.
+    let lowered = uri.to_ascii_lowercase();
+    let Some(rest) = lowered.strip_prefix("pkcs11:") else {
+        return Vec::new();
+    };
+
+    let (path_part, query_part) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |segment: &str| {
+        if let Some((key, _)) = segment.split_once('=') {
+            let key = key.trim().to_ascii_lowercase();
+            if !key.is_empty() && !names.contains(&key) {
+                names.push(key);
+            }
+        }
+    };
+    for segment in path_part.split(';') {
+        push(segment);
+    }
+    if let Some(query) = query_part {
+        for segment in query.split('&') {
+            push(segment);
+        }
+    }
+    names
+}
+
 /// Rules that apply to a single PKCS#11 token URI.
 fn lint_pkcs11_uri(path: &str, uri: &str, lint: &mut PolicyLint) {
     let lowered = uri.to_ascii_lowercase();
+    let attrs = pkcs11_attribute_names(uri);
+    let has = |name: &str| attrs.iter().any(|a| a == name);
 
     if !lowered.starts_with("pkcs11:") {
         lint.errors.push(format!(
@@ -546,7 +637,7 @@ fn lint_pkcs11_uri(path: &str, uri: &str, lint: &mut PolicyLint) {
     // to nothing — the next time the host boots, which surfaces as an unlock
     // failure in the initramfs on an encrypted, unreachable machine. `serial=`
     // is a property of the token itself and is stable.
-    if lowered.contains("slot-id=") && !lowered.contains("serial=") {
+    if has("slot-id") && !has("serial") {
         lint.errors.push(format!(
             "{path}: pkcs11 uri `{uri}` is keyed on `slot-id=` with no \
              `serial=` — slot IDs are reassigned between insertions, so this \
@@ -554,6 +645,44 @@ fn lint_pkcs11_uri(path: &str, uri: &str, lint: &mut PolicyLint) {
              Key on `serial=`."
         ));
     }
+
+    // --- rule: BOTH `serial=` and `token=` are required -------------------
+    // Measured against clevis 23's own resolver chain. Only ONE of the three
+    // slot resolvers actually works for our tokens:
+    //
+    // * `clevis_get_slot_by_serial_and_token_from_uri` — needs BOTH attributes.
+    //   The only one that returns a slot for a fleet token.
+    // * `clevis_get_slot_by_serial_from_uri` — invokes `pkcs11-tool` WITHOUT
+    //   `--module`, so it is dead for any non-OpenSC provider. Ours is one.
+    // * `clevis_get_pkcs11_final_slot_from_uri` — returns rc=1 for a
+    //   `serial=`-only URI.
+    //
+    // And the failure is silent, which is why this is fatal rather than a
+    // warning: when no slot resolves, clevis falls back to `pkcs11-tool -O |
+    // head -1` and binds the share to *whichever token enumerates first*, with
+    // rc=0 and no diagnostic. A cross-decrypt matrix over the fleet's five
+    // shares found all five bound to a single token — five "independent"
+    // factors that were one factor wearing five hats. A URI that cannot resolve
+    // a slot MUST stop the install.
+    if lowered.starts_with("pkcs11:") {
+        let missing: Vec<&str> = ["serial", "token"]
+            .into_iter()
+            .filter(|name| !has(name))
+            .collect();
+        if !missing.is_empty() {
+            lint.errors.push(format!(
+                "{path}: pkcs11 uri `{uri}` is missing `{}=` — clevis resolves a \
+                 slot only via `clevis_get_slot_by_serial_and_token_from_uri`, \
+                 which requires BOTH `serial=` and `token=`. Without them no \
+                 slot resolves and clevis silently binds this share to whichever \
+                 token `pkcs11-tool -O` lists first, at rc=0, with no warning.",
+                missing.join("=`, `")
+            ));
+        }
+    }
+
+    // --- rule: an explicitly EMPTY mechanism is not a mechanism -----------
+    // Handled at the pin level rather than here; see `lint_level`.
 }
 
 #[cfg(test)]
@@ -831,8 +960,11 @@ pins:
         SssPolicy::fleet_three_group(
             &["http://172.16.2.45", "http://172.16.2.46"],
             2,
-            "pkcs11:serial=NANO0001",
-            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            "pkcs11:serial=NANO0001;token=TOKNANO0001",
+            &[
+                "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A",
+                "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B",
+            ],
             2,
             None,
         )
@@ -855,8 +987,11 @@ pins:
         let lenserv = SssPolicy::fleet_three_group(
             &["http://172.16.2.45", "http://172.16.2.46"],
             2,
-            "pkcs11:serial=NANO0001",
-            &["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"],
+            "pkcs11:serial=NANO0001;token=TOKNANO0001",
+            &[
+                "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A",
+                "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B",
+            ],
             2,
             Some("7"),
         );
@@ -866,6 +1001,190 @@ pins:
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
+    /// Helper: a valid fleet-shaped token URI (both `serial=` and `token=`).
+    fn uri(serial: &str, token: &str) -> String {
+        format!("pkcs11:serial={serial};token={token}")
+    }
+
+    // ── Fix 2: a URI that cannot resolve a slot is a HARD ERROR ─────────────
+
+    /// `serial=` alone does not resolve a slot, and the failure is silent.
+    ///
+    /// Measured against clevis 23: `clevis_get_pkcs11_final_slot_from_uri`
+    /// returns rc=1 for a `serial=`-only URI, so no slot is selected and
+    /// `pkcs11-tool -O | head -1` wins — every share binds to whichever token
+    /// enumerates first, at rc=0, with no warning. A cross-decrypt matrix over
+    /// the fleet's five shares found all five on one token.
+    #[test]
+    fn test_reject_pkcs11_uri_missing_token_attribute() {
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001".to_string(),
+                mechanism: None,
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        assert!(
+            errors[0].contains("token="),
+            "error must name the missing attribute: {errors:?}"
+        );
+    }
+
+    /// `token=` alone is equally unresolvable — the working resolver is
+    /// `clevis_get_slot_by_serial_and_token_from_uri`, which needs BOTH.
+    #[test]
+    fn test_reject_pkcs11_uri_missing_serial_attribute() {
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:token=YubiKey%20PIV".to_string(),
+                mechanism: None,
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        assert!(
+            errors[0].contains("serial="),
+            "error must name the missing attribute: {errors:?}"
+        );
+    }
+
+    /// The happy path: both attributes present, no errors and no warnings.
+    #[test]
+    fn test_accept_pkcs11_uri_with_serial_and_token() {
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: uri("YK0000001", "YubiKey%20PIV"),
+                mechanism: None,
+            })],
+        };
+        let warnings = policy
+            .validate()
+            .expect("serial= + token= must be accepted");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// The attribute check is STRUCTURAL, not a substring scan.
+    ///
+    /// A `contains("token=")` test passes on a URI whose only `token=` is
+    /// buried inside another attribute's VALUE — exactly the false-green class
+    /// this repo has been bitten by three times. Assert on parsed names.
+    #[test]
+    fn test_pkcs11_attribute_names_parses_structure_not_substrings() {
+        assert_eq!(
+            pkcs11_attribute_names("pkcs11:serial=YK1;token=Yubi"),
+            vec!["serial", "token"]
+        );
+        // `token=` appearing inside a VALUE is not an attribute name.
+        assert_eq!(
+            pkcs11_attribute_names("pkcs11:slot-description=a%20token=b"),
+            vec!["slot-description"],
+            "a `token=` inside a value must not count as the `token` attribute"
+        );
+        // Attribute names are case-insensitive; the scheme may be shouted.
+        assert_eq!(
+            pkcs11_attribute_names("PKCS11:SERIAL=YK1;Token=Yubi"),
+            vec!["serial", "token"]
+        );
+        // RFC 7512 query attributes (after `?`, joined by `&`) are attributes too.
+        assert_eq!(
+            pkcs11_attribute_names(
+                "pkcs11:serial=YK1;token=Y?module-path=/usr/lib/x.so&pin-source=/run/p"
+            ),
+            vec!["serial", "token", "module-path", "pin-source"]
+        );
+        // Not a pkcs11 URI at all.
+        assert!(pkcs11_attribute_names("YK0000001").is_empty());
+    }
+
+    /// A substring scan would call this URI valid; the structural check must not.
+    #[test]
+    fn test_reject_pkcs11_uri_whose_token_is_only_inside_a_value() {
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK1;slot-description=my%20token=thing".to_string(),
+                mechanism: None,
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert!(
+            errors.iter().any(|e| e.contains("token=")),
+            "a `token=` inside a value must not satisfy the requirement: {errors:?}"
+        );
+    }
+
+    // ── Fix 3: `mechanism` is never absent from a binding ───────────────────
+
+    /// YAML that omits `mechanism` must deserialize to the working default.
+    ///
+    /// Measured: a binding with no mechanism binds cleanly and then fails at
+    /// unlock with `error: Decrypt mechanism not supported` — a green install
+    /// and a host that never boots.
+    #[test]
+    fn test_pkcs11_mechanism_defaults_to_rsa_pkcs_when_omitted() {
+        let pin: UnlockPin =
+            serde_yaml::from_str("kind: pkcs11\nuri: \"pkcs11:serial=YK1;token=Yubi\"\n").unwrap();
+        match pin {
+            UnlockPin::Pkcs11(p) => assert_eq!(
+                p.mechanism.as_deref(),
+                Some(DEFAULT_PKCS11_MECHANISM),
+                "an omitted mechanism must default to {DEFAULT_PKCS11_MECHANISM}, not None"
+            ),
+            other => panic!("expected pkcs11, got {}", other.kind()),
+        }
+    }
+
+    /// An explicitly authored mechanism still wins over the default.
+    #[test]
+    fn test_pkcs11_mechanism_explicit_value_is_preserved() {
+        let pin: UnlockPin = serde_yaml::from_str(
+            "kind: pkcs11\nuri: \"pkcs11:serial=YK1;token=Yubi\"\nmechanism: RSA-PKCS-OAEP\n",
+        )
+        .unwrap();
+        match pin {
+            UnlockPin::Pkcs11(p) => assert_eq!(p.mechanism.as_deref(), Some("RSA-PKCS-OAEP")),
+            other => panic!("expected pkcs11, got {}", other.kind()),
+        }
+    }
+
+    /// `any_pkcs11` builds pins that can actually decrypt.
+    #[test]
+    fn test_any_pkcs11_constructor_sets_the_mechanism() {
+        let or = SssPolicy::any_pkcs11(&["pkcs11:serial=A;token=A", "pkcs11:serial=B;token=B"]);
+        for pin in &or.pins {
+            match pin {
+                UnlockPin::Pkcs11(p) => {
+                    assert_eq!(p.mechanism.as_deref(), Some(DEFAULT_PKCS11_MECHANISM))
+                }
+                other => panic!("expected pkcs11, got {}", other.kind()),
+            }
+        }
+    }
+
+    /// A present-but-empty mechanism is a hard error: the emitter's default
+    /// only fires on `None`, and clevis skips `--mechanism` when it is empty,
+    /// reproducing the very boot failure the default exists to prevent.
+    #[test]
+    fn test_reject_empty_pkcs11_mechanism() {
+        let policy = SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: uri("YK1", "Yubi"),
+                mechanism: Some(String::new()),
+            })],
+        };
+        let errors = errors_of(&policy);
+        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        assert!(
+            errors[0].contains("mechanism"),
+            "error must name the field: {errors:?}"
+        );
+    }
+
     #[test]
     fn test_reject_pkcs11_uri_with_pin_value() {
         // Storing the PIN in the LUKS header reduces the factor to
@@ -873,7 +1192,7 @@ pins:
         let policy = SssPolicy {
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
-                uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+                uri: "pkcs11:serial=YK0000001;token=Yubi;pin-value=123456".to_string(),
                 mechanism: None,
             })],
         };
@@ -889,7 +1208,7 @@ pins:
         let shouty = SssPolicy {
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
-                uri: "PKCS11:SERIAL=YK1;PIN-VALUE=123456".to_string(),
+                uri: "PKCS11:SERIAL=YK1;TOKEN=Yubi;PIN-VALUE=123456".to_string(),
                 mechanism: None,
             })],
         };
@@ -911,10 +1230,21 @@ pins:
             })],
         };
         let errors = errors_of(&policy);
-        assert_eq!(errors.len(), 1, "exactly one rule broken: {errors:?}");
+        // TWO rules now: the slot-id keying rule, and the `serial=`+`token=`
+        // requirement — a slot-id-only URI breaks both, and both messages are
+        // worth showing an author at once.
+        assert_eq!(
+            errors.len(),
+            2,
+            "slot-id + missing serial/token: {errors:?}"
+        );
         assert!(
-            errors[0].contains("slot-id="),
+            errors.iter().any(|e| e.contains("slot-id=")),
             "error must name the offending parameter: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("`serial=`, `token=`")),
+            "the unresolvable-slot rule must fire too: {errors:?}"
         );
 
         // A slot-id used only as a HINT alongside a stable serial is fine —
@@ -923,7 +1253,7 @@ pins:
         let hinted = SssPolicy {
             threshold: 1,
             pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
-                uri: "pkcs11:serial=YK0000001;slot-id=0".to_string(),
+                uri: "pkcs11:serial=YK0000001;token=Yubi;slot-id=0".to_string(),
                 mechanism: None,
             })],
         };
@@ -933,21 +1263,26 @@ pins:
         );
     }
 
-    /// `mechanism` is optional in the AUTHORING format too — omitting it must
-    /// parse, and a `module_path`/`slot` field must NOT, because clevis derives
-    /// both from the URI and a struct field for either would be authored,
+    /// `mechanism` may be omitted in the AUTHORING format (it defaults — see
+    /// `test_pkcs11_mechanism_defaults_to_rsa_pkcs_when_omitted`), and a
+    /// `module_path`/`slot` field must NOT parse, because clevis derives both
+    /// from the URI and a struct field for either would be authored,
     /// serialized, and then silently ignored.
     #[test]
-    fn test_pkcs11_mechanism_is_optional_and_module_path_is_not_a_field() {
+    fn test_pkcs11_module_path_is_not_a_config_field() {
         let bare: UnlockPin =
-            serde_yaml::from_str("kind: pkcs11\nuri: \"pkcs11:serial=YK1\"\n").unwrap();
+            serde_yaml::from_str("kind: pkcs11\nuri: \"pkcs11:serial=YK1;token=Yubi\"\n").unwrap();
         match &bare {
-            UnlockPin::Pkcs11(p) => assert_eq!(p.mechanism, None, "omitted mechanism is None"),
+            UnlockPin::Pkcs11(p) => assert_eq!(
+                p.mechanism.as_deref(),
+                Some(DEFAULT_PKCS11_MECHANISM),
+                "an omitted mechanism takes the default"
+            ),
             other => panic!("expected pkcs11, got {}", other.kind()),
         }
 
         let with_mech: UnlockPin = serde_yaml::from_str(
-            "kind: pkcs11\nuri: \"pkcs11:serial=YK1\"\nmechanism: RSA-PKCS-OAEP\n",
+            "kind: pkcs11\nuri: \"pkcs11:serial=YK1;token=Yubi\"\nmechanism: RSA-PKCS-OAEP\n",
         )
         .unwrap();
         match &with_mech {
@@ -1000,7 +1335,10 @@ pins:
         }
 
         // Case is not an escape hatch, and a well-formed URI still passes.
-        for good in ["pkcs11:serial=YK0000001", "PKCS11:serial=YK0000001"] {
+        for good in [
+            "pkcs11:serial=YK0000001;token=Yubi",
+            "PKCS11:serial=YK0000001;TOKEN=Yubi",
+        ] {
             let policy = SssPolicy {
                 threshold: 1,
                 pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
@@ -1093,15 +1431,15 @@ pins:
             threshold: 2,
             pins: vec![
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
                     mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000001".to_string(),
+                    uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
                     mechanism: None,
                 }),
                 UnlockPin::Pkcs11(Pkcs11Pin {
-                    uri: "pkcs11:serial=YK0000002".to_string(),
+                    uri: "pkcs11:serial=YK0000002;token=TOKYK0000002".to_string(),
                     mechanism: None,
                 }),
             ],
@@ -1198,8 +1536,8 @@ pins:
         let errors = errors_of(&policy);
         assert_eq!(
             errors.len(),
-            3,
-            "bad threshold + slot-id + pin-value: {errors:?}"
+            5,
+            "bad threshold + slot-id + two unresolvable-slot URIs + pin-value: {errors:?}"
         );
     }
 
@@ -1232,10 +1570,13 @@ pins:
         // cannot pass vacuously) and the nano is NOT.
         assert_eq!(
             uris,
-            vec!["pkcs11:serial=CARRIED0A", "pkcs11:serial=CARRIED0B"]
+            vec![
+                "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A",
+                "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B"
+            ]
         );
         assert!(
-            !uris.contains(&"pkcs11:serial=NANO0001"),
+            !uris.contains(&"pkcs11:serial=NANO0001;token=TOKNANO0001"),
             "the nano must NEVER be a group-3 factor: {uris:?}"
         );
         // ...and it IS in group 2, so its absence above is an exclusion, not an
@@ -1246,7 +1587,7 @@ pins:
         };
         assert!(group_two.pins.iter().any(|p| matches!(
             p,
-            UnlockPin::Pkcs11(k) if k.uri == "pkcs11:serial=NANO0001"
+            UnlockPin::Pkcs11(k) if k.uri == "pkcs11:serial=NANO0001;token=TOKNANO0001"
         )));
     }
 

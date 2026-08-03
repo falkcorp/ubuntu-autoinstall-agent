@@ -97,8 +97,7 @@ impl fmt::Debug for SecretsFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut dbg = f.debug_struct("SecretsFile");
         for (host, keys) in &self.sections {
-            let redacted: Vec<String> =
-                keys.keys().map(|k| format!("{k}: <redacted>")).collect();
+            let redacted: Vec<String> = keys.keys().map(|k| format!("{k}: <redacted>")).collect();
             dbg.field(host, &redacted);
         }
         dbg.finish()
@@ -146,7 +145,10 @@ fn parse_section_header(line: &str) -> Option<&str> {
     let name = &line[..name_end];
     let rest = &line[name_end..];
     let after_colon = rest.strip_prefix(':')?;
-    if after_colon.chars().all(|c| c == ' ' || c == '\t' || c == '\r') {
+    if after_colon
+        .chars()
+        .all(|c| c == ' ' || c == '\t' || c == '\r')
+    {
         Some(name)
     } else {
         None
@@ -674,7 +676,10 @@ mod tests {
         // comment line dropped
         assert!(!out.contains("# note"), "comment not dropped: {out}");
         // unmatched placeholder survives unchanged
-        assert!(out.contains("  other_key: REPLACE_AT_PLACE_TIME"), "got: {out}");
+        assert!(
+            out.contains("  other_key: REPLACE_AT_PLACE_TIME"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -792,7 +797,10 @@ mod tests {
 
         assert_eq!(report.refused.len(), 1, "leftover placeholder → refused");
         for (_, reason) in &report.refused {
-            assert!(!reason.contains("sekrit-123"), "reason leaked value: {reason}");
+            assert!(
+                !reason.contains("sekrit-123"),
+                "reason leaked value: {reason}"
+            );
         }
         // Debug never prints the value.
         let secrets = SecretsFile::parse(&fs::read_to_string(&secrets_path).unwrap());
@@ -820,8 +828,11 @@ mod tests {
         )
         .unwrap();
         let ca_path = secrets_dir.path().join("ca.crt");
-        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let opts = PlaceOptions {
             src_dir: src.path().to_path_buf(),
@@ -843,12 +854,17 @@ mod tests {
         let mode = fs::metadata(&placed).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o644, "wrong mode: {:o}", mode);
         let content = fs::read_to_string(&placed).unwrap();
-        assert!(content.contains("test-passphrase"), "injected value missing");
-        assert!(content.contains("-----BEGIN CERTIFICATE-----"), "CA cert missing");
+        assert!(
+            content.contains("test-passphrase"),
+            "injected value missing"
+        );
+        assert!(
+            content.contains("-----BEGIN CERTIFICATE-----"),
+            "CA cert missing"
+        );
         assert!(!content.contains(PLACEHOLDER), "placeholder leftover");
         // Parses as InstallationConfig.
-        let parsed: InstallationConfig =
-            serde_yaml::from_str(&content).expect("must parse");
+        let parsed: InstallationConfig = serde_yaml::from_str(&content).expect("must parse");
         assert_eq!(
             parsed.install_ca_cert,
             "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"
@@ -859,8 +875,11 @@ mod tests {
     fn test_inject_install_ca_cert_fills_placeholder() {
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.crt");
-        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let config = "hostname: x\ninstall_ca_cert: REPLACE_AT_PLACE_TIME\nother: y\n";
         let out = inject_install_ca_cert(config, &ca_path);
@@ -877,7 +896,10 @@ mod tests {
     fn test_inject_install_ca_cert_missing_file_is_noop() {
         let config = "hostname: x\ninstall_ca_cert: REPLACE_AT_PLACE_TIME\n";
         let out = inject_install_ca_cert(config, Path::new("/nonexistent/ca.crt"));
-        assert_eq!(out, config, "missing CA file must leave the placeholder untouched");
+        assert_eq!(
+            out, config,
+            "missing CA file must leave the placeholder untouched"
+        );
     }
 
     // ── DS-OPS-03: the PLACE side of `config place --from-registry` ──────────
@@ -919,7 +941,11 @@ mod tests {
             "default path must be byte-identical to the committed source"
         );
         assert!(
-            !dest.path().join("6c4b90bc39b3").join("uaa.yaml.bak").exists(),
+            !dest
+                .path()
+                .join("6c4b90bc39b3")
+                .join("uaa.yaml.bak")
+                .exists(),
             "the non-registry path must never write a .bak"
         );
     }
@@ -931,7 +957,11 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();
         // A committed source to diff against (proves the diff path runs).
-        fs::write(src.path().join("len-serv-001.yaml"), valid_config("len-serv-001")).unwrap();
+        fs::write(
+            src.path().join("len-serv-001.yaml"),
+            valid_config("len-serv-001"),
+        )
+        .unwrap();
         let resolved: InstallationConfig =
             serde_yaml::from_str(&valid_config("len-serv-001")).unwrap();
 
@@ -951,7 +981,11 @@ mod tests {
             fs::read_dir(dest.path()).unwrap().next().is_none(),
             "dry-run must write NOTHING under dest"
         );
-        assert_eq!(report.dry_run_diffs.len(), 1, "a diff must be recorded per host");
+        assert_eq!(
+            report.dry_run_diffs.len(),
+            1,
+            "a diff must be recorded per host"
+        );
         assert_eq!(report.dry_run_diffs[0].0, "len-serv-001");
     }
 
@@ -972,8 +1006,11 @@ mod tests {
         // supply a real CA to fill it (else the hard gate refuses, and nothing
         // is written — which would defeat the point of this write-path test).
         let ca_path = src.path().join("ca.crt");
-        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         let resolved: InstallationConfig =
             serde_yaml::from_str(&valid_config("len-serv-001")).unwrap();
         let opts = PlaceOptions {
@@ -994,8 +1031,14 @@ mod tests {
             ".bak must hold the exact pre-overwrite bytes"
         );
         let new_content = fs::read_to_string(dest_dir.join("uaa.yaml")).unwrap();
-        assert!(new_content.contains("len-serv-001"), "uaa.yaml holds the newly placed config");
-        assert_ne!(new_content, old_bytes, "uaa.yaml must have been overwritten");
+        assert!(
+            new_content.contains("len-serv-001"),
+            "uaa.yaml holds the newly placed config"
+        );
+        assert_ne!(
+            new_content, old_bytes,
+            "uaa.yaml must have been overwritten"
+        );
     }
 
     #[test]
@@ -1019,8 +1062,11 @@ mod tests {
              tpm2_pin: \"12345678\"\n",
         );
         let ca_path = secrets_dir.path().join("ca.crt");
-        fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         // A resolved config carrying placeholders, as `merge` produces from
         // group defaults of REPLACE_AT_PLACE_TIME.
@@ -1045,7 +1091,13 @@ mod tests {
             !content.contains(PLACEHOLDER),
             "the hard gate must see no leftover placeholder in the serialized resolved config"
         );
-        assert!(content.contains("test-passphrase"), "secret injected into serialized resolved config");
-        assert!(content.contains("-----BEGIN CERTIFICATE-----"), "CA injected into serialized resolved config");
+        assert!(
+            content.contains("test-passphrase"),
+            "secret injected into serialized resolved config"
+        );
+        assert!(
+            content.contains("-----BEGIN CERTIFICATE-----"),
+            "CA injected into serialized resolved config"
+        );
     }
 }
