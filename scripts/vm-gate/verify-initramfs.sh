@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # file: scripts/vm-gate/verify-initramfs.sh
-# version: 1.0.0
+# version: 1.1.0
 # guid: 7d267727-2c1d-4a5e-8ce6-3007511f3de4
-# last-edited: 2026-08-02
+# last-edited: 2026-08-03
 #
 # PRE-REBOOT VERIFICATION. Given an initramfs image, assert that everything
 # the configured clevis unlock pins need is actually INSIDE it — before
@@ -160,13 +160,50 @@ if [ "$PIN" = "all" ] || [ "$PIN" = "pkcs11" ]; then
   # entirely, which is why the VM gate can never prove this half — but the
   # pieces still have to be in the image for a hardware token to work.
   REQS+=("anyof|pcscd:libpcsclite.so:libpcsclite.so.1|the pcscd/CCID smartcard stack a real YubiKey needs (SoftHSM bypasses it, so the VM gate cannot exercise it)")
+  # MEASURED 2026-08-03 in the root-LUKS gate VM: Ubuntu's libpcsclite.so.1 is a
+  # dlopen shim that loads libpcsclite_real.so.1 at runtime, and dracut's
+  # 50clevis-pin-pkcs11 installs only the shim. The initramfs console printed
+  #   loading "libpcsclite_real.so.1" failed: ... No such file or directory
+  #   No slots.
+  # so pcscd could enumerate no readers. SoftHSM does not go through pcsc-lite,
+  # so the VM gate cannot prove the YubiKey path either way — but a smartcard
+  # stack that cannot load its own backend cannot see a token, and this is the
+  # cheapest place to catch it before a host with no remote power reboots.
+  REQS+=("file|libpcsclite_real.so.1|the REAL pcsc-lite backend behind Ubuntu's libpcsclite.so.1 dlopen shim; dracut's 50clevis-pin-pkcs11 does NOT install it, so add it via install_items or a real YubiKey is invisible in the initramfs")
 fi
 
 # =========================================================================
 # Evaluate. Collect EVERY miss, not just the first.
 # =========================================================================
 have_file() { grep -qE "(^|/)$(printf '%s' "$1" | sed 's/[.[\*^$]/\\&/g')(\$|[[:space:]])" "$LISTING"; }
-have_module() { grep -qx -- "$1" "$MODULES" 2>/dev/null || grep -q -- "$1" "$LISTING"; }
+# `lsinitrd -m` prints dracut module names WITHOUT their numeric directory
+# prefix: the module that lives in /usr/lib/dracut/modules.d/50clevis-pin-pkcs11
+# is listed as `clevis-pin-pkcs11`. Matching the on-disk directory name with
+# -qx therefore never hit, and this check printed "MISSING ... DO NOT REBOOT"
+# for an initramfs that then booted and unlocked fine (measured 2026-08-03).
+#
+# Accept either spelling by stripping a leading run of digits from BOTH the
+# needle and each listed module before comparing, and anchor the comparison so
+# `clevis` never matches `clevis-pin-sss`.
+#
+# The old fallback `|| grep -q -- "$1" "$LISTING"` was an unanchored substring
+# search over the whole file listing, which is a false POSITIVE generator: the
+# string "clevis-pin-pkcs11" appears in the listing as part of hook paths even
+# when the module itself was not enabled. The listing fallback is kept only for
+# images whose `lsinitrd -m` output is unavailable, and it is anchored to a
+# modules.d path component.
+have_module() {
+  local needle="${1#"${1%%[!0-9]*}"}"   # strip any leading digits
+  if [ -s "$MODULES" ]; then
+    local m
+    while IFS= read -r m; do
+      m="${m#"${m%%[!0-9]*}"}"
+      [ "$m" = "$needle" ] && return 0
+    done < "$MODULES"
+    return 1
+  fi
+  grep -qE "modules\.d/[0-9]*${needle}(/|\$)" "$LISTING"
+}
 
 MISSING=0
 for req in "${REQS[@]}"; do
