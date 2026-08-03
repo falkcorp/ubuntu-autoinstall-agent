@@ -1778,3 +1778,61 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         assert!(r.detail.contains("shimx64.efi"));
     }
 }
+
+#[cfg(test)]
+mod emitter_verifier_loop {
+    use super::*;
+
+    /// THE LOOP: the settled fleet policy shape, exactly as the emitter writes
+    /// it (outer t=1 OR over three groups) — fed to the verifier.
+    #[test]
+    fn known_gap_verifier_rejects_the_emitted_fleet_policy() {
+        let tang = |t: u64| {
+            serde_json::json!({"t": t, "pins": {"tang": [
+            {"url":"http://172.16.2.45","adv":"/run/uaa-tang-0.adv"},
+            {"url":"http://172.16.2.46","adv":"/run/uaa-tang-1.adv"},
+            {"url":"http://172.16.2.47","adv":"/run/uaa-tang-2.adv"}]}})
+        };
+        let tok = |u: &str| serde_json::json!({"uri": u, "mechanism": "RSA-PKCS"});
+        let policy = serde_json::json!({"t": 1, "pins": {"sss": [
+            {"t": 2, "pins": {"tpm2": [{"pcr_ids":"7","pcr_bank":"sha256"}], "sss": [tang(2)]}},
+            {"t": 2, "pins": {"pkcs11": [tok("pkcs11:serial=N;token=N"), tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}},
+            {"t": 2, "pins": {"sss": [tang(1), {"t": 1, "pins": {"pkcs11": [tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}}]}}
+        ]}});
+        let r = evaluate_clevis_bindings(&[ClevisBindingLine {
+            slot: "1".into(),
+            pin: "sss".into(),
+            json: policy.to_string(),
+        }]);
+        // ── KNOWN GAP, NOT A BLESSING ───────────────────────────────────────
+        // This assertion records a BUG, so that it cannot be forgotten. The
+        // verifier REJECTS the very policy the installer emits:
+        //
+        //   slot 1: threshold is t=1, fleet policy requires t=2
+        //
+        // `validate_sss_policy` hardcodes `t == CLEVIS_THRESHOLD` (2), which
+        // predates `SssPolicy::fleet_three_group` — that returns an outer t=1
+        // OR over three groups, so every correctly-built host fails the check.
+        //
+        // It was invisible until now: the verifier used to be fed a
+        // `clevis luks list` misrendering and was wrong either way. Reading
+        // ground truth exposed the staleness. Fixing it means teaching
+        // `validate_sss_policy` about grouped OR policies — real design work
+        // (each group must be independently sound, or the OR is only as strong
+        // as its weakest branch), deliberately NOT smuggled into this change.
+        //
+        // See todo.d/2026-08-03-verifier-rejects-the-emitted-fleet-policy.md.
+        // WHEN THIS ASSERTION STARTS FAILING, the bug is fixed: delete this
+        // test, the todo fragment, and replace it with `assert!(r.passed)`.
+        assert!(
+            !r.passed,
+            "the verifier now ACCEPTS the emitted fleet policy — the known gap \
+             is closed. Delete this test and its todo fragment."
+        );
+        assert!(
+            r.detail.contains("requires t=2"),
+            "the gap should still be the stale threshold rule, got: {}",
+            r.detail
+        );
+    }
+}
