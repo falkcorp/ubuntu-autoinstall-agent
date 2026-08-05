@@ -17,9 +17,9 @@
 //! only adds behavior, mirroring `saga.rs`'s separate-trait+module precedent
 //! rather than growing `RegistryStore` (`db/registry.rs`).
 
-pub mod store;
 pub mod alloc;
 pub mod convert;
 pub mod drift;
 pub mod reify;
 pub mod resolve;
+pub mod store;

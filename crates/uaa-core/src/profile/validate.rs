@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/validate.rs
-// version: 1.2.2
+// version: 1.6.0
 // guid: 4ab394df-7428-4813-b3ee-0eab0df57448
-// last-edited: 2026-07-27
+// last-edited: 2026-08-03
 
 //! Validation logic for `HostGroupProfile` / `HostProfile` (DS-PRF-03).
 //!
@@ -32,7 +32,7 @@ use super::{HostGroupProfile, HostProfile};
 use crate::error::{AutoInstallError, Result};
 use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
 use crate::network::ssh_installer::config::{
-    ApplicationSpec, Arch, HostRole, InstallationConfig, StorageMode,
+    ApplicationSpec, Arch, HostRole, InitramfsType, InstallationConfig, StorageMode,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -99,8 +99,16 @@ pub fn validate(groups: &[HostGroupProfile], profiles: &[HostProfile]) -> Result
 ///    Tang-server host with no Tang workload is a misconfigured host.
 ///    `role == InstallTarget` requires both a storage disk plan
 ///    (`disk_device` set OR `disks` non-empty) and a non-empty unlock
-///    (`tang_servers` non-empty OR `enroll_tpm2` true) — an install target
-///    with neither is a host nobody can unlock after first boot.
+///    (`tang_servers` non-empty OR `enroll_tpm2` true OR an authored
+///    `unlock_sss` policy tree) — an install target with a disk plan but no
+///    unlock factor at all is a host nobody can unlock after first boot.
+/// 6. (Not a separate entry — the decommission-policy check is documented and
+///    implemented inside rule 5's `InstallTarget` arm.)
+/// 7. `initramfs_type` must be `Dracut`. `InitramfsTools` is unsupported
+///    fleet-wide — see [`InitramfsType::UNSUPPORTED_REASON`] for the
+///    mechanism (no `initrd.target`, therefore no bounded fail-closed on a
+///    failed unlock). Keyed on `initramfs_type` alone: it is a property of
+///    the build, not of the unlock policy, so no policy makes it safe.
 ///
 /// **Not checked here (PS-INSTALLER-29):** a resolved config carrying
 /// non-default disk sizes or `reset_enabled` would be unsupported today, but
@@ -193,13 +201,53 @@ pub fn validate_resolved(cfg: &InstallationConfig) -> Result<()> {
                         .to_string(),
                 );
             }
-            let has_unlock = !cfg.tang_servers.is_empty() || cfg.enroll_tpm2;
+            // An authored `unlock_sss` tree counts as an unlock factor in its
+            // own right: a host may declare its whole policy there (its Tang
+            // servers included) and leave the flat roster empty. Without this
+            // clause the validator would reject a config THIS crate's own
+            // `lower` happily produces.
+            let has_unlock =
+                !cfg.tang_servers.is_empty() || cfg.enroll_tpm2 || cfg.unlock_sss.is_some();
             if !has_unlock {
                 violations.push(
-                    "role is install-target but unlock is empty (no tang_servers and \
-                     enroll_tpm2 is false); at least one unlock factor is required"
+                    "role is install-target but unlock is empty (no tang_servers, no \
+                     unlock_sss policy, and enroll_tpm2 is false); at least one unlock \
+                     factor is required"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    // Rule 7: dracut everywhere. See `InitramfsType::UNSUPPORTED_REASON` for
+    // the mechanism — this is a build-shape rule, not an unlock-policy rule,
+    // so it is keyed on `initramfs_type` ALONE and applies to every role and
+    // every policy. The enum variant is deliberately still deserializable so
+    // an old committed config lands here, with an explanation, instead of on
+    // an opaque serde "unknown variant" error.
+    if cfg.initramfs_type == InitramfsType::InitramfsTools {
+        violations.push(InitramfsType::UNSUPPORTED_REASON.to_string());
+    }
+
+    // The unlock policy tree is validated for EVERY role, not just
+    // install-target: a tree that cannot be bound is a defect wherever it is
+    // authored, and the cost of catching it here is a terminal message instead
+    // of a half-bound LUKS header on a host that is by then encrypted and
+    // unreachable. `SssPolicy::validate` walks the whole tree recursively — see
+    // its rules and the reasoning for each one.
+    if let Some(policy) = cfg.unlock_sss.as_ref() {
+        match policy.validate() {
+            Ok(warnings) => {
+                // Legal but suspicious. Loud, and NOT fatal: a warning that
+                // blocks is just an error with a confusing name.
+                for warning in warnings {
+                    tracing::warn!(target: "uaa::unlock", "unlock_sss policy: {warning}");
+                }
+            }
+            Err(errors) => {
+                for error in errors {
+                    violations.push(format!("unlock_sss policy: {error}"));
+                }
             }
         }
     }
@@ -619,6 +667,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
@@ -628,6 +677,7 @@ mod tests {
             role: HostRole::InstallTarget,
             firmware_quirks: Vec::new(),
             hooks: Default::default(),
+            unlock_sss: None,
         }
     }
 
@@ -863,6 +913,107 @@ mod tests {
         );
     }
 
+    /// A host whose ENTIRE unlock policy lives in the `unlock_sss` tree — flat
+    /// Tang roster empty, TPM2 enrollment off — is a legal install target. The
+    /// tree is an unlock factor; rejecting it would mean this crate's own
+    /// `lower` produces configs its own validator refuses.
+    #[test]
+    fn test_rule5_install_target_unlocked_only_by_a_policy_tree_passes() {
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+        cfg.unlock_sss = Some(SssPolicy::tpm2_and_tang(
+            "7",
+            &[TangServer {
+                url: "http://tang1.example.internal".to_string(),
+            }],
+            1,
+        ));
+        assert!(
+            validate_resolved(&cfg).is_ok(),
+            "a tree-only unlock policy must satisfy rule 5"
+        );
+
+        // Negative control: drop the tree and the SAME config is rejected, so
+        // the assertion above is proving the tree clause and not a coincidence.
+        cfg.unlock_sss = None;
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role is install-target but unlock is empty"),
+            "got: {err}"
+        );
+    }
+
+    /// The unlock-policy rules are only worth anything if they GATE an install.
+    /// `SssPolicy::validate` has its own exhaustive unit tests; this asserts the
+    /// wiring — that a policy those rules reject cannot get past
+    /// `validate_resolved`, and that the settled fleet policy sails through.
+    #[test]
+    fn test_resolved_config_is_gated_on_the_unlock_policy_rules() {
+        use crate::network::ssh_installer::unlock_sss::{Pkcs11Pin, SssPolicy, UnlockPin};
+
+        let mut cfg = base_config();
+        cfg.role = HostRole::InstallTarget;
+        cfg.disk_device = "/dev/nvme0n1".into();
+        cfg.tang_servers = Vec::new();
+        cfg.enroll_tpm2 = false;
+
+        // A PIN stored in the LUKS header, reached through a resolved config.
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                uri: "pkcs11:serial=YK0000001;pin-value=123456".to_string(),
+                mechanism: None,
+            })],
+        });
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("unlock_sss policy") && err.to_string().contains("pin-value="),
+            "the pkcs11 rules must gate a resolved config: {err}"
+        );
+
+        // An illegal threshold buried in a nested group, likewise.
+        cfg.unlock_sss = Some(SssPolicy {
+            threshold: 1,
+            pins: vec![UnlockPin::Sss(SssPolicy {
+                threshold: 4,
+                pins: vec![UnlockPin::Pkcs11(Pkcs11Pin {
+                    uri: "pkcs11:serial=YK0000001;token=TOKYK0000001".to_string(),
+                    mechanism: None,
+                })],
+            })],
+        });
+        let err = validate_resolved(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold 4"),
+            "nested threshold rule must gate a resolved config: {err}"
+        );
+
+        // Positive control: the settled fleet policy is accepted, so the two
+        // rejections above are the rules firing and not a blanket refusal of
+        // every tree.
+        cfg.unlock_sss = Some(SssPolicy::fleet_three_group(
+            &["http://172.16.2.45", "http://172.16.2.46"],
+            2,
+            "pkcs11:serial=NANO0001;token=TOKNANO0001",
+            &[
+                "pkcs11:serial=CARRIED0A;token=TOKCARRIED0A",
+                "pkcs11:serial=CARRIED0B;token=TOKCARRIED0B",
+            ],
+            2,
+            None,
+        ));
+        assert!(
+            validate_resolved(&cfg).is_ok(),
+            "the settled fleet policy must pass the gate"
+        );
+    }
+
     #[test]
     fn test_rule5_install_target_without_disk_plan_fails() {
         let mut cfg = base_config();
@@ -897,5 +1048,106 @@ mod tests {
             msg.contains("tang_threshold 5 is out of range"),
             "got: {msg}"
         );
+    }
+
+    // -- Rule 7: initramfs-tools is unsupported, fleet-wide --
+
+    /// Splits a `validate_resolved` error back into the individual violation
+    /// strings it was assembled from, so a test can assert on a WHOLE
+    /// violation by equality instead of substring-matching the joined blob.
+    /// Three false-green assertions in this repo's history came from
+    /// `contains()`; this helper exists so rule 7 cannot become the fourth.
+    fn violations_of(err: &AutoInstallError) -> Vec<String> {
+        match err {
+            AutoInstallError::ConfigError(msg) => msg.split("; ").map(|s| s.to_string()).collect(),
+            other => panic!("expected ConfigError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rule7_initramfs_tools_is_rejected() {
+        let mut cfg = base_config();
+        cfg.initramfs_type = InitramfsType::InitramfsTools;
+        let err = validate_resolved(&cfg).expect_err("initramfs-tools must not validate");
+        // `base_config()` is otherwise valid, so rule 7 must be the SOLE
+        // violation and the payload must equal the shared constant exactly —
+        // no substring matching, and no room for a near-miss message to pass.
+        assert_eq!(
+            violations_of(&err),
+            vec![InitramfsType::UNSUPPORTED_REASON.to_string()]
+        );
+
+        // ...and it survives being collected alongside other violations as ONE
+        // element, which is only true if the message carries no `"; "` of its
+        // own. (Rule 4's pre-existing message does contain one and therefore
+        // splits into two here — that is its bug, not this rule's, and is left
+        // alone deliberately rather than tangled into a validation change.)
+        let mut multi = cfg.clone();
+        multi.arch = Arch::Arm64;
+        multi.firmware_quirks = vec![FirmwareQuirk::GrubRemovableFallback];
+        let violations = violations_of(&validate_resolved(&multi).unwrap_err());
+        assert!(
+            violations
+                .iter()
+                .any(|v| v == InitramfsType::UNSUPPORTED_REASON),
+            "rule 7 must survive collection intact, not split; got {violations:#?}"
+        );
+    }
+
+    /// Rule 7 is keyed on the initramfs implementation and NOTHING else. The
+    /// same config on dracut — including the nested policy tree that motivated
+    /// the rule — must sail through, or the guard has become a policy rule by
+    /// accident.
+    #[test]
+    fn test_rule7_does_not_fire_for_dracut() {
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        // (a) the plain default host
+        let mut cfg = base_config();
+        cfg.initramfs_type = InitramfsType::Dracut;
+        validate_resolved(&cfg).expect("dracut host must still validate");
+
+        // (b) the legacy flat N-of-M Tang host (len-serv-001/002's shape)
+        cfg.tang_servers = vec![
+            TangServer {
+                url: "http://tang1".into(),
+            },
+            TangServer {
+                url: "http://tang2".into(),
+            },
+            TangServer {
+                url: "http://tang3".into(),
+            },
+        ];
+        cfg.tang_threshold = 2;
+        validate_resolved(&cfg).expect("legacy flat Tang on dracut must still validate");
+
+        // (c) the nested policy tree
+        cfg.unlock_sss = Some(SssPolicy::tpm2_and_tang(
+            "7",
+            &[
+                TangServer {
+                    url: "http://tang1".into(),
+                },
+                TangServer {
+                    url: "http://tang2".into(),
+                },
+                TangServer {
+                    url: "http://tang3".into(),
+                },
+            ],
+            2,
+        ));
+        validate_resolved(&cfg).expect("nested policy on dracut must still validate");
+    }
+
+    /// Rule 7 rejects at VALIDATION time, not at parse time. The enum variant
+    /// stays deserializable on purpose so an old committed config yields this
+    /// rule's explanation rather than an opaque serde "unknown variant" error.
+    #[test]
+    fn test_rule7_variant_still_deserializes() {
+        let parsed: InitramfsType =
+            serde_yaml::from_str("initramfs-tools").expect("the variant must still parse");
+        assert_eq!(parsed, InitramfsType::InitramfsTools);
     }
 }

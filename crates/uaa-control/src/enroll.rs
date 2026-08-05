@@ -128,7 +128,10 @@ impl EnrollmentStore for MemEnrollmentStore {
     }
 
     async fn update(&self, row: EnrollmentRow) -> anyhow::Result<()> {
-        self.rows.lock().unwrap().insert(row.spki_fingerprint.clone(), row);
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(row.spki_fingerprint.clone(), row);
         Ok(())
     }
 
@@ -191,10 +194,9 @@ pub async fn submit_csr(
     }
 
     // Known fp: idempotent upsert — NEVER resets a decided row back to pending.
-    let existing = store
-        .get(&fp)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("enrollment row for {fp} vanished after insert_if_absent"))?;
+    let existing = store.get(&fp).await?.ok_or_else(|| {
+        anyhow::anyhow!("enrollment row for {fp} vanished after insert_if_absent")
+    })?;
 
     if existing.state == EnrollmentState::Issued {
         if let Some(cert_pem) = existing.cert_pem.as_deref() {
@@ -430,7 +432,11 @@ pub struct EnrollGrpcService {
 }
 
 impl EnrollGrpcService {
-    pub fn new(store: Arc<dyn EnrollmentStore>, ca: Arc<InstallCa>, audit: Arc<dyn AuditStore>) -> Self {
+    pub fn new(
+        store: Arc<dyn EnrollmentStore>,
+        ca: Arc<InstallCa>,
+        audit: Arc<dyn AuditStore>,
+    ) -> Self {
         Self { store, ca, audit }
     }
 }
@@ -453,10 +459,12 @@ impl uaa_proto::enroll::v1::enroll_service_server::EnrollService for EnrollGrpcS
         .await
         .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
-        Ok(tonic::Response::new(uaa_proto::enroll::v1::SubmitCsrResponse {
-            spki_fingerprint: row.spki_fingerprint,
-            state: String::from(row.state),
-        }))
+        Ok(tonic::Response::new(
+            uaa_proto::enroll::v1::SubmitCsrResponse {
+                spki_fingerprint: row.spki_fingerprint,
+                state: String::from(row.state),
+            },
+        ))
     }
 
     async fn get_credential(
@@ -467,15 +475,17 @@ impl uaa_proto::enroll::v1::enroll_service_server::EnrollService for EnrollGrpcS
         match get_credential(self.store.as_ref(), &req.spki_fingerprint).await {
             Ok(Some(row)) => {
                 let issued = row.state == EnrollmentState::Issued;
-                Ok(tonic::Response::new(uaa_proto::enroll::v1::GetCredentialResponse {
-                    state: String::from(row.state),
-                    cert_pem: row.cert_pem.unwrap_or_default(),
-                    ca_pem: if issued {
-                        self.ca.ca_cert_pem().to_string()
-                    } else {
-                        String::new()
+                Ok(tonic::Response::new(
+                    uaa_proto::enroll::v1::GetCredentialResponse {
+                        state: String::from(row.state),
+                        cert_pem: row.cert_pem.unwrap_or_default(),
+                        ca_pem: if issued {
+                            self.ca.ca_cert_pem().to_string()
+                        } else {
+                            String::new()
+                        },
                     },
-                }))
+                ))
             }
             // Fail-closed: unknown fingerprint -> NOT_FOUND, never auto-issued.
             Ok(None) => Err(tonic::Status::not_found(format!(
@@ -548,7 +558,10 @@ pub fn enroll_json_router(
         .with_state(AppState { store, ca, audit })
 }
 
-async fn handle_submit_csr(State(state): State<AppState>, Json(body): Json<SubmitCsrBody>) -> Response {
+async fn handle_submit_csr(
+    State(state): State<AppState>,
+    Json(body): Json<SubmitCsrBody>,
+) -> Response {
     match submit_csr(
         state.store.as_ref(),
         state.ca.as_ref(),
@@ -572,7 +585,10 @@ async fn handle_submit_csr(State(state): State<AppState>, Json(body): Json<Submi
     }
 }
 
-async fn handle_get_credential(State(state): State<AppState>, AxumPath(fp): AxumPath<String>) -> Response {
+async fn handle_get_credential(
+    State(state): State<AppState>,
+    AxumPath(fp): AxumPath<String>,
+) -> Response {
     match get_credential(state.store.as_ref(), &fp).await {
         Ok(Some(row)) => {
             let issued = row.state == EnrollmentState::Issued;
@@ -698,7 +714,10 @@ mod tests {
     async fn test_unknown_fp_get_credential_404() {
         let store = MemEnrollmentStore::new();
         let result = get_credential(&store, "deadbeef-unknown-fp").await.unwrap();
-        assert!(result.is_none(), "unknown fp must never auto-issue — Ok(None)");
+        assert!(
+            result.is_none(),
+            "unknown fp must never auto-issue — Ok(None)"
+        );
     }
 
     #[tokio::test]
@@ -746,7 +765,10 @@ mod tests {
         let validity = cert.validity();
         let lifetime_days =
             (validity.not_after.timestamp() - validity.not_before.timestamp()) / 86_400;
-        assert!((89..=91).contains(&lifetime_days), "expected ~90d, got {lifetime_days}d");
+        assert!(
+            (89..=91).contains(&lifetime_days),
+            "expected ~90d, got {lifetime_days}d"
+        );
 
         let mut found_dns = false;
         let mut found_uri = false;
@@ -756,7 +778,9 @@ mod tests {
             {
                 for name in &san.general_names {
                     match name {
-                        x509_parser::extensions::GeneralName::DNSName(dns) if *dns == id.hostname => {
+                        x509_parser::extensions::GeneralName::DNSName(dns)
+                            if *dns == id.hostname =>
+                        {
                             found_dns = true
                         }
                         x509_parser::extensions::GeneralName::URI(uri)
@@ -769,7 +793,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_dns && found_uri, "SAN must be hostname (DNS) + uaa-mac:<mac> (URI)");
+        assert!(
+            found_dns && found_uri,
+            "SAN must be hostname (DNS) + uaa-mac:<mac> (URI)"
+        );
     }
 
     // ── anti-over-suppression ─────────────────────────────────────────────
@@ -794,7 +821,10 @@ mod tests {
             .unwrap()
             .expect("known fp must be found");
         assert_eq!(polled.state, EnrollmentState::Issued);
-        assert!(polled.cert_pem.is_some(), "issued poll must return the signed cert");
+        assert!(
+            polled.cert_pem.is_some(),
+            "issued poll must return the signed cert"
+        );
     }
 
     // ── supersede-on-reinstall ────────────────────────────────────────────
@@ -824,7 +854,10 @@ mod tests {
         let second = submit_csr(&store, &ca, &audit, &csr2, mac, &id2.hostname)
             .await
             .unwrap();
-        assert_ne!(second.spki_fingerprint, first.spki_fingerprint, "reinstall mints a new keypair");
+        assert_ne!(
+            second.spki_fingerprint, first.spki_fingerprint,
+            "reinstall mints a new keypair"
+        );
 
         let second_issued = approve(&store, &ca, &audit, &second.spki_fingerprint, "alice")
             .await
@@ -938,9 +971,18 @@ mod tests {
                 }
             }
         }
-        assert!(!saw_spoofed_host, "renewal must never sign the resubmitted hostname claim");
-        assert!(!saw_spoofed_mac, "renewal must never sign the resubmitted mac claim");
-        assert!(saw_real_host, "renewal must keep signing the ORIGINAL approved hostname");
+        assert!(
+            !saw_spoofed_host,
+            "renewal must never sign the resubmitted hostname claim"
+        );
+        assert!(
+            !saw_spoofed_mac,
+            "renewal must never sign the resubmitted mac claim"
+        );
+        assert!(
+            saw_real_host,
+            "renewal must keep signing the ORIGINAL approved hostname"
+        );
         // Row's mac on file must also be untouched by the spoofed resubmission.
         assert_eq!(renewed.mac.as_deref(), Some(id.mac.as_str()));
     }
@@ -968,7 +1010,11 @@ mod tests {
         let after = submit_csr(&store, &ca, &audit, &csr_pem, &id.mac, &id.hostname)
             .await
             .unwrap();
-        assert_eq!(after.state, EnrollmentState::Revoked, "revoked must stay revoked, no auto-issue");
+        assert_eq!(
+            after.state,
+            EnrollmentState::Revoked,
+            "revoked must stay revoked, no auto-issue"
+        );
     }
 
     // ── rejected holds until re-approve ───────────────────────────────────
@@ -998,7 +1044,11 @@ mod tests {
         let resubmitted = submit_csr(&store, &ca, &audit, &csr_pem, &id.mac, &id.hostname)
             .await
             .unwrap();
-        assert_eq!(resubmitted.state, EnrollmentState::Rejected, "resubmit must not clear rejected");
+        assert_eq!(
+            resubmitted.state,
+            EnrollmentState::Rejected,
+            "resubmit must not clear rejected"
+        );
 
         // Operator re-approves: rejected -> issued.
         let issued = approve(&store, &ca, &audit, &submitted.spki_fingerprint, "bob")

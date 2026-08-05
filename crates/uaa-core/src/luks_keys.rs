@@ -178,7 +178,9 @@ pub async fn luks_status(
     luks_dev: &str,
 ) -> crate::error::Result<(crate::autoinstall::verify::CheckResult, Vec<Fido2Token>)> {
     validate_luks_dev(luks_dev)?;
-    let output = executor.execute_with_output(&dump_command(luks_dev)).await?;
+    let output = executor
+        .execute_with_output(&dump_command(luks_dev))
+        .await?;
     let check = crate::autoinstall::verify::evaluate_fido2_keyslot(&output);
     let tokens = parse_fido2_tokens(&output);
     Ok((check, tokens))
@@ -204,7 +206,10 @@ pub struct LuksCredentialRecord {
 /// or empty file => `vec![]`), append `record`, then write it back
 /// atomically: serialize to `<state_path>.tmp`, then `std::fs::rename` over
 /// the target. Never truncate-then-write in place.
-fn append_state(state_path: &std::path::Path, record: LuksCredentialRecord) -> crate::error::Result<()> {
+fn append_state(
+    state_path: &std::path::Path,
+    record: LuksCredentialRecord,
+) -> crate::error::Result<()> {
     let mut records: Vec<LuksCredentialRecord> = if state_path.exists() {
         let contents = std::fs::read_to_string(state_path)?;
         if contents.trim().is_empty() {
@@ -490,7 +495,9 @@ async fn wipe_slot_guarded(
     state_path: &std::path::Path,
 ) -> crate::error::Result<()> {
     // Guard #2: last-method. Read-only luksDump — not a destructive command.
-    let before = executor.execute_with_output(&dump_command(luks_dev)).await?;
+    let before = executor
+        .execute_with_output(&dump_command(luks_dev))
+        .await?;
     let would_remain = parse_fido2_tokens(&before)
         .into_iter()
         .filter(|t| t.keyslot != Some(slot))
@@ -507,8 +514,13 @@ async fn wipe_slot_guarded(
     executor.execute(&wipe_slot_command(luks_dev, slot)).await?;
 
     // Verify the token is GONE before we record the revocation.
-    let after = executor.execute_with_output(&dump_command(luks_dev)).await?;
-    if parse_fido2_tokens(&after).iter().any(|t| t.keyslot == Some(slot)) {
+    let after = executor
+        .execute_with_output(&dump_command(luks_dev))
+        .await?;
+    if parse_fido2_tokens(&after)
+        .iter()
+        .any(|t| t.keyslot == Some(slot))
+    {
         return Err(AutoInstallError::SystemError(format!(
             "wipe-slot ran but a systemd-fido2 token still binds keyslot {slot} on {luks_dev}"
         )));
@@ -597,7 +609,8 @@ pub async fn rotate_fido2(
     // ENROLL NEW FIRST. enroll_fido2 self-verifies the new token appears in the
     // header; on any failure it returns Err and appends nothing — old key
     // untouched.
-    let new_record = enroll_fido2(executor, luks_dev, role, new_serial, passphrase, state_path).await?;
+    let new_record =
+        enroll_fido2(executor, luks_dev, role, new_serial, passphrase, state_path).await?;
 
     // Only now — new key PROVEN present — retire the old one. Quorum already
     // proven this call, so the wipe leg re-checks only the last-method guard
@@ -790,9 +803,18 @@ mod tests {
 
     #[test]
     fn test_role_parse() {
-        assert_eq!("primary".parse::<CredentialRole>().unwrap(), CredentialRole::Primary);
-        assert_eq!("backup1".parse::<CredentialRole>().unwrap(), CredentialRole::Backup1);
-        assert_eq!("backup2".parse::<CredentialRole>().unwrap(), CredentialRole::Backup2);
+        assert_eq!(
+            "primary".parse::<CredentialRole>().unwrap(),
+            CredentialRole::Primary
+        );
+        assert_eq!(
+            "backup1".parse::<CredentialRole>().unwrap(),
+            CredentialRole::Backup1
+        );
+        assert_eq!(
+            "backup2".parse::<CredentialRole>().unwrap(),
+            CredentialRole::Backup2
+        );
 
         let err = "backup3".parse::<CredentialRole>().unwrap_err();
         assert!(matches!(err, AutoInstallError::ConfigError(_)));
@@ -807,7 +829,9 @@ mod tests {
     #[test]
     fn test_build_enroll_command_shape() {
         let cmd = build_enroll_command(DEV, "test-passphrase").expect("valid inputs should build");
-        assert!(cmd.contains("systemd-cryptenroll --fido2-device=auto --fido2-with-client-pin=yes /dev/nvme0n1p4"));
+        assert!(cmd.contains(
+            "systemd-cryptenroll --fido2-device=auto --fido2-with-client-pin=yes /dev/nvme0n1p4"
+        ));
         assert!(cmd.starts_with("PASSWORD="));
     }
 
@@ -842,7 +866,10 @@ mod tests {
             "/dev/sda>~/x",
         ] {
             assert!(
-                matches!(build_enroll_command(evil, "pw"), Err(AutoInstallError::ConfigError(_))),
+                matches!(
+                    build_enroll_command(evil, "pw"),
+                    Err(AutoInstallError::ConfigError(_))
+                ),
                 "injection payload should be rejected: {evil:?}"
             );
         }
@@ -920,8 +947,14 @@ Keyslots:
         assert_eq!(
             tokens,
             vec![
-                Fido2Token { token_id: 1, keyslot: Some(2) },
-                Fido2Token { token_id: 3, keyslot: Some(4) },
+                Fido2Token {
+                    token_id: 1,
+                    keyslot: Some(2)
+                },
+                Fido2Token {
+                    token_id: 3,
+                    keyslot: Some(4)
+                },
             ]
         );
     }
@@ -934,7 +967,13 @@ Keyslots:
     #[test]
     fn test_parse_fido2_tokens_missing_keyslot() {
         let tokens = parse_fido2_tokens(LUKSDUMP_MISSING_KEYSLOT);
-        assert_eq!(tokens, vec![Fido2Token { token_id: 2, keyslot: None }]);
+        assert_eq!(
+            tokens,
+            vec![Fido2Token {
+                token_id: 2,
+                keyslot: None
+            }]
+        );
     }
 
     // ── luks_status ───────────────────────────────────────────────────────
@@ -942,7 +981,9 @@ Keyslots:
     #[tokio::test]
     async fn test_luks_status_reports_tokens() {
         let mut mock = MockExecutor::new().queue(&dump_command(DEV), LUKSDUMP_MULTI);
-        let (check, tokens) = luks_status(&mut mock, DEV).await.expect("status should succeed");
+        let (check, tokens) = luks_status(&mut mock, DEV)
+            .await
+            .expect("status should succeed");
         assert!(check.passed);
         assert_eq!(tokens.len(), 2);
     }
@@ -979,17 +1020,31 @@ Keyslots:
 
         // Empty serial.
         let mut mock = MockExecutor::new();
-        let err = enroll_fido2(&mut mock, DEV, CredentialRole::Primary, "", "test-passphrase", &state_path)
-            .await
-            .unwrap_err();
+        let err = enroll_fido2(
+            &mut mock,
+            DEV,
+            CredentialRole::Primary,
+            "",
+            "test-passphrase",
+            &state_path,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AutoInstallError::ConfigError(_)));
         assert_eq!(mock.recorded.len(), 0);
 
         // Passphrase with a quote.
         let mut mock = MockExecutor::new();
-        let err = enroll_fido2(&mut mock, DEV, CredentialRole::Primary, "12345678", "a'b", &state_path)
-            .await
-            .unwrap_err();
+        let err = enroll_fido2(
+            &mut mock,
+            DEV,
+            CredentialRole::Primary,
+            "12345678",
+            "a'b",
+            &state_path,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AutoInstallError::ConfigError(_)));
         assert_eq!(mock.recorded.len(), 0);
 
@@ -1075,7 +1130,8 @@ Keyslots:
         assert_eq!(mock.recorded[2], dump_cmd);
 
         let contents = std::fs::read_to_string(&state_path).expect("state file written");
-        let records: Vec<LuksCredentialRecord> = serde_json::from_str(&contents).expect("valid json");
+        let records: Vec<LuksCredentialRecord> =
+            serde_json::from_str(&contents).expect("valid json");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].role, CredentialRole::Primary);
         assert_eq!(records[0].revoked_at, None);
@@ -1150,7 +1206,10 @@ Keyslots:
     }
 
     fn count_wipes(recorded: &[String]) -> usize {
-        recorded.iter().filter(|c| c.contains("--wipe-slot")).count()
+        recorded
+            .iter()
+            .filter(|c| c.contains("--wipe-slot"))
+            .count()
     }
 
     // ── check_tang_quorum / require_tang_quorum ──────────────────────────────
@@ -1453,8 +1512,14 @@ Keyslots:
         // New record appended, old record's revoked_at set.
         let records = read_records(&state_path).unwrap();
         assert_eq!(records.len(), 2);
-        let old = records.iter().find(|r| r.yubikey_serial == "old-serial").unwrap();
-        let new = records.iter().find(|r| r.yubikey_serial == "new-serial").unwrap();
+        let old = records
+            .iter()
+            .find(|r| r.yubikey_serial == "old-serial")
+            .unwrap();
+        let new = records
+            .iter()
+            .find(|r| r.yubikey_serial == "new-serial")
+            .unwrap();
         assert!(old.revoked_at.is_some());
         assert!(new.revoked_at.is_none());
     }
@@ -1491,7 +1556,9 @@ Keyslots:
         let mut mock = MockExecutor::new()
             .queue(&tang_adv_command(DEFAULT_TANG_URLS[0]), ADV)
             .queue(&tang_adv_command(DEFAULT_TANG_URLS[1]), ADV);
-        rot.rebind_host(&mut mock, "len-serv-003", DEV, 3).await.unwrap();
+        rot.rebind_host(&mut mock, "len-serv-003", DEV, 3)
+            .await
+            .unwrap();
         let plan = rot.retire_old_key().expect("all hosts rebound → Ok(plan)");
         assert!(plan.contains("Safe to retire"));
         assert!(rot.pending_hosts().is_empty());

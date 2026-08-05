@@ -113,8 +113,14 @@ pub const MASK_UNITS: [&str; 3] = [
 ];
 
 /// Live-rootfs tools interrogated by stage 3 (marker :81), in report order.
-pub const INTERROGATE_TOOLS: [&str; 6] =
-    ["debootstrap", "sgdisk", "zpool", "cryptsetup", "dracut", "clevis"];
+pub const INTERROGATE_TOOLS: [&str; 6] = [
+    "debootstrap",
+    "sgdisk",
+    "zpool",
+    "cryptsetup",
+    "dracut",
+    "clevis",
+];
 
 const SSH_USER: &str = "ubuntu-server";
 const SSH_LIVE_PASSWORD: &str = "default";
@@ -165,7 +171,11 @@ pub fn render_report(r: &VerifyOnVmReport) -> String {
             .get(tool)
             .copied()
             .unwrap_or(ToolStatus::Unknown);
-        out.push_str(&format!("  {:<12} {}\n", format!("{tool}:"), status.as_str()));
+        out.push_str(&format!(
+            "  {:<12} {}\n",
+            format!("{tool}:"),
+            status.as_str()
+        ));
     }
     match &r.gate {
         GateResult::Pass => out.push_str("GATE: PASS\n"),
@@ -314,13 +324,20 @@ fn scp_cmd(
     let local = shq(local);
     let remote_dst = shq(remote_dst);
     if have_sshpass && user == SSH_USER {
-        format!("sshpass -p {SSH_LIVE_PASSWORD} scp {scp_opts} {local} {user}@127.0.0.1:{remote_dst}")
+        format!(
+            "sshpass -p {SSH_LIVE_PASSWORD} scp {scp_opts} {local} {user}@127.0.0.1:{remote_dst}"
+        )
     } else {
         format!("scp {scp_opts} {local} {user}@127.0.0.1:{remote_dst}")
     }
 }
 
-fn wait_for_ssh_cmd(opts: &VmValidateOptions, have_sshpass: bool, user: &str, overall: u64) -> String {
+fn wait_for_ssh_cmd(
+    opts: &VmValidateOptions,
+    have_sshpass: bool,
+    user: &str,
+    overall: u64,
+) -> String {
     let probe = ssh_cmd(opts, have_sshpass, user, 5, "true");
     format!(
         "waited=0; while [ $waited -lt {overall} ]; do {probe} && exit 0; sleep 5; waited=$((waited+5)); done; exit 1"
@@ -379,7 +396,9 @@ async fn cleanup(executor: &mut dyn CommandExecutor, pids: &[String]) {
             .await
             .unwrap_or(false);
         if alive {
-            let _ = executor.execute(&format!("kill {pid} 2>/dev/null || true")).await;
+            let _ = executor
+                .execute(&format!("kill {pid} 2>/dev/null || true"))
+                .await;
         }
     }
 }
@@ -593,7 +612,11 @@ async fn stage2_boot_iso(
     let log = log_path_str(&opts.workdir, LOG_02_BOOT_ISO);
     let serial_log = log_path_str(&opts.workdir, "02-boot-iso-serial.log");
     let firmware = firmware_args(&ctx.ovmf_code, ctx.ovmf_vars.as_deref(), &opts.workdir);
-    let kvm = if ctx.kvm_ok { " -enable-kvm -cpu host" } else { "" };
+    let kvm = if ctx.kvm_ok {
+        " -enable-kvm -cpu host"
+    } else {
+        ""
+    };
 
     let launch_cmd = format!(
         "qemu-system-x86_64 -m 4096 -smp 2{firmware} -drive file={disk},if=virtio,format=qcow2 -cdrom {iso} -boot order=dc -chardev socket,id=chrtpm,path={sock} -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 -netdev user,id=n0,hostfwd=tcp::{port}-:22 -device virtio-net-pci,netdev=n0 -serial file:{serial_log} -display none -no-reboot{kvm} >>{log} 2>&1 & echo $!",
@@ -637,7 +660,11 @@ async fn stage2_boot_iso(
 // Stage 3: interrogate (report-only — never fails the gate)
 // ---------------------------------------------------------------------
 
-async fn stage3_interrogate(executor: &mut dyn CommandExecutor, opts: &VmValidateOptions, ctx: &mut Ctx) {
+async fn stage3_interrogate(
+    executor: &mut dyn CommandExecutor,
+    opts: &VmValidateOptions,
+    ctx: &mut Ctx,
+) {
     let _log = log_path_str(&opts.workdir, LOG_03_INTERROGATE);
 
     let units_cmd = ssh_cmd(
@@ -759,7 +786,9 @@ async fn stage4_install(
         ));
     }
     if exit_code != 0 {
-        return Err(format!("uaa install exited nonzero ({exit_code}) — see {log}"));
+        return Err(format!(
+            "uaa install exited nonzero ({exit_code}) — see {log}"
+        ));
     }
 
     // 7 phases total: Phase 0..Phase 6 ("Phase 6: Final setup" is the last).
@@ -811,14 +840,21 @@ async fn stage5_boot_disk(
     // docs/vm-validation.md); a genuine hang here is caught by the
     // boot-timeout FAIL below regardless. Backgrounded (trailing `&`) so it
     // never blocks the SSH wait that follows.
-    let serial_sock = format!("{}/serial-disk.sock", shq(&opts.workdir.display().to_string()));
+    let serial_sock = format!(
+        "{}/serial-disk.sock",
+        shq(&opts.workdir.display().to_string())
+    );
     let serial_args = if ctx.have_socat {
         format!(" -chardev socket,id=serial0,path={serial_sock},server=on,wait=off -serial chardev:serial0")
     } else {
         format!(" -serial file:{serial_log}")
     };
     let firmware = firmware_args(&ctx.ovmf_code, ctx.ovmf_vars.as_deref(), &opts.workdir);
-    let kvm = if ctx.kvm_ok { " -enable-kvm -cpu host" } else { "" };
+    let kvm = if ctx.kvm_ok {
+        " -enable-kvm -cpu host"
+    } else {
+        ""
+    };
     let launch_cmd = format!(
         "qemu-system-x86_64 -m 4096 -smp 2{firmware} -drive file={disk},if=virtio,format=qcow2 -boot order=c -chardev socket,id=chrtpm,path={sock} -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 -netdev user,id=n0,hostfwd=tcp::{port}-:22 -device virtio-net-pci,netdev=n0{serial} -display none -no-reboot{kvm} >>{log} 2>&1 & echo $!",
         disk = ctx.disk_img,
@@ -892,14 +928,32 @@ async fn stage6_assert(
         .await
         .unwrap_or_default();
 
-    let mu_cmd = ssh_cmd(opts, false, "root", 30, "systemctl is-system-running --wait");
-    let mu_out = executor.execute_with_output(&mu_cmd).await.unwrap_or_default();
+    let mu_cmd = ssh_cmd(
+        opts,
+        false,
+        "root",
+        30,
+        "systemctl is-system-running --wait",
+    );
+    let mu_out = executor
+        .execute_with_output(&mu_cmd)
+        .await
+        .unwrap_or_default();
 
     let fallback = if mu_out.contains("running") || mu_out.contains("degraded") {
         None
     } else {
-        let alt_cmd = ssh_cmd(opts, false, "root", 15, "systemctl is-active multi-user.target");
-        let alt = executor.execute_with_output(&alt_cmd).await.unwrap_or_default();
+        let alt_cmd = ssh_cmd(
+            opts,
+            false,
+            "root",
+            15,
+            "systemctl is-active multi-user.target",
+        );
+        let alt = executor
+            .execute_with_output(&alt_cmd)
+            .await
+            .unwrap_or_default();
         Some(alt.trim().to_string())
     };
 
@@ -1041,14 +1095,20 @@ mod tests {
         }
 
         fn with(mut self, cmd: &str, exit_code: i32, stdout: &str) -> Self {
-            self.responses
-                .insert(cmd.to_string(), (exit_code, stdout.to_string(), String::new()));
+            self.responses.insert(
+                cmd.to_string(),
+                (exit_code, stdout.to_string(), String::new()),
+            );
             self
         }
 
         fn with_contains(mut self, needle: &str, exit_code: i32, stdout: &str) -> Self {
-            self.contains
-                .push((needle.to_string(), exit_code, stdout.to_string(), String::new()));
+            self.contains.push((
+                needle.to_string(),
+                exit_code,
+                stdout.to_string(),
+                String::new(),
+            ));
             self
         }
 
@@ -1192,7 +1252,13 @@ Installation completed successfully\n";
         // stage 0's live-session sshpass detection.
         let cryptsetup_cmd = ssh_cmd(opts, false, "root", 30, "cryptsetup status luks");
         let zpool_cmd = ssh_cmd(opts, false, "root", 30, "zpool list -H -o name");
-        let is_system_running_cmd = ssh_cmd(opts, false, "root", 30, "systemctl is-system-running --wait");
+        let is_system_running_cmd = ssh_cmd(
+            opts,
+            false,
+            "root",
+            30,
+            "systemctl is-system-running --wait",
+        );
 
         MockExecutor::new()
             .with("uname -s", 0, "Linux")
@@ -1241,7 +1307,9 @@ Installation completed successfully\n";
         let mut last_idx = None;
         for tool in INTERROGATE_TOOLS {
             let needle = format!("{tool}:");
-            let idx = rendered.find(&needle).unwrap_or_else(|| panic!("missing tool line for {tool}"));
+            let idx = rendered
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing tool line for {tool}"));
             if let Some(prev) = last_idx {
                 assert!(idx > prev, "tool {tool} out of order");
             }
@@ -1268,7 +1336,8 @@ Installation completed successfully\n";
             assert!(
                 rendered
                     .lines()
-                    .any(|l| l.trim_start().starts_with(&needle) && l.trim_end().ends_with("UNKNOWN")),
+                    .any(|l| l.trim_start().starts_with(&needle)
+                        && l.trim_end().ends_with("UNKNOWN")),
                 "tool {tool} line missing UNKNOWN"
             );
         }
@@ -1344,7 +1413,9 @@ Phase completed: 4\nPhase completed: 5\nPhase 6: Final setup\nPhase completed: 6
         assert!(evaluate_stage6("is active", "rpool\n", "running", None).is_err());
         assert!(evaluate_stage6("is active", "rpool\nbpool\n", "degraded", None).is_ok());
         assert!(evaluate_stage6("is active", "rpool\nbpool\n", "starting", Some("active")).is_ok());
-        assert!(evaluate_stage6("is active", "rpool\nbpool\n", "starting", Some("inactive")).is_err());
+        assert!(
+            evaluate_stage6("is active", "rpool\nbpool\n", "starting", Some("inactive")).is_err()
+        );
         assert!(evaluate_stage6("not active", "rpool\nbpool\n", "running", None).is_err());
     }
 
@@ -1368,8 +1439,14 @@ Phase completed: 4\nPhase completed: 5\nPhase 6: Final setup\nPhase completed: 6
         // Presence CHECKS (`command -v qemu-img ...`) are expected here —
         // only actual invocations of the VM tooling are forbidden.
         assert!(!mock.recorded.iter().any(|c| c.contains("qemu-img create")));
-        assert!(!mock.recorded.iter().any(|c| c.contains("swtpm socket --tpmstate")));
-        assert!(!mock.recorded.iter().any(|c| c.contains("qemu-system-x86_64 -m")));
+        assert!(!mock
+            .recorded
+            .iter()
+            .any(|c| c.contains("swtpm socket --tpmstate")));
+        assert!(!mock
+            .recorded
+            .iter()
+            .any(|c| c.contains("qemu-system-x86_64 -m")));
     }
 
     #[tokio::test]
@@ -1415,7 +1492,9 @@ Phase completed: 4\nPhase completed: 5\nPhase 6: Final setup\nPhase completed: 6
                 .skip(from)
                 .find(|(_, c)| c.contains(needle))
                 .map(|(i, _)| i)
-                .unwrap_or_else(|| panic!("command containing {needle:?} not found after index {from}"))
+                .unwrap_or_else(|| {
+                    panic!("command containing {needle:?} not found after index {from}")
+                })
         };
 
         let i0 = find_after(0, "qemu-img create -f qcow2");
@@ -1441,7 +1520,8 @@ Phase completed: 4\nPhase completed: 5\nPhase 6: Final setup\nPhase completed: 6
         // Force the stage-2 SSH wait loop to fail (have_sshpass is false in
         // happy_path_opts — stage 0's preflight stubs sshpass as absent).
         let wait_cmd = wait_for_ssh_cmd(&opts, false, SSH_USER, opts.boot_timeout);
-        mock.responses.insert(wait_cmd, (1, String::new(), String::new()));
+        mock.responses
+            .insert(wait_cmd, (1, String::new(), String::new()));
 
         let result = vm_validate(&mut mock, &opts).await;
         match result {

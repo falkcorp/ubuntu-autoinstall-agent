@@ -197,8 +197,7 @@ pub async fn run_dash_action(
         Some(p) if !p.is_empty() => p,
         _ => {
             return Err(AutoInstallError::ConfigError(
-                "DASH password required: set UAA_DASH_PASSWORD or pass --dash-password"
-                    .to_string(),
+                "DASH password required: set UAA_DASH_PASSWORD or pass --dash-password".to_string(),
             ));
         }
     };
@@ -344,8 +343,7 @@ mod tests {
         for password in ["", "a'b"] {
             let wsman = build_wsman_dash_command(TARGET_IP, USERNAME, password, PowerAction::On);
             assert!(matches!(wsman, Err(AutoInstallError::ConfigError(_))));
-            let dashcli =
-                build_dashcli_command(TARGET_IP, USERNAME, password, PowerAction::On);
+            let dashcli = build_dashcli_command(TARGET_IP, USERNAME, password, PowerAction::On);
             assert!(matches!(dashcli, Err(AutoInstallError::ConfigError(_))));
         }
     }
@@ -378,24 +376,31 @@ mod tests {
             run_dash_action(&mut mock, "len-serv-002", Some(SECRET), PowerAction::On).await;
         assert!(result.is_ok());
 
-        let expected_cmd =
-            build_wsman_dash_command("len-serv-002", DASH_DEFAULT_USERNAME, SECRET, PowerAction::On)
-                .unwrap();
+        let expected_cmd = build_wsman_dash_command(
+            "len-serv-002",
+            DASH_DEFAULT_USERNAME,
+            SECRET,
+            PowerAction::On,
+        )
+        .unwrap();
         assert_eq!(mock.recorded, vec![dash_probe_command(), expected_cmd]);
     }
 
     #[tokio::test]
     async fn test_run_dash_prefers_dashcli() {
         // dashcli present: probe response is non-empty.
-        let mut mock =
-            MockExecutor::new(&[(dash_probe_command().as_str(), "/usr/bin/dashcli")]);
+        let mut mock = MockExecutor::new(&[(dash_probe_command().as_str(), "/usr/bin/dashcli")]);
         let result =
             run_dash_action(&mut mock, "len-serv-002", Some(SECRET), PowerAction::On).await;
         assert!(result.is_ok());
 
-        let expected_cmd =
-            build_dashcli_command("len-serv-002", DASH_DEFAULT_USERNAME, SECRET, PowerAction::On)
-                .unwrap();
+        let expected_cmd = build_dashcli_command(
+            "len-serv-002",
+            DASH_DEFAULT_USERNAME,
+            SECRET,
+            PowerAction::On,
+        )
+        .unwrap();
         assert_eq!(mock.recorded, vec![dash_probe_command(), expected_cmd]);
     }
 

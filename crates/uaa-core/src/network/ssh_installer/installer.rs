@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/installer.rs
-// version: 2.15.1
+// version: 2.17.0
 // guid: sshins01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Main SSH/local installer orchestrating all installation phases.
 //!
@@ -13,7 +13,7 @@ use super::config::{InstallationConfig, StorageMode, SystemInfo};
 use super::disk_native::DiskNativeManager;
 use super::disk_ops::DiskManager;
 use super::investigation::SystemInvestigator;
-use super::packages::PackageManager;
+use super::packages::{clevis23_apt_config_commands, target_pkcs11_package_suffix, PackageManager};
 use super::partitions::partition_path;
 use super::reset_partition::ResetPartitionStager;
 use super::system_setup::SystemConfigurator;
@@ -292,17 +292,26 @@ impl SshInstaller {
         }
 
         if selection.contains(0) {
-            run_phase!("Phase 0: Setup variables", self.setup_installation_variables(config));
+            run_phase!(
+                "Phase 0: Setup variables",
+                self.setup_installation_variables(config)
+            );
         } else {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", self.phase_1_package_installation());
+            run_phase!(
+                "Phase 1: Package installation",
+                self.phase_1_package_installation(config)
+            );
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
         if let Some(wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", self.phase_2_disk_preparation(config, &wipe_auth));
+            run_phase!(
+                "Phase 2: Disk preparation",
+                self.phase_2_disk_preparation(config, &wipe_auth)
+            );
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
@@ -364,12 +373,18 @@ impl SshInstaller {
         let mut failed_phases: Vec<String> = Vec::new();
         let mut successful_phases: Vec<&str> = Vec::new();
 
-        self.report(config, "running", 5, "Installation starting").await;
+        self.report(config, "running", 5, "Installation starting")
+            .await;
 
         macro_rules! run_phase {
             ($label:expr, $progress:expr, $fut:expr) => {{
-                self.report(config, "running", $progress, &format!("{} — starting", $label))
-                    .await;
+                self.report(
+                    config,
+                    "running",
+                    $progress,
+                    &format!("{} — starting", $label),
+                )
+                .await;
                 match $fut.await {
                     Ok(_) => {
                         info!("✓ Phase completed: {}", $label);
@@ -402,22 +417,38 @@ impl SshInstaller {
         }
 
         if selection.contains(0) {
-            run_phase!("Phase 0: Setup variables", 10, self.setup_installation_variables(config));
+            run_phase!(
+                "Phase 0: Setup variables",
+                10,
+                self.setup_installation_variables(config)
+            );
         } else {
             info!("Phase 0: Setup variables — SKIPPED (--phases)");
         }
         if selection.contains(1) {
-            run_phase!("Phase 1: Package installation", 20, self.phase_1_package_installation());
+            run_phase!(
+                "Phase 1: Package installation",
+                20,
+                self.phase_1_package_installation(config)
+            );
         } else {
             info!("Phase 1: Package installation — SKIPPED (--phases)");
         }
         if let Some(wipe_auth) = selection.authorize_wipe() {
-            run_phase!("Phase 2: Disk preparation", 35, self.phase_2_disk_preparation(config, &wipe_auth));
+            run_phase!(
+                "Phase 2: Disk preparation",
+                35,
+                self.phase_2_disk_preparation(config, &wipe_auth)
+            );
         } else {
             info!("Phase 2: Disk preparation — SKIPPED (--phases)");
         }
         if selection.contains(3) {
-            run_phase!("Phase 3: ZFS creation", 50, self.phase_3_zfs_creation(config));
+            run_phase!(
+                "Phase 3: ZFS creation",
+                50,
+                self.phase_3_zfs_creation(config)
+            );
         } else {
             info!("Phase 3: ZFS creation — SKIPPED (--phases)");
         }
@@ -449,8 +480,13 @@ impl SshInstaller {
                 "🎉 Installation completed successfully for {}",
                 config.hostname
             );
-            self.report(config, "success", 100, &format!("{} installed", config.hostname))
-                .await;
+            self.report(
+                config,
+                "success",
+                100,
+                &format!("{} installed", config.hostname),
+            )
+            .await;
             Ok(())
         } else {
             error!(
@@ -461,7 +497,11 @@ impl SshInstaller {
                 config,
                 "failed",
                 100,
-                &format!("{} install failed: {} phase(s)", config.hostname, failed_phases.len()),
+                &format!(
+                    "{} install failed: {} phase(s)",
+                    config.hostname,
+                    failed_phases.len()
+                ),
             )
             .await;
             Err(crate::error::AutoInstallError::InstallationError(format!(
@@ -479,7 +519,10 @@ impl SshInstaller {
     /// unchanged. NEVER runs preflight_checks (it wipes residual state),
     /// Phases 1-4 (packages/disk prep/ZFS/debootstrap), or Phase 6
     /// (final_cleanup would zpool-export / cryptsetup-close the RUNNING root).
-    pub async fn perform_in_target_configuration(&mut self, config: &InstallationConfig) -> Result<()> {
+    pub async fn perform_in_target_configuration(
+        &mut self,
+        config: &InstallationConfig,
+    ) -> Result<()> {
         self.require_connected()?;
 
         if self
@@ -870,10 +913,13 @@ impl SshInstaller {
         Ok(())
     }
 
-    async fn phase_1_package_installation(&mut self) -> Result<()> {
+    async fn phase_1_package_installation(&mut self, config: &InstallationConfig) -> Result<()> {
         info!("Phase 1: Package installation");
         let mut pm = PackageManager::new(&mut *self.runner);
-        pm.install_required_packages().await?;
+        // `clevis luks bind … pkcs11` runs on the LIVE host, so the clevis-23
+        // pocket has to be pinned here too, not only in the target chroot.
+        pm.install_required_packages(config.clevis_pkcs11_pin)
+            .await?;
         info!("Phase 1 completed");
         Ok(())
     }
@@ -883,7 +929,10 @@ impl SshInstaller {
         config: &InstallationConfig,
         auth: &WipeAuthorization,
     ) -> Result<()> {
-        info!("Phase 2: Disk preparation (storage_mode = {:?})", config.storage_mode);
+        info!(
+            "Phase 2: Disk preparation (storage_mode = {:?})",
+            config.storage_mode
+        );
         // storage_mode selects the disk path; PlainLuks (default) is the proven
         // single-disk Lenovo path, byte-identical to before; NativeKeystore is
         // the multi-disk U1 / server-profile partitioner.
@@ -902,7 +951,10 @@ impl SshInstaller {
     }
 
     async fn phase_3_zfs_creation(&mut self, config: &InstallationConfig) -> Result<()> {
-        info!("Phase 3: ZFS creation (storage_mode = {:?})", config.storage_mode);
+        info!(
+            "Phase 3: ZFS creation (storage_mode = {:?})",
+            config.storage_mode
+        );
         match config.storage_mode {
             StorageMode::PlainLuks => {
                 let mut zm = ZfsManager::new(&mut *self.runner, &mut self.variables);
@@ -982,7 +1034,7 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
     let esp_part = partition_path(&config.disk_device, 1);
     let p4 = partition_path(&config.disk_device, 4);
     let release = config.debootstrap_release.as_deref().unwrap_or("resolute");
-    vec![
+    let mut cmds = vec![
         "mkdir -p /mnt/targetos/boot/efi".to_string(),
         format!("mount {} /mnt/targetos/boot/efi", esp_part),
         format!(
@@ -1012,12 +1064,22 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         "echo 'nameserver 1.1.1.1' > /mnt/targetos/etc/resolv.conf".to_string(),
         format!("bash -lc 'ESP_UUID=$(blkid -s UUID -o value {e} 2>/dev/null || true); if [ -n \"$ESP_UUID\" ]; then echo \"UUID=$ESP_UUID /boot/efi vfat umask=0077 0 1\" >> /mnt/targetos/etc/fstab; fi'", e=esp_part),
         "chroot /mnt/targetos bash -lc '[ -d /sys/firmware/efi/efivars ] || mkdir -p /sys/firmware/efi/efivars; mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars || true'".to_string(),
+    ];
+
+    // OPT-IN, OFF BY DEFAULT. Lay the pinned 26.10 pocket into the target
+    // BEFORE `apt update`, otherwise the pocket is never indexed and the
+    // chroot silently resolves clevis 20 (no pkcs11 pin).
+    if config.clevis_pkcs11_pin {
+        cmds.extend(clevis23_apt_config_commands("/mnt/targetos"));
+    }
+
+    cmds.extend([
         "chroot /mnt/targetos bash -lc 'apt update'".to_string(),
         // Package set matched to the clean 26.04 install on len-serv-003: dracut
         // (never initramfs-tools), zfs-dracut (never zfs-initramfs), base clevis
         // (the tang pin is bundled — no clevis-tang pkg), and systemd-cryptsetup +
         // tpm2/fido2 stacks for the TPM2+PIN and YubiKey keyslots.
-        "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1'".to_string(),
+        format!("chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1{}'", target_pkcs11_package_suffix(config.clevis_pkcs11_pin)),
         "chroot /mnt/targetos bash -lc 'DEBIAN_FRONTEND=noninteractive apt purge -y os-prober || true'".to_string(),
         format!("bash -lc 'UUID=$(blkid -s UUID -o value {p4} 2>/dev/null || true); DEV=\"{p4}\"; [ -n \"$UUID\" ] && DEV=\"/dev/disk/by-uuid/$UUID\"; echo \"luks $DEV none luks,discard,initramfs\" > /mnt/targetos/etc/crypttab'"),
         "chroot /mnt/targetos bash -lc 'dracut --regenerate-all --force'".to_string(),
@@ -1026,7 +1088,9 @@ pub(super) fn build_next_commands_after_storage(config: &InstallationConfig) -> 
         "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck'".to_string(),
         "chroot /mnt/targetos bash -lc 'grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --uefi-secure-boot --recheck --no-nvram' # fallback".to_string(),
         "chroot /mnt/targetos bash -lc 'update-grub'".to_string(),
-    ]
+    ]);
+
+    cmds
 }
 
 #[cfg(test)]
@@ -1058,6 +1122,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
@@ -1067,6 +1132,7 @@ mod tests {
             role: Default::default(),
             firmware_quirks: Vec::new(),
             hooks: Default::default(),
+            unlock_sss: None,
         }
     }
 
@@ -1078,6 +1144,65 @@ mod tests {
         assert!(cmds.iter().any(|c| c.contains("dracut --regenerate-all")));
         assert!(cmds.iter().any(|c| c.contains("grub-install")));
         assert!(cmds.iter().any(|c| c.contains("update-grub")));
+    }
+
+    /// The exact chroot apt line as it stood before clevis-23 support existed.
+    /// Default-off must reproduce it byte for byte — this is what keeps
+    /// len-serv-001/002 unaffected.
+    const BASELINE_CHROOT_APT_LINE: &str = "chroot /mnt/targetos bash -lc \'DEBIAN_FRONTEND=noninteractive apt install -y grub-efi-amd64 grub-efi-amd64-signed linux-image-generic shim-signed dracut dracut-network zfs-dracut zfsutils-linux zfs-zed efibootmgr cryptsetup dosfstools clevis clevis-luks clevis-dracut clevis-systemd clevis-tpm2 systemd-cryptsetup tpm2-tools tpm-udev libfido2-1\'";
+
+    #[test]
+    fn clevis_pkcs11_pin_defaults_off_and_changes_nothing() {
+        let cfg = sample_config();
+        assert!(!cfg.clevis_pkcs11_pin, "default MUST be off");
+        let cmds = build_next_commands_after_storage(&cfg);
+
+        // Byte-identical package selection, not a fuzzy contains().
+        assert!(
+            cmds.iter().any(|c| c == BASELINE_CHROOT_APT_LINE),
+            "chroot apt line drifted from the pre-clevis-23 baseline: {cmds:#?}"
+        );
+        // And the apt plumbing must be ABSENT from the vector entirely, not
+        // present-and-empty.
+        for c in &cmds {
+            assert!(!c.contains("uaa-clevis23.sources"), "{c}");
+            assert!(!c.contains("99-uaa-clevis23-pkcs11"), "{c}");
+            assert!(!c.contains("opensc"), "{c}");
+            assert!(!c.contains("pcscd"), "{c}");
+        }
+    }
+
+    #[test]
+    fn clevis_pkcs11_pin_enabled_adds_pinned_pocket_before_apt_update() {
+        let mut cfg = sample_config();
+        cfg.clevis_pkcs11_pin = true;
+        let cmds = build_next_commands_after_storage(&cfg);
+
+        let prefs = cmds
+            .iter()
+            .position(|c| c.contains("99-uaa-clevis23-pkcs11"))
+            .expect("preferences file must be written");
+        let sources = cmds
+            .iter()
+            .position(|c| c.contains("uaa-clevis23.sources"))
+            .expect("sources file must be written");
+        let update = cmds
+            .iter()
+            .position(|c| c.contains("bash -lc \'apt update\'"))
+            .expect("apt update");
+        assert!(
+            sources < update && prefs < update,
+            "apt plumbing must precede apt update or the pocket is never indexed"
+        );
+        // Written into the TARGET filesystem, not the live host.
+        assert!(cmds[sources].contains("/mnt/targetos/etc/apt/sources.list.d/"));
+
+        assert!(
+            cmds.iter().any(|c| c.contains("libfido2-1 opensc pcscd\'")),
+            "PIV token userspace must be appended to the chroot apt line: {cmds:#?}"
+        );
+        // Only the suffix changed.
+        assert!(!cmds.iter().any(|c| c == BASELINE_CHROOT_APT_LINE));
     }
 
     #[test]
@@ -1227,7 +1352,11 @@ mod tests {
             _desc: &str,
         ) -> Result<(i32, String, String)> {
             self.commands.lock().unwrap().push(cmd.to_string());
-            Ok((0, self.responses.get(cmd).cloned().unwrap_or_default(), String::new()))
+            Ok((
+                0,
+                self.responses.get(cmd).cloned().unwrap_or_default(),
+                String::new(),
+            ))
         }
         async fn check_silent(&mut self, cmd: &str) -> Result<bool> {
             self.commands.lock().unwrap().push(cmd.to_string());
@@ -1327,7 +1456,10 @@ mod tests {
         cfg.install_ca_cert = crate::config_place::PLACEHOLDER.to_string();
 
         let result = installer.perform_installation(&cfg, &selection).await;
-        assert!(result.is_ok(), "phase 5 must not fail on an unplaced CA: {result:?}");
+        assert!(
+            result.is_ok(),
+            "phase 5 must not fail on an unplaced CA: {result:?}"
+        );
 
         let cmds = mock.recorded();
         assert!(
@@ -1351,8 +1483,8 @@ mod tests {
         let zpool = position_cmd(&cmds, "zpool create").expect("zpool create expected");
         // Match the Phase-4 debootstrap *invocation*, not the "debootstrap"
         // package name apt installs back in Phase 1.
-        let debootstrap =
-            position_cmd(&cmds, "debootstrap resolute /mnt/targetos").expect("debootstrap expected");
+        let debootstrap = position_cmd(&cmds, "debootstrap resolute /mnt/targetos")
+            .expect("debootstrap expected");
         let grub = position_cmd(&cmds, "grub-install").expect("grub-install expected");
 
         assert!(
@@ -1364,10 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn test_preflight_selective_no_wipe_on_residual() {
         // Residual rpool present, but --phases 5 omits Phase 2 → guard refuses.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1389,10 +1519,8 @@ mod tests {
     async fn test_default_run_still_wipes_on_residual() {
         // ANTI-OVER-SUPPRESSION: the same residual state under the flagless full
         // selection MUST still wipe — the guard must never block the normal path.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::full();
         let cfg = sample_config();
@@ -1418,10 +1546,8 @@ mod tests {
         // Residual rpool present + --phases 5 (omits Phase 2): preflight must
         // BYPASS the recovery-wipe (log + continue), returning Ok, and issue no
         // destructive command.
-        let mock = RecordingExecutor::with_responses(&[(
-            "zpool list -H rpool >/dev/null 2>&1",
-            "rpool",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[("zpool list -H rpool >/dev/null 2>&1", "rpool")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1430,7 +1556,12 @@ mod tests {
         assert!(result.is_ok(), "selective preflight must bypass, not error");
 
         let cmds = mock.recorded();
-        for forbidden in ["wipefs", "sgdisk --zap-all", "zpool destroy", "cryptsetup close"] {
+        for forbidden in [
+            "wipefs",
+            "sgdisk --zap-all",
+            "zpool destroy",
+            "cryptsetup close",
+        ] {
             assert!(
                 !contains_cmd(&cmds, forbidden),
                 "selective preflight bypass must not issue {forbidden:?}"
@@ -1483,10 +1614,8 @@ mod tests {
     async fn test_prep_mount_order_root_then_boot_then_esp() {
         // THE faea48e regression test: / (rpool ROOT) before /boot (bpool BOOT)
         // before the ESP.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1494,10 +1623,10 @@ mod tests {
         let _ = installer.perform_installation(&cfg, &selection).await;
 
         let cmds = mock.recorded();
-        let root = position_cmd(&cmds, "zfs mount rpool/ROOT/ubuntu_abc123")
-            .expect("root mount expected");
-        let boot = position_cmd(&cmds, "zfs mount bpool/BOOT/ubuntu_abc123")
-            .expect("boot mount expected");
+        let root =
+            position_cmd(&cmds, "zfs mount rpool/ROOT/ubuntu_abc123").expect("root mount expected");
+        let boot =
+            position_cmd(&cmds, "zfs mount bpool/BOOT/ubuntu_abc123").expect("boot mount expected");
         // Match the ESP *mount* specifically (the normalize step umounts the same
         // path first, so an unqualified `/mnt/targetos/boot/efi` would mis-match).
         let esp = position_cmd(&cmds, "mount /dev/nvme0n1p1 /mnt/targetos/boot/efi")
@@ -1512,10 +1641,8 @@ mod tests {
     async fn test_prep_normalizes_partial_mounts_first() {
         // The umount inverse ops run BEFORE any import/mount, and prep never
         // exports a pool.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1555,10 +1682,8 @@ mod tests {
     #[tokio::test]
     async fn test_prep_import_uses_altroot_no_automount() {
         // Every zpool import must carry -N (no automount) and -R /mnt/targetos.
-        let mock = RecordingExecutor::with_responses(&[(
-            ROOT_DISCOVER_CMD,
-            "rpool/ROOT/ubuntu_abc123",
-        )]);
+        let mock =
+            RecordingExecutor::with_responses(&[(ROOT_DISCOVER_CMD, "rpool/ROOT/ubuntu_abc123")]);
         let mut installer = SshInstaller::for_tests(Box::new(mock.clone()));
         let selection = PhaseSelection::parse("5").unwrap();
         let cfg = sample_config();
@@ -1566,8 +1691,7 @@ mod tests {
         let _ = installer.perform_installation(&cfg, &selection).await;
 
         let cmds = mock.recorded();
-        let imports: Vec<&String> =
-            cmds.iter().filter(|c| c.contains("zpool import")).collect();
+        let imports: Vec<&String> = cmds.iter().filter(|c| c.contains("zpool import")).collect();
         assert!(!imports.is_empty(), "prep must import at least one pool");
         for cmd in imports {
             assert!(

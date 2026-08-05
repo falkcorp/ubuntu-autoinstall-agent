@@ -111,7 +111,10 @@ pub async fn import_from(dir: &Path, store: &dyn RegistryStore) -> Result<Import
             report.skipped.machines = skipped;
         }
         None => {
-            tracing::warn!(file = REGISTRY_FILE, "registry import: file absent, skipping");
+            tracing::warn!(
+                file = REGISTRY_FILE,
+                "registry import: file absent, skipping"
+            );
             report.files_missing.push(REGISTRY_FILE.to_string());
         }
     }
@@ -179,10 +182,7 @@ fn log_unknown_keys(context: &str, obj: &Map<String, Value>, known: &[&str]) {
     }
 }
 
-async fn import_machines(
-    dir: &Path,
-    store: &dyn RegistryStore,
-) -> Result<Option<(usize, usize)>> {
+async fn import_machines(dir: &Path, store: &dyn RegistryStore) -> Result<Option<(usize, usize)>> {
     let Some(map) = read_json_dict(dir, REGISTRY_FILE)? else {
         return Ok(None);
     };
@@ -228,14 +228,20 @@ async fn import_machines(
                 .map(|s| MachineStatus::from(s.to_string()))
                 .unwrap_or(MachineStatus::Pending),
             boot_target: BootTarget::LocalDisk,
-            tpm_ek: obj.get("tpm_ek").and_then(Value::as_str).map(str::to_string),
+            tpm_ek: obj
+                .get("tpm_ek")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             registered_at: obj
                 .get("registered_at")
                 .and_then(unix_to_ts)
                 .or_else(|| Some(now_unix().to_string())),
             approved_at: obj.get("approved_at").and_then(unix_to_ts),
             last_seen: obj.get("last_seen").and_then(unix_to_ts),
-            last_ip: obj.get("last_ip").and_then(Value::as_str).map(str::to_string),
+            last_ip: obj
+                .get("last_ip")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             installed_at: None,
             last_install_status: None,
             updated_at: None,
@@ -252,10 +258,7 @@ async fn import_machines(
     Ok(Some((inserted, skipped)))
 }
 
-async fn import_yubikeys(
-    dir: &Path,
-    store: &dyn RegistryStore,
-) -> Result<Option<(usize, usize)>> {
+async fn import_yubikeys(dir: &Path, store: &dyn RegistryStore) -> Result<Option<(usize, usize)>> {
     let Some(map) = read_json_dict(dir, YUBIKEY_REGISTRY_FILE)? else {
         return Ok(None);
     };
@@ -289,8 +292,14 @@ async fn import_yubikeys(
                 .get("ssh_pubkey")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            comment: obj.get("comment").and_then(Value::as_str).map(str::to_string),
-            serial: obj.get("serial").and_then(Value::as_str).map(str::to_string),
+            comment: obj
+                .get("comment")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            serial: obj
+                .get("serial")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             status: obj
                 .get("status")
                 .and_then(Value::as_str)
@@ -693,13 +702,20 @@ mod tests {
 
         let store = MemRegistryStore::new();
         let r1 = import_from(dir.path(), &store).await.unwrap();
-        assert_eq!(r1.inserted.machines + r1.inserted.yubikeys + r1.inserted.tang, 3);
+        assert_eq!(
+            r1.inserted.machines + r1.inserted.yubikeys + r1.inserted.tang,
+            3
+        );
 
         let out_dir = tempfile::tempdir().unwrap();
         export_to_json(out_dir.path(), &store).await.unwrap();
 
         let r2 = import_from(out_dir.path(), &store).await.unwrap();
-        assert_eq!(r2.inserted, RegistryCounts::default(), "round-trip inserts 0");
+        assert_eq!(
+            r2.inserted,
+            RegistryCounts::default(),
+            "round-trip inserts 0"
+        );
         assert_eq!(r2.skipped.machines, 1);
         assert_eq!(r2.skipped.yubikeys, 1);
         assert_eq!(r2.skipped.tang, 1);

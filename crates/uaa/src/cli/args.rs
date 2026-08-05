@@ -5,8 +5,8 @@
 
 //! Command line argument definitions
 
-use uaa_core::config::Architecture;
 use clap::{Parser, Subcommand};
+use uaa_core::config::Architecture;
 
 #[derive(Parser)]
 #[command(name = "ubuntu-autoinstall-agent")]
@@ -93,7 +93,12 @@ pub enum Commands {
         #[arg(long, help = "SSH into this host and install there (omit for local)")]
         remote: Option<String>,
 
-        #[arg(short, long, default_value = "ubuntu", help = "SSH username (remote only)")]
+        #[arg(
+            short,
+            long,
+            default_value = "ubuntu",
+            help = "SSH username (remote only)"
+        )]
         username: Option<String>,
 
         #[arg(short, long, help = "Path to YAML installation config file")]
@@ -226,7 +231,11 @@ pub enum Commands {
         #[arg(long, default_value = "172.16.2.30", help = "Netboot server host")]
         server: String,
 
-        #[arg(long, default_value = "jdfalk", help = "SSH user for the netboot server")]
+        #[arg(
+            long,
+            default_value = "jdfalk",
+            help = "SSH user for the netboot server"
+        )]
         server_user: String,
 
         #[arg(long, help = "Path to custom template file")]
@@ -238,7 +247,11 @@ pub enum Commands {
         #[arg(long, help = "SSH into the target host and trigger a reboot")]
         reboot: bool,
 
-        #[arg(long, default_value = "jdfalk", help = "SSH user for the target (reboot only)")]
+        #[arg(
+            long,
+            default_value = "jdfalk",
+            help = "SSH user for the target (reboot only)"
+        )]
         target_user: String,
 
         #[arg(long, help = "Print what would happen without writing anything")]
@@ -767,7 +780,15 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Commands::Place {
-                hostname, address, server, server_user, template, flip, reboot, target_user, dry_run,
+                hostname,
+                address,
+                server,
+                server_user,
+                template,
+                flip,
+                reboot,
+                target_user,
+                dry_run,
             } => {
                 assert_eq!(hostname, "len-serv-003");
                 assert_eq!(address, "172.16.3.96/23");
@@ -788,20 +809,34 @@ mod tests {
         let args = vec![
             "ubuntu-autoinstall-agent",
             "place",
-            "--hostname", "len-serv-001",
-            "--address", "172.16.3.92/23",
-            "--server", "172.16.2.30",
-            "--server-user", "admin",
-            "--template", "/tmp/custom.tmpl",
+            "--hostname",
+            "len-serv-001",
+            "--address",
+            "172.16.3.92/23",
+            "--server",
+            "172.16.2.30",
+            "--server-user",
+            "admin",
+            "--template",
+            "/tmp/custom.tmpl",
             "--flip",
             "--reboot",
-            "--target-user", "jdfalk",
+            "--target-user",
+            "jdfalk",
             "--dry-run",
         ];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
             Commands::Place {
-                hostname, address, server, server_user, template, flip, reboot, target_user, dry_run,
+                hostname,
+                address,
+                server,
+                server_user,
+                template,
+                flip,
+                reboot,
+                target_user,
+                dry_run,
             } => {
                 assert_eq!(hostname, "len-serv-001");
                 assert_eq!(address, "172.16.3.92/23");
@@ -831,7 +866,13 @@ mod tests {
         ];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Commands::Verify { host, hostname, address, username, strict } => {
+            Commands::Verify {
+                host,
+                hostname,
+                address,
+                username,
+                strict,
+            } => {
                 assert_eq!(host, "172.16.3.96");
                 assert_eq!(hostname, "len-serv-003");
                 assert_eq!(address, "172.16.3.96/23");
@@ -859,7 +900,13 @@ mod tests {
         ];
         let cli = Cli::try_parse_from(args).unwrap();
         match cli.command {
-            Commands::Verify { host, hostname, address, username, strict } => {
+            Commands::Verify {
+                host,
+                hostname,
+                address,
+                username,
+                strict,
+            } => {
                 assert_eq!(host, "172.16.3.92");
                 assert_eq!(hostname, "len-serv-001");
                 assert_eq!(address, "172.16.3.92/23");

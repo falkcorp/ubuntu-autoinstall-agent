@@ -1090,11 +1090,7 @@ mod tests {
             .insert_machine_if_absent(seed_machine_row())
             .await
             .unwrap();
-        fx.participants
-            .place_ipxe
-            .lock()
-            .unwrap()
-            .push_back(false); // place_ipxe fails
+        fx.participants.place_ipxe.lock().unwrap().push_back(false); // place_ipxe fails
         let deps = fx.deps(Some(5));
 
         let outcome = approve_machine(&deps, MAC).await.unwrap();
@@ -1304,10 +1300,7 @@ mod tests {
         assert!(
             history.iter().all(|r| r.state != SagaState::Compensated),
             "must NEVER be marked compensated while an undo is outstanding: {:?}",
-            history
-                .iter()
-                .map(|r| r.state.clone())
-                .collect::<Vec<_>>()
+            history.iter().map(|r| r.state.clone()).collect::<Vec<_>>()
         );
         let row = latest_row(&fx.saga_store, MAC);
         assert_eq!(

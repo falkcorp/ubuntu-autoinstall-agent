@@ -318,7 +318,12 @@ async fn handle_network_config(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    serve_seed_file(&state, &addr.ip().to_canonical().to_string(), "network-config").await
+    serve_seed_file(
+        &state,
+        &addr.ip().to_canonical().to_string(),
+        "network-config",
+    )
+    .await
 }
 
 async fn handle_uaa_config(

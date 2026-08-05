@@ -42,13 +42,13 @@
 
 use std::path::Path;
 
+use uaa_control::db::store::StatePaths;
+use uaa_control::profiles::store::{ProfileStore, SnapshotProfileStore};
 use uaa_core::config_place::{
     mac_for_host, place_configs, PlaceOptions, PlaceReport, DEFAULT_DEST_BASE,
     DEFAULT_INSTALL_CA_CERT_PATH, DEFAULT_SRC_DIR, KNOWN_HOSTS,
 };
 use uaa_core::network::InstallationConfig;
-use uaa_control::db::store::StatePaths;
-use uaa_control::profiles::store::{ProfileStore, SnapshotProfileStore};
 
 #[derive(Debug, clap::Args)]
 pub struct ConfigArgs {
@@ -157,8 +157,8 @@ async fn reify_host_from_file(
     host: &str,
     actor: &str,
 ) -> Result<(), String> {
-    let mac =
-        mac_for_host(host).ok_or_else(|| "unknown host (add its MAC to mac_for_host)".to_string())?;
+    let mac = mac_for_host(host)
+        .ok_or_else(|| "unknown host (add its MAC to mac_for_host)".to_string())?;
     let path = src_dir.join(format!("{host}.yaml"));
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -446,7 +446,10 @@ mod tests {
         base.hosts = vec!["len-serv-001".to_string(), "len-serv-002".to_string()];
 
         let result = resolve_all_and_place(&store, base, false).await;
-        assert!(result.is_err(), "a host that fails to resolve must fail the whole run");
+        assert!(
+            result.is_err(),
+            "a host that fails to resolve must fail the whole run"
+        );
         assert!(
             result.unwrap_err().to_string().contains("len-serv-002"),
             "the error must name the unresolvable host"
@@ -478,7 +481,11 @@ mod tests {
         // hostname-sorted order (the allocation-order contract 001/002/003);
         // unimatrixone is a pinned standalone (hostname_override, no allocation).
         let indexed = ["len-serv-001", "len-serv-002", "len-serv-003"];
-        let macs = ["6c:4b:90:bc:39:b3", "6c:4b:90:bc:f8:a3", "6c:4b:90:bc:f7:f4"];
+        let macs = [
+            "6c:4b:90:bc:39:b3",
+            "6c:4b:90:bc:f8:a3",
+            "6c:4b:90:bc:f7:f4",
+        ];
         for (host, mac) in indexed.iter().zip(macs.iter()) {
             uaa_control::register_from_config(
                 &store,
@@ -506,7 +513,12 @@ mod tests {
         .await
         .unwrap();
 
-        for host in ["len-serv-001", "len-serv-002", "len-serv-003", "unimatrixone"] {
+        for host in [
+            "len-serv-001",
+            "len-serv-002",
+            "len-serv-003",
+            "unimatrixone",
+        ] {
             let resolved = uaa_control::resolve_from_registry(&store, host)
                 .await
                 .unwrap_or_else(|e| panic!("resolving {host}: {e}"));
@@ -556,7 +568,11 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 0, "no committed configs found in {}", dir.display());
+        assert!(
+            checked > 0,
+            "no committed configs found in {}",
+            dir.display()
+        );
     }
 
     #[test]
@@ -570,7 +586,10 @@ mod tests {
         let standalone = group_spec_for_host("unimatrixone");
         assert_eq!(standalone.group_name, "unimatrixone");
         assert!(standalone.is_standalone);
-        assert_eq!(standalone.hostname_override.as_deref(), Some("unimatrixone"));
+        assert_eq!(
+            standalone.hostname_override.as_deref(),
+            Some("unimatrixone")
+        );
     }
 
     #[tokio::test]

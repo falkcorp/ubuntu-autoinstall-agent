@@ -212,9 +212,7 @@ impl<'a> ResetPartitionStager<'a> {
 
         let avail_bytes: u64 = self
             .runner
-            .execute_with_output(&format!(
-                "df --output=avail -B1 {RESET_MOUNT} | tail -n1"
-            ))
+            .execute_with_output(&format!("df --output=avail -B1 {RESET_MOUNT} | tail -n1"))
             .await
             .unwrap_or_default()
             .trim()
@@ -330,7 +328,10 @@ impl<'a> ResetPartitionStager<'a> {
     /// the warn-and-return paths) so RESET is never left mounted into Phase
     /// 6. Built from an `|| true` guard, so this is always `Ok`.
     async fn unmount_reset(&mut self) -> Result<()> {
-        let _ = self.runner.execute(&format!("umount {RESET_MOUNT} || true")).await;
+        let _ = self
+            .runner
+            .execute(&format!("umount {RESET_MOUNT} || true"))
+            .await;
         Ok(())
     }
 

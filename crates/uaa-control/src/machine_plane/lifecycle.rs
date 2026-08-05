@@ -448,10 +448,22 @@ fn parse_app_status_reports(data: &Value) -> Vec<AppStatusReportRow> {
         .map(|arr| {
             arr.iter()
                 .map(|r| AppStatusReportRow {
-                    kind: r.get("kind").and_then(Value::as_str).unwrap_or("").to_string(),
-                    unit: r.get("unit").and_then(Value::as_str).unwrap_or("").to_string(),
+                    kind: r
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    unit: r
+                        .get("unit")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     active: r.get("active").and_then(Value::as_bool).unwrap_or(false),
-                    detail: r.get("detail").and_then(Value::as_str).unwrap_or("").to_string(),
+                    detail: r
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                 })
                 .collect()
         })
@@ -1075,7 +1087,11 @@ mod tests {
             serde_json::to_vec(&json!({"mac": "aa:bb:cc:dd:ee:ff", "reports": []})).unwrap(),
         );
         let resp = handle_app_status(State(state), body).await;
-        assert_eq!(resp.status(), StatusCode::OK, "empty reports is not an error");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty reports is not an error"
+        );
         let v = body_json(resp).await;
         assert_eq!(v["ok"], true);
         assert_eq!(v["reports_recorded"], 0);

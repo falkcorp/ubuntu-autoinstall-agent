@@ -155,10 +155,7 @@ impl PlaceReport {
 /// The server maintains `/var/www/html/cloud-init/<hostname> → <hexmac>`.
 /// We read this symlink via SSH to avoid requiring the caller to know or
 /// supply the MAC address.
-pub async fn resolve_hexmac(
-    server: &mut dyn CommandExecutor,
-    hostname: &str,
-) -> Result<String> {
+pub async fn resolve_hexmac(server: &mut dyn CommandExecutor, hostname: &str) -> Result<String> {
     let cloud_init_base = &crate::fleet::fleet().cloud_init_base;
     let symlink_path = format!("{cloud_init_base}/{hostname}");
     let output = server
@@ -189,33 +186,25 @@ pub async fn write_seed(
     let md_remote = seed_path(hexmac, "meta-data");
 
     // Write user-data to temp file
-    let mut ud_tmp = tempfile::NamedTempFile::new()
-        .map_err(AutoInstallError::IoError)?;
+    let mut ud_tmp = tempfile::NamedTempFile::new().map_err(AutoInstallError::IoError)?;
     ud_tmp
         .write_all(user_data.as_bytes())
         .map_err(AutoInstallError::IoError)?;
     ud_tmp.flush().map_err(AutoInstallError::IoError)?;
 
     // Write meta-data to temp file
-    let mut md_tmp = tempfile::NamedTempFile::new()
-        .map_err(AutoInstallError::IoError)?;
+    let mut md_tmp = tempfile::NamedTempFile::new().map_err(AutoInstallError::IoError)?;
     md_tmp
         .write_all(meta_data.as_bytes())
         .map_err(AutoInstallError::IoError)?;
     md_tmp.flush().map_err(AutoInstallError::IoError)?;
 
     server
-        .upload_file(
-            ud_tmp.path().to_str().unwrap_or("/tmp/ud"),
-            &ud_remote,
-        )
+        .upload_file(ud_tmp.path().to_str().unwrap_or("/tmp/ud"), &ud_remote)
         .await?;
 
     server
-        .upload_file(
-            md_tmp.path().to_str().unwrap_or("/tmp/md"),
-            &md_remote,
-        )
+        .upload_file(md_tmp.path().to_str().unwrap_or("/tmp/md"), &md_remote)
         .await?;
 
     Ok((ud_remote, md_remote))
@@ -426,21 +415,37 @@ mod tests {
     #[async_trait]
     impl CommandExecutor for RecordingMock {
         async fn connect(&mut self, host: &str, user: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(("connect".into(), host.into(), user.into()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("connect".into(), host.into(), user.into()));
             Ok(())
         }
         async fn execute(&mut self, cmd: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(("execute".into(), cmd.into(), String::new()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("execute".into(), cmd.into(), String::new()));
             Ok(())
         }
         async fn execute_with_output(&mut self, cmd: &str) -> Result<String> {
-            self.calls.lock().unwrap().push(("execute_with_output".into(), cmd.into(), String::new()));
+            self.calls.lock().unwrap().push((
+                "execute_with_output".into(),
+                cmd.into(),
+                String::new(),
+            ));
             Ok(self.responses.get(cmd).cloned().unwrap_or_default())
         }
         async fn execute_with_error_collection(
-            &mut self, cmd: &str, _desc: &str,
+            &mut self,
+            cmd: &str,
+            _desc: &str,
         ) -> Result<(i32, String, String)> {
-            Ok((0, self.responses.get(cmd).cloned().unwrap_or_default(), String::new()))
+            Ok((
+                0,
+                self.responses.get(cmd).cloned().unwrap_or_default(),
+                String::new(),
+            ))
         }
         async fn check_silent(&mut self, cmd: &str) -> Result<bool> {
             Ok(!self.responses.get(cmd).map_or(true, |s| s.is_empty()))
@@ -449,11 +454,17 @@ mod tests {
             Ok(String::new())
         }
         async fn upload_file(&mut self, local: &str, remote: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(("upload_file".into(), local.into(), remote.into()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("upload_file".into(), local.into(), remote.into()));
             Ok(())
         }
         async fn download_file(&mut self, remote: &str, local: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(("download_file".into(), remote.into(), local.into()));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("download_file".into(), remote.into(), local.into()));
             Ok(())
         }
         fn disconnect(&mut self) {}
@@ -527,7 +538,9 @@ mod tests {
     async fn resolve_hexmac_errors_on_missing_hostname() {
         let mut mock = RecordingMock::with_responses(&[]);
         let err = resolve_hexmac(&mut mock, "unknown-host").await.unwrap_err();
-        assert!(err.to_string().contains("No cloud-init directory registered"));
+        assert!(err
+            .to_string()
+            .contains("No cloud-init directory registered"));
     }
 
     // ── write_seed tests ─────────────────────────────────────────────────────
@@ -544,7 +557,10 @@ mod tests {
         assert_eq!(md_path, "/var/www/html/cloud-init/6c4b90bcf7f4/meta-data");
 
         let calls = mock.recorded();
-        let upload_calls: Vec<_> = calls.iter().filter(|(m, _, _)| m == "upload_file").collect();
+        let upload_calls: Vec<_> = calls
+            .iter()
+            .filter(|(m, _, _)| m == "upload_file")
+            .collect();
         assert_eq!(upload_calls.len(), 2);
         // Check remote paths (second arg to upload_file)
         let remote_paths: Vec<&str> = upload_calls.iter().map(|(_, _, r)| r.as_str()).collect();
@@ -580,7 +596,10 @@ mod tests {
 
         // No upload_file calls in dry-run
         let calls = server.recorded();
-        let uploads: Vec<_> = calls.iter().filter(|(m, _, _)| m == "upload_file").collect();
+        let uploads: Vec<_> = calls
+            .iter()
+            .filter(|(m, _, _)| m == "upload_file")
+            .collect();
         assert!(uploads.is_empty());
     }
 
@@ -609,7 +628,10 @@ mod tests {
         assert_eq!(report.hexmac, "6c4b90bcf7f4");
 
         let calls = server.recorded();
-        let uploads: Vec<_> = calls.iter().filter(|(m, _, _)| m == "upload_file").collect();
+        let uploads: Vec<_> = calls
+            .iter()
+            .filter(|(m, _, _)| m == "upload_file")
+            .collect();
         assert_eq!(uploads.len(), 2);
     }
 
@@ -660,6 +682,8 @@ mod tests {
         let err = place_and_drive(&mut server, None, &spec, &opts)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("No cloud-init directory registered"));
+        assert!(err
+            .to_string()
+            .contains("No cloud-init directory registered"));
     }
 }

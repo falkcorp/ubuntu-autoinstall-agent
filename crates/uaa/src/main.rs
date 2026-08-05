@@ -44,12 +44,8 @@ async fn main() -> Result<()> {
                 via_ssh,
                 dry_run,
             } => deploy_command(&target, &config, &image, via_ssh, dry_run).await,
-            uaa::cli::args::Commands::Validate { image } => {
-                validate_command(&image).await
-            }
-            uaa::cli::args::Commands::CheckPrereqs => {
-                check_prerequisites_command().await
-            }
+            uaa::cli::args::Commands::Validate { image } => validate_command(&image).await,
+            uaa::cli::args::Commands::CheckPrereqs => check_prerequisites_command().await,
             uaa::cli::args::Commands::ListImages { filter_arch, json } => {
                 list_images_command(filter_arch.map(Into::into), json).await
             }

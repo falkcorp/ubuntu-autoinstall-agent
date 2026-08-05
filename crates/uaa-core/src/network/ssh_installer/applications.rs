@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/applications.rs
-// version: 1.4.1
+// version: 1.4.2
 // guid: dc8e60fb-8d31-4869-96bf-bf6203d3a530
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! `ApplicationInstaller`: dispatches per-application installation for
 //! `config.applications` (DS-APP-02).
@@ -259,10 +259,7 @@ impl<'a> ApplicationInstaller<'a> {
         // The packaged unit reads ARGS from /etc/default/prometheus-node-exporter,
         // so override there rather than editing the vendor unit.
         if !spec.listen_address.is_empty() {
-            let defaults = format!(
-                "ARGS=\"--web.listen-address={}\"\n",
-                spec.listen_address
-            );
+            let defaults = format!("ARGS=\"--web.listen-address={}\"\n", spec.listen_address);
             self.runner
                 .execute(&format!(
                     "cat > /mnt/targetos/etc/default/prometheus-node-exporter \
@@ -426,9 +423,7 @@ impl<'a> ApplicationInstaller<'a> {
             .execute_with_output(&Self::chroot_wrap(&format!("curl -fsSL \"{cert_url}\"")))
             .await
             .map_err(|e| {
-                AutoInstallError::ConfigError(format!(
-                    "cert fetch from {cert_url} failed: {e}"
-                ))
+                AutoInstallError::ConfigError(format!("cert fetch from {cert_url} failed: {e}"))
             })?;
         let parsed: serde_json::Value = serde_json::from_str(&cert_json).map_err(|e| {
             AutoInstallError::ConfigError(format!(
@@ -441,11 +436,14 @@ impl<'a> ApplicationInstaller<'a> {
                 "cert fetch from {cert_url} returned ok:false; body: {cert_json}"
             )));
         }
-        let certs = parsed.get("certs").and_then(|v| v.as_object()).ok_or_else(|| {
-            AutoInstallError::ConfigError(format!(
-                "cert fetch from {cert_url} response missing 'certs' object; body: {cert_json}"
-            ))
-        })?;
+        let certs = parsed
+            .get("certs")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                AutoInstallError::ConfigError(format!(
+                    "cert fetch from {cert_url} response missing 'certs' object; body: {cert_json}"
+                ))
+            })?;
         for (fname, b64_val) in certs {
             // Allowlist BEFORE anything else touches `fname` — this is the
             // only thing standing between an MITM'd response and a
@@ -704,6 +702,7 @@ mod tests {
             tpm2_pin: None,
             tpm2_pcr_ids: "7".into(),
             expect_fido2: true,
+            clevis_pkcs11_pin: false,
             install_ca_cert: "test-ca-pem".into(),
             applications: vec![],
             cockroach_members: Vec::new(),
@@ -713,6 +712,7 @@ mod tests {
             role: Default::default(),
             firmware_quirks: Vec::new(),
             hooks: Default::default(),
+            unlock_sss: None,
         }
     }
 
@@ -727,7 +727,8 @@ mod tests {
             max_sql_memory: "25%".into(),
             locality: "region=default".into(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".into(),
-            decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
+            decommission:
+                crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         }
     }
 
@@ -783,7 +784,10 @@ mod tests {
 
         let result = installer.install(&config).await;
 
-        assert!(result.is_ok(), "TangServer dispatch must not error: {result:?}");
+        assert!(
+            result.is_ok(),
+            "TangServer dispatch must not error: {result:?}"
+        );
         assert_eq!(
             executor.recorded().len(),
             0,
@@ -852,15 +856,24 @@ mod tests {
 
         let (advertise_1, join_1) = derive_cockroach_endpoints("172.16.3.92/23", &members, &spec);
         assert_eq!(advertise_1, "172.16.3.92:36357");
-        assert_eq!(join_1, "172.16.2.30:36357,172.16.3.94:36357,172.16.3.96:36357");
+        assert_eq!(
+            join_1,
+            "172.16.2.30:36357,172.16.3.94:36357,172.16.3.96:36357"
+        );
 
         let (advertise_2, join_2) = derive_cockroach_endpoints("172.16.3.94/23", &members, &spec);
         assert_eq!(advertise_2, "172.16.3.94:36357");
-        assert_eq!(join_2, "172.16.2.30:36357,172.16.3.92:36357,172.16.3.96:36357");
+        assert_eq!(
+            join_2,
+            "172.16.2.30:36357,172.16.3.92:36357,172.16.3.96:36357"
+        );
 
         let (advertise_3, join_3) = derive_cockroach_endpoints("172.16.3.96/23", &members, &spec);
         assert_eq!(advertise_3, "172.16.3.96:36357");
-        assert_eq!(join_3, "172.16.2.30:36357,172.16.3.92:36357,172.16.3.94:36357");
+        assert_eq!(
+            join_3,
+            "172.16.2.30:36357,172.16.3.92:36357,172.16.3.94:36357"
+        );
     }
 
     #[test]
@@ -872,7 +885,10 @@ mod tests {
         let (advertise, join) = derive_cockroach_endpoints("172.16.3.92/23", &members, &spec);
 
         assert_eq!(advertise, format!("172.16.3.92:{}", spec.port));
-        assert!(!advertise.contains('/'), "advertise must not carry a CIDR suffix");
+        assert!(
+            !advertise.contains('/'),
+            "advertise must not carry a CIDR suffix"
+        );
         assert!(
             !join.contains("172.16.3.92/23:"),
             "join must not contain an unstripped self entry: {join}"
@@ -892,7 +908,10 @@ mod tests {
 
         let (_, join) = derive_cockroach_endpoints("172.16.3.92/23", &members, &spec);
 
-        assert!(!join.contains("172.16.3.96"), "released member leaked into join: {join}");
+        assert!(
+            !join.contains("172.16.3.96"),
+            "released member leaked into join: {join}"
+        );
     }
 
     #[test]
@@ -903,7 +922,10 @@ mod tests {
 
         let (advertise, join) = derive_cockroach_endpoints("172.16.3.92/23", &members, &spec);
 
-        assert!(join.starts_with(&advertise), "seed must be listed first: {join}");
+        assert!(
+            join.starts_with(&advertise),
+            "seed must be listed first: {join}"
+        );
         assert_eq!(
             join.matches("172.16.3.92:").count(),
             1,
@@ -1010,10 +1032,10 @@ mod tests {
             // through the real local file so a base64-decode bug would
             // show up as a byte-count mismatch, not just "a call happened".
             let bytes = std::fs::read(local_path).unwrap_or_default();
-            self.commands
-                .lock()
-                .unwrap()
-                .push(format!("upload_file remote={remote_path} bytes={}", bytes.len()));
+            self.commands.lock().unwrap().push(format!(
+                "upload_file remote={remote_path} bytes={}",
+                bytes.len()
+            ));
             Ok(())
         }
         async fn download_file(&mut self, _remote_path: &str, _local_path: &str) -> Result<()> {
@@ -1047,21 +1069,39 @@ mod tests {
         let enable_idx = idx("systemctl enable cockroach");
         let start_idx = idx("systemctl start cockroach");
 
-        assert!(curl_idx < useradd_idx, "binary download must precede useradd");
+        assert!(
+            curl_idx < useradd_idx,
+            "binary download must precede useradd"
+        );
         assert!(useradd_idx < cert_idx, "useradd must precede cert fetch");
-        assert!(cert_idx < unit_idx, "certs must be fetched before the unit is written");
-        assert!(unit_idx < reload_idx, "unit must be written before daemon-reload");
+        assert!(
+            cert_idx < unit_idx,
+            "certs must be fetched before the unit is written"
+        );
+        assert!(
+            unit_idx < reload_idx,
+            "unit must be written before daemon-reload"
+        );
         assert!(reload_idx < enable_idx, "daemon-reload must precede enable");
         assert!(enable_idx < start_idx, "enable must precede start");
 
         // Anti-over-suppression companion to
         // test_cert_response_rejects_unexpected_filename: the allowlist
         // check must not reject the three *legitimate* cert filenames.
-        let uploads: Vec<&String> = commands.iter().filter(|c| c.starts_with("upload_file")).collect();
-        assert_eq!(uploads.len(), 3, "expected exactly 3 cert uploads: {commands:?}");
+        let uploads: Vec<&String> = commands
+            .iter()
+            .filter(|c| c.starts_with("upload_file"))
+            .collect();
+        assert_eq!(
+            uploads.len(),
+            3,
+            "expected exactly 3 cert uploads: {commands:?}"
+        );
         for fname in COCKROACH_CERT_FILENAMES {
             assert!(
-                uploads.iter().any(|u| u.contains(&format!("certs/{fname}"))),
+                uploads
+                    .iter()
+                    .any(|u| u.contains(&format!("certs/{fname}"))),
                 "missing upload for {fname}: {commands:?}"
             );
         }
@@ -1090,7 +1130,9 @@ mod tests {
             "no cert file may be written once an unexpected filename is seen: {commands:?}"
         );
         assert!(
-            !commands.iter().any(|c| c.contains("systemctl start cockroach")),
+            !commands
+                .iter()
+                .any(|c| c.contains("systemctl start cockroach")),
             "must never start a node when the cert response was rejected: {commands:?}"
         );
     }

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/verify.rs
-// version: 1.5.0
+// version: 2.1.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-08-03
+// last-edited: 2026-08-05
 
 //! Post-install verification for Lenovo fleet hosts.
 //!
@@ -33,11 +33,7 @@
 //! # }
 //! ```
 
-use crate::{
-    autoinstall::host_spec::HostSpec,
-    network::executor::CommandExecutor,
-    Result,
-};
+use crate::{autoinstall::host_spec::HostSpec, network::executor::CommandExecutor, Result};
 
 // ── Fleet-wide constants used only for verification ──────────────────────────
 
@@ -77,6 +73,9 @@ pub const TANG_URLS: &[&str] = &[
 /// [`min_satisfying_shares`]. This is deliberately NOT a threshold on any one
 /// `"t"` field: the settled policy has an outer `t=1`, and thresholds only mean
 /// anything relative to the cost of the branches they range over.
+///
+/// This supersedes the old `CLEVIS_THRESHOLD` constant, which hardcoded an
+/// outer `t == 2` and therefore rejected the settled policy outright.
 const MIN_SATISFYING_SHARES: usize = 2;
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -91,11 +90,19 @@ pub struct CheckResult {
 
 impl CheckResult {
     fn pass(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: true, detail: detail.into() }
+        Self {
+            name,
+            passed: true,
+            detail: detail.into(),
+        }
     }
 
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, passed: false, detail: detail.into() }
+        Self {
+            name,
+            passed: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -155,9 +162,16 @@ pub fn evaluate_zfs_pools(zpool_output: &str) -> CheckResult {
         CheckResult::pass("zfs_pools", "rpool + bpool imported")
     } else {
         let mut missing = vec![];
-        if !has_rpool { missing.push("rpool"); }
-        if !has_bpool { missing.push("bpool"); }
-        CheckResult::fail("zfs_pools", format!("missing pool(s): {}", missing.join(", ")))
+        if !has_rpool {
+            missing.push("rpool");
+        }
+        if !has_bpool {
+            missing.push("bpool");
+        }
+        CheckResult::fail(
+            "zfs_pools",
+            format!("missing pool(s): {}", missing.join(", ")),
+        )
     }
 }
 
@@ -253,63 +267,195 @@ pub fn evaluate_shim_present(esp_listing: &str) -> CheckResult {
     let has_shim = esp_listing.lines().any(|l| l.trim() == "shimx64.efi");
     let has_grub = esp_listing.lines().any(|l| l.trim() == "grubx64.efi");
     if has_shim && has_grub {
-        CheckResult::pass("shim_present", "shimx64.efi + grubx64.efi installed (Secure Boot ready)")
+        CheckResult::pass(
+            "shim_present",
+            "shimx64.efi + grubx64.efi installed (Secure Boot ready)",
+        )
     } else {
         let mut missing = vec![];
-        if !has_shim { missing.push("shimx64.efi"); }
-        if !has_grub { missing.push("grubx64.efi"); }
+        if !has_shim {
+            missing.push("shimx64.efi");
+        }
+        if !has_grub {
+            missing.push("grubx64.efi");
+        }
         CheckResult::fail("shim_present", format!("missing: {}", missing.join(", ")))
     }
 }
 
-/// One `slot: pin '<json>'` line from `clevis luks list`.
+/// One clevis binding, recovered from the LUKS2 token it is stored in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClevisBindingLine {
-    /// LUKS keyslot number, e.g. `1`.
+    /// LUKS keyslot number the token unlocks, e.g. `1`.
     pub slot: String,
     /// Top-level clevis pin name, e.g. `sss` or `tang`.
     pub pin: String,
-    /// The single-quoted JSON payload, unquoted.
+    /// The reconstructed clevis pin config, as JSON.
     pub json: String,
 }
 
-/// Parse `clevis luks list` output into one entry per bound keyslot.
+/// The command whose output [`parse_clevis_tokens`] consumes.
 ///
-/// Real-world format is one line per slot:
+/// # Why not `clevis luks list`
+///
+/// **Because it lies about nested policies.** Measured on clevis 20 /
+/// cryptsetup 2.8.4 by binding a known tree to a loopback LUKS2 volume and
+/// reading back what each tool reported:
 ///
 /// ```text
-/// 1: sss '{"t":2,"pins":{...}}'
+/// authored: {"t":2,"pins":{"null":[{}],"sss":[{"t":2,"pins":{"tang":[a,b,c]}}]}}
+/// rendered: {"t":2,"pins":{"sss":{"t":2,"pins":{"tang":[a,b,c]}}}}
+///                          ^^^ the `null` share is GONE, and the `sss` ARRAY
+///                              has become a bare OBJECT
 /// ```
 ///
-/// The pin name is taken from the parsed token, never from a substring of the
-/// whole line — that conflation is what let a vulnerable policy masquerade as a
-/// valid one. Lines that do not match the shape are skipped.
-pub fn parse_clevis_bindings(clevis_output: &str) -> Vec<ClevisBindingLine> {
-    clevis_output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let (slot, rest) = line.split_once(':')?;
-            if slot.is_empty() || !slot.chars().all(|c| c.is_ascii_digit()) {
-                return None;
-            }
-            // JSON never contains a single quote, so first/last delimit it.
-            let open = rest.find('\'')?;
-            let close = rest.rfind('\'')?;
-            if close <= open {
-                return None;
-            }
-            let pin = rest[..open].trim();
-            if pin.is_empty() {
-                return None;
-            }
-            Some(ClevisBindingLine {
-                slot: slot.to_string(),
-                pin: pin.to_string(),
-                json: rest[open + 1..close].to_string(),
+/// A second measurement, with two nested groups:
+///
+/// ```text
+/// authored: {"t":1,"pins":{"sss":[{"t":2,"pins":{"null":[{},{}]}},
+///                                 {"t":1,"pins":{"null":[{},{},{}]}}]}}
+/// rendered: {"t":1,"pins":{"sss":{"t":1,"pins":{}}}}
+/// ```
+///
+/// Both renderings drop shares and collapse arrays, which is precisely the
+/// share arithmetic every check in this module depends on. A verifier reading
+/// that output is reading fiction — it can call a Tang-satisfiable policy safe,
+/// or a safe one broken, with equal confidence.
+///
+/// The JWE stored in the LUKS2 token is the ground truth: it is what clevis
+/// itself decrypts at boot, and the whole tree is recoverable from it.
+pub const CLEVIS_PROBE_COMMAND: &str = "cryptsetup luksDump --dump-json-metadata";
+
+/// Recover the clevis policy tree from a JWE `protected` header.
+///
+/// The header is base64url (unpadded) JSON of the form
+/// `{"alg":…,"clevis":{"pin":"<name>","<name>":{…}},"enc":…}`. For an `sss`
+/// pin the config is `{"t":N,"jwe":[<compact JWE>, …]}`, where each element is
+/// a nested binding whose own protected header is its first `.`-separated
+/// segment. Verified against a real binding produced by `clevis luks bind`.
+///
+/// Returns `(pin_name, config_in_clevis_form)`. Nested groups are rebuilt into
+/// the authored `{"t":…,"pins":{…}}` shape — same-kind children grouped into
+/// one array-valued key, exactly as clevis's config language expresses them —
+/// so every existing structural check applies unchanged.
+fn policy_from_protected_header(
+    protected_b64: &str,
+) -> std::result::Result<(String, serde_json::Value), String> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(protected_b64.trim())
+        .map_err(|e| format!("JWE protected header is not base64url: {e}"))?;
+    let header: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("JWE protected header is not JSON: {e}"))?;
+
+    let clevis = header
+        .get("clevis")
+        .and_then(|c| c.as_object())
+        .ok_or_else(|| "JWE protected header has no \"clevis\" object".to_string())?;
+    let pin = clevis
+        .get("pin")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| "clevis header has no \"pin\"".to_string())?
+        .to_string();
+    let config = clevis
+        .get(&pin)
+        .ok_or_else(|| format!("clevis header has no \"{pin}\" config for its own pin"))?;
+
+    if pin != "sss" {
+        return Ok((pin, config.clone()));
+    }
+
+    let threshold = config
+        .get("t")
+        .and_then(|t| t.as_u64())
+        .ok_or_else(|| "sss config has no numeric \"t\"".to_string())?;
+    let children = config
+        .get("jwe")
+        .and_then(|j| j.as_array())
+        .ok_or_else(|| "sss config has no \"jwe\" array of child bindings".to_string())?;
+
+    // Group children by pin name so the result speaks clevis's config language,
+    // where `pins` is an OBJECT and N same-kind shares are an N-element array.
+    let mut pins = serde_json::Map::new();
+    for child in children {
+        let compact = child
+            .as_str()
+            .ok_or_else(|| "sss child binding is not a compact JWE string".to_string())?;
+        let child_protected = compact
+            .split('.')
+            .next()
+            .ok_or_else(|| "sss child binding is empty".to_string())?;
+        let (child_pin, child_cfg) = policy_from_protected_header(child_protected)?;
+        let entry = pins
+            .entry(child_pin)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        match entry {
+            serde_json::Value::Array(items) => items.push(child_cfg),
+            // `or_insert_with` above only ever inserts arrays.
+            other => return Err(format!("internal: pins entry is not an array: {other}")),
+        }
+    }
+
+    Ok((
+        pin,
+        serde_json::json!({ "t": threshold, "pins": serde_json::Value::Object(pins) }),
+    ))
+}
+
+/// Parse `cryptsetup luksDump --dump-json-metadata <dev>` into one entry per
+/// clevis-bound keyslot, reconstructing each policy from its JWE.
+///
+/// `Err` on unparseable metadata or an undecodable binding — never a partial
+/// result, because a silently-skipped binding is a keyslot that can open the
+/// volume and was not checked. Non-clevis tokens (`systemd-tpm2`,
+/// `systemd-fido2`, …) are not bindings and are ignored by design.
+pub fn parse_clevis_tokens(luks_json: &str) -> std::result::Result<Vec<ClevisBindingLine>, String> {
+    let meta: serde_json::Value =
+        serde_json::from_str(luks_json).map_err(|e| format!("LUKS2 metadata is not JSON: {e}"))?;
+    let Some(tokens) = meta.get("tokens").and_then(|t| t.as_object()) else {
+        // A header with no tokens at all is a header with no clevis binding.
+        return Ok(Vec::new());
+    };
+
+    // `tokens` is a JSON object keyed by token id; sort numerically so the
+    // report is stable rather than at the mercy of map ordering.
+    let mut ids: Vec<&String> = tokens.keys().collect();
+    ids.sort_by_key(|id| id.parse::<u64>().unwrap_or(u64::MAX));
+
+    let mut out = Vec::new();
+    for id in ids {
+        let token = &tokens[id];
+        if token.get("type").and_then(|t| t.as_str()) != Some("clevis") {
+            continue;
+        }
+        let protected = token
+            .get("jwe")
+            .and_then(|j| j.get("protected"))
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| format!("token {id}: clevis token has no jwe.protected header"))?;
+        let (pin, config) =
+            policy_from_protected_header(protected).map_err(|e| format!("token {id}: {e}"))?;
+        // A token names the keyslot(s) it unlocks; report them as the slot.
+        let slot = token
+            .get("keyslots")
+            .and_then(|k| k.as_array())
+            .map(|slots| {
+                slots
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .collect::<Vec<&str>>()
+                    .join(",")
             })
-        })
-        .collect()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("token {id}"));
+        out.push(ClevisBindingLine {
+            slot,
+            pin,
+            json: config.to_string(),
+        });
+    }
+    Ok(out)
 }
 
 /// Number of independent SSS **shares** contributed by a `pins` object.
@@ -326,6 +472,34 @@ pub fn count_shares(pins: &serde_json::Map<String, serde_json::Value>) -> usize 
             _ => 1,
         })
         .sum()
+}
+
+/// Collect every Tang `url` appearing anywhere in a clevis policy tree.
+fn collect_tang_urls(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map {
+                if key == "tang" {
+                    let entries: Vec<&serde_json::Value> = match val {
+                        serde_json::Value::Array(items) => items.iter().collect(),
+                        other => vec![other],
+                    };
+                    for entry in entries {
+                        if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
+                            out.push(url.to_string());
+                        }
+                    }
+                }
+                collect_tang_urls(val, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_tang_urls(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The **smallest number of leaf factors** that can satisfy a clevis policy
@@ -412,34 +586,6 @@ fn min_satisfying_shares_at(
     }
     costs.sort_unstable();
     Ok(costs.iter().take(t).sum())
-}
-
-/// Collect every Tang `url` appearing anywhere in a clevis policy tree.
-fn collect_tang_urls(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                if key == "tang" {
-                    let entries: Vec<&serde_json::Value> = match val {
-                        serde_json::Value::Array(items) => items.iter().collect(),
-                        other => vec![other],
-                    };
-                    for entry in entries {
-                        if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
-                            out.push(url.to_string());
-                        }
-                    }
-                }
-                collect_tang_urls(val, out);
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_tang_urls(item, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Reject the **flattening bug** anywhere in the tree.
@@ -567,7 +713,9 @@ fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String
 /// Clevis SSS binding is present, is bound only to Tang servers we run, and has
 /// a **share topology** no single factor can open.
 ///
-/// Expects output of `clevis luks list <dev>`.
+/// Expects output of [`CLEVIS_PROBE_COMMAND`] — **not** `clevis luks list`,
+/// whose rendering of a nested policy drops shares and collapses arrays. See
+/// that constant for the measurements.
 ///
 /// # Why this is structural and not a substring match
 ///
@@ -594,15 +742,29 @@ fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String
 /// Fails closed: empty output, unparseable JSON, or no `sss` binding all FAIL.
 /// With multiple keyslots, ANY vulnerable binding fails the check — every slot
 /// can unlock the volume, so a good slot does not redeem a bad one.
-pub fn evaluate_clevis_binding(clevis_output: &str) -> CheckResult {
+pub fn evaluate_clevis_binding(luks_json: &str) -> CheckResult {
+    const NAME: &str = "clevis_binding";
+    match parse_clevis_tokens(luks_json) {
+        Ok(bindings) => evaluate_clevis_bindings(&bindings),
+        // Fails CLOSED: metadata we cannot read is not metadata we can bless.
+        Err(e) => CheckResult::fail(
+            NAME,
+            format!("could not read clevis bindings from LUKS2 metadata: {e}"),
+        ),
+    }
+}
+
+/// The structural half of [`evaluate_clevis_binding`], over already-recovered
+/// bindings. Split out so the topology rules can be exercised directly on a
+/// policy tree without round-tripping it through a JWE.
+pub fn evaluate_clevis_bindings(bindings: &[ClevisBindingLine]) -> CheckResult {
     const NAME: &str = "clevis_binding";
     let tang_urls = &crate::fleet::fleet().tang_urls;
 
-    let bindings = parse_clevis_bindings(clevis_output);
     if bindings.is_empty() {
         return CheckResult::fail(
             NAME,
-            "no clevis binding found (empty or unparseable `clevis luks list` output)",
+            "no clevis binding found (no `clevis` token in the LUKS2 header)",
         );
     }
 
@@ -720,7 +882,10 @@ pub fn evaluate_crypttab(crypttab_output: &str) -> CheckResult {
 /// Expects output of `cat /etc/dracut.conf.d/clevis.conf`.
 pub fn evaluate_dracut_network(dracut_conf: &str) -> CheckResult {
     if dracut_conf.contains("add_dracutmodules") && dracut_conf.contains("network") {
-        CheckResult::pass("dracut_network_module", "add_dracutmodules includes network")
+        CheckResult::pass(
+            "dracut_network_module",
+            "add_dracutmodules includes network",
+        )
     } else {
         CheckResult::fail(
             "dracut_network_module",
@@ -736,11 +901,18 @@ pub fn evaluate_dracut_kernel_cmdline(dracut_conf: &str) -> CheckResult {
     let has_neednet = dracut_conf.contains("rd.neednet=1");
     let has_ip_dhcp = dracut_conf.contains("ip=dhcp");
     if has_neednet && has_ip_dhcp {
-        CheckResult::pass("dracut_kernel_cmdline", "kernel_cmdline has rd.neednet=1 ip=dhcp")
+        CheckResult::pass(
+            "dracut_kernel_cmdline",
+            "kernel_cmdline has rd.neednet=1 ip=dhcp",
+        )
     } else {
         let mut reasons = vec![];
-        if !has_neednet { reasons.push("missing rd.neednet=1"); }
-        if !has_ip_dhcp { reasons.push("missing ip=dhcp"); }
+        if !has_neednet {
+            reasons.push("missing rd.neednet=1");
+        }
+        if !has_ip_dhcp {
+            reasons.push("missing ip=dhcp");
+        }
         CheckResult::fail("dracut_kernel_cmdline", reasons.join("; "))
     }
 }
@@ -755,7 +927,10 @@ pub fn evaluate_grub_cmdline(grub_content: &str) -> CheckResult {
         .any(|l| l.contains("rd.neednet=1") && l.contains("ip=dhcp"));
 
     if in_grub_line {
-        CheckResult::pass("grub_cmdline", "GRUB_CMDLINE_LINUX has rd.neednet=1 ip=dhcp")
+        CheckResult::pass(
+            "grub_cmdline",
+            "GRUB_CMDLINE_LINUX has rd.neednet=1 ip=dhcp",
+        )
     } else {
         CheckResult::fail(
             "grub_cmdline",
@@ -774,8 +949,12 @@ pub fn evaluate_running_cmdline(proc_cmdline: &str) -> CheckResult {
         CheckResult::pass("running_cmdline", "boot cmdline has rd.neednet=1 ip=dhcp")
     } else {
         let mut reasons = vec![];
-        if !has_neednet { reasons.push("missing rd.neednet=1"); }
-        if !has_ip_dhcp { reasons.push("missing ip=dhcp"); }
+        if !has_neednet {
+            reasons.push("missing rd.neednet=1");
+        }
+        if !has_ip_dhcp {
+            reasons.push("missing ip=dhcp");
+        }
         CheckResult::fail("running_cmdline", reasons.join("; "))
     }
 }
@@ -801,7 +980,10 @@ pub fn evaluate_hostname(hostname_output: &str, spec: &HostSpec) -> CheckResult 
 pub fn evaluate_ip_address(ip_br_output: &str, spec: &HostSpec) -> CheckResult {
     let lenserv_nic = &crate::fleet::fleet().lenserv_nic;
     if ip_br_output.contains(&spec.network_address) {
-        CheckResult::pass("ip_matches", format!("{} on {lenserv_nic}", spec.network_address))
+        CheckResult::pass(
+            "ip_matches",
+            format!("{} on {lenserv_nic}", spec.network_address),
+        )
     } else {
         CheckResult::fail(
             "ip_matches",
@@ -820,7 +1002,10 @@ pub fn evaluate_service(svc_name: &'static str, is_active_output: &str) -> Check
     if is_active_output.trim() == "active" {
         CheckResult::pass(svc_name, "active")
     } else {
-        CheckResult::fail(svc_name, format!("not active: '{}'", is_active_output.trim()))
+        CheckResult::fail(
+            svc_name,
+            format!("not active: '{}'", is_active_output.trim()),
+        )
     }
 }
 
@@ -872,7 +1057,7 @@ pub async fn verify_host(
 
     // 2. Clevis SSS Tang binding
     let clevis = runner
-        .execute_with_output(&format!("sudo -n clevis luks list -d {luks_partition}"))
+        .execute_with_output(&format!("sudo -n {CLEVIS_PROBE_COMMAND} {luks_partition}"))
         .await
         .unwrap_or_default();
     checks.push(evaluate_clevis_binding(&clevis));
@@ -1045,11 +1230,21 @@ luks        crypt zfs_member";
     const LUKSDUMP_003: &str = "\
 LUKS header information\nVersion:        2\nTokens:\n  0: clevis\n  1: systemd-tpm2\n  2: systemd-fido2\nKeyslots:\n  0: luks2\n";
 
+    /// The live len-serv-003 policy, as a bare clevis `sss` config — the shape
+    /// [`parse_clevis_tokens`] reconstructs out of the LUKS2 token's JWE.
     const CLEVIS_003: &str =
-        "1: sss '{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}'";
+        "{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}";
 
-    const CRYPTTAB_003: &str =
-        "dm_crypt-0 UUID=210735c1-4b9d-45ff-a954-8d3648e17e1a none luks\n";
+    /// One recovered `sss` binding on keyslot 1.
+    fn sss_binding(json: &str) -> Vec<ClevisBindingLine> {
+        vec![ClevisBindingLine {
+            slot: "1".to_string(),
+            pin: "sss".to_string(),
+            json: json.to_string(),
+        }]
+    }
+
+    const CRYPTTAB_003: &str = "dm_crypt-0 UUID=210735c1-4b9d-45ff-a954-8d3648e17e1a none luks\n";
 
     const DRACUT_CONF_003: &str = "\
 add_dracutmodules+=\" network \"\nkernel_cmdline=\"rd.neednet=1 ip=dhcp\"\n";
@@ -1075,7 +1270,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn clevis_binding_passes_on_live_fixture() {
-        assert!(evaluate_clevis_binding(CLEVIS_003).passed);
+        assert!(evaluate_clevis_bindings(&sss_binding(CLEVIS_003)).passed);
     }
 
     /// The VULNERABLE shape: `tang` is a DIRECT child of the outer `pins`, so
@@ -1083,16 +1278,16 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// and the three Tang servers ALONE satisfy the threshold — the tpm2 pin
     /// contributes nothing to the threat model.
     const CLEVIS_VULNERABLE_2_OF_4: &str =
-        "1: sss '{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}],\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"}}}'";
+        "{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}],\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"}}}";
 
     /// The CORRECT shape: the Tang group is nested under an inner `sss`, so it
     /// collapses to ONE share. Outer is 2-of-2 = AND(tpm2, 2-of-3 tang).
     const CLEVIS_NESTED_CORRECT: &str =
-        "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"},\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'";
+        "{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\",\"pcr_bank\":\"sha256\"},\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}";
 
     #[test]
     fn clevis_binding_rejects_tang_satisfiable_2_of_4() {
-        let r = evaluate_clevis_binding(CLEVIS_VULNERABLE_2_OF_4);
+        let r = evaluate_clevis_bindings(&sss_binding(CLEVIS_VULNERABLE_2_OF_4));
         assert!(
             !r.passed,
             "2-of-4 config is Tang-satisfiable and MUST be rejected: {}",
@@ -1107,7 +1302,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn clevis_binding_passes_on_nested_tpm2_and_tang() {
-        let r = evaluate_clevis_binding(CLEVIS_NESTED_CORRECT);
+        let r = evaluate_clevis_bindings(&sss_binding(CLEVIS_NESTED_CORRECT));
         assert!(
             r.passed,
             "correct nested policy must verify clean: {}",
@@ -1160,24 +1355,144 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         assert_eq!(count_shares(&pins_of("{}")), 0);
     }
 
-    // ── parse_clevis_bindings ────────────────────────────────────────────────
+    // ── parse_clevis_tokens: recover the tree from the LUKS2 token ──────────
 
+    /// A REAL `cryptsetup luksDump --dump-json-metadata` capture of a volume
+    /// bound by `clevis luks bind` with a known nested policy:
+    ///
+    /// ```text
+    /// {"t":2,"pins":{"null":[{}],
+    ///                "sss":[{"t":2,"pins":{"tang":[.45,.46,.47]}}]}}
+    /// ```
+    const LUKSDUMP_NESTED_JSON: &str =
+        include_str!("../../tests/fixtures/clevis-nested-tang.luksdump.json");
+
+    /// What `clevis luks list` printed for that SAME volume, verbatim.
+    ///
+    /// Note what is missing: the `null` share is gone entirely, and the `sss`
+    /// ARRAY has become a bare OBJECT. This string is kept only as the evidence
+    /// that the tool cannot be parsed — nothing reads it.
+    const CLEVIS_LUKS_LIST_MISRENDERING: &str = concat!(
+        r#"1: sss '{"t":2,"pins":{"sss":{"t":2,"pins":{"tang":"#,
+        r#"[{"url":"http://172.16.2.45"},{"url":"http://172.16.2.46"},"#,
+        r#"{"url":"http://172.16.2.47"}]}}}}'"#
+    );
+
+    /// The whole authored tree comes back out of the JWE — including the share
+    /// `clevis luks list` dropped and the array it flattened.
     #[test]
-    fn parse_clevis_bindings_reads_slot_pin_and_json() {
-        let parsed = parse_clevis_bindings(CLEVIS_003);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].slot, "1");
+    fn parse_clevis_tokens_recovers_the_full_nested_topology() {
+        let parsed = parse_clevis_tokens(LUKSDUMP_NESTED_JSON).expect("real capture must parse");
+        assert_eq!(parsed.len(), 1, "one clevis token: {parsed:?}");
         assert_eq!(parsed[0].pin, "sss");
-        assert!(parsed[0].json.starts_with('{') && parsed[0].json.ends_with('}'));
+        assert_eq!(parsed[0].slot, "1", "token names the keyslot it unlocks");
+
+        let policy: serde_json::Value =
+            serde_json::from_str(&parsed[0].json).expect("reconstructed policy must be JSON");
+        assert_eq!(policy["t"], 2);
+
+        let pins = policy["pins"].as_object().expect("pins is an object");
+        // The `null` share `clevis luks list` dropped.
+        assert!(
+            pins.contains_key("null"),
+            "the `null` share must survive reconstruction: {policy}"
+        );
+        // The `sss` ARRAY that `clevis luks list` rendered as a bare object.
+        let nested = pins["sss"].as_array().expect("sss must stay an ARRAY");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0]["t"], 2);
+        let tang = nested[0]["pins"]["tang"]
+            .as_array()
+            .expect("nested tang group");
+        let urls: Vec<&str> = tang.iter().filter_map(|t| t["url"].as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "http://172.16.2.45",
+                "http://172.16.2.46",
+                "http://172.16.2.47"
+            ]
+        );
+
+        // Share arithmetic — the thing every other check depends on.
+        assert_eq!(count_shares(pins), 2, "null + nested sss = 2 shares");
     }
 
+    /// The measurement that justifies Fix 4, asserted rather than narrated.
+    ///
+    /// Parsing `clevis luks list` for the SAME volume yields a tree that is
+    /// structurally different from what the JWE says was bound. Whichever one a
+    /// verifier believes, they cannot both be right — and the JWE is what
+    /// clevis decrypts at boot.
     #[test]
-    fn parse_clevis_bindings_handles_multiple_slots_and_junk() {
-        let out =
-            format!("{CLEVIS_003}\n\n2: tang '{{\"url\":\"http://x\"}}'\nnot a binding line\n");
-        let parsed = parse_clevis_bindings(&out);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[1].pin, "tang");
+    fn clevis_luks_list_disagrees_with_the_jwe_it_claims_to_describe() {
+        let truth = parse_clevis_tokens(LUKSDUMP_NESTED_JSON).expect("real capture must parse");
+        let truth: serde_json::Value = serde_json::from_str(&truth[0].json).unwrap();
+
+        // Pull the JSON back out of the `clevis luks list` line the same way the
+        // deleted parser did, so this compares like with like.
+        let open = CLEVIS_LUKS_LIST_MISRENDERING.find('\'').unwrap();
+        let close = CLEVIS_LUKS_LIST_MISRENDERING.rfind('\'').unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&CLEVIS_LUKS_LIST_MISRENDERING[open + 1..close]).unwrap();
+
+        assert_ne!(
+            truth, rendered,
+            "if these ever agree, the misrendering is fixed upstream and this \
+             module's premise should be revisited"
+        );
+        // Name the two specific corruptions, so a partial upstream fix does not
+        // silently satisfy the assertion above.
+        assert!(
+            truth["pins"].get("null").is_some() && rendered["pins"].get("null").is_none(),
+            "`clevis luks list` drops the non-tang share"
+        );
+        assert!(
+            truth["pins"]["sss"].is_array() && !rendered["pins"]["sss"].is_array(),
+            "`clevis luks list` renders the sss ARRAY as a bare object"
+        );
+
+        // And the corruption is not cosmetic: it changes the VERDICT. Feed the
+        // rendered tree to the same structural checks and the correctly-bound
+        // volume is condemned as unsatisfiable, because the dropped share and
+        // the flattened array between them make `count_shares` report 1 where
+        // the truth is 2. A verifier reading `clevis luks list` therefore fails
+        // good hosts — and, in the mirror-image case, blesses bad ones.
+        let from_rendered = evaluate_clevis_bindings(&sss_binding(&rendered.to_string()));
+        let from_truth = evaluate_clevis_bindings(&sss_binding(&truth.to_string()));
+        assert!(
+            from_truth.passed,
+            "the JWE says this volume is correctly bound: {}",
+            from_truth.detail
+        );
+        assert!(
+            !from_rendered.passed,
+            "the same volume, judged from `clevis luks list`, must come out \
+             WRONG — that is the whole reason this parser was removed: {}",
+            from_rendered.detail
+        );
+    }
+
+    /// Fails CLOSED on metadata it cannot read — never "no bindings, so fine".
+    #[test]
+    fn parse_clevis_tokens_fails_closed_on_garbage() {
+        assert!(parse_clevis_tokens("not json").is_err());
+        // A clevis token with an undecodable JWE is an error, not a skip.
+        let bad =
+            r#"{"tokens":{"0":{"type":"clevis","keyslots":["1"],"jwe":{"protected":"!!!"}}}}"#;
+        assert!(parse_clevis_tokens(bad).is_err());
+        // A header with no tokens has no bindings — that is a fact, not a failure.
+        assert_eq!(parse_clevis_tokens(r#"{"keyslots":{}}"#).unwrap().len(), 0);
+    }
+
+    /// Non-clevis tokens are not bindings and must not be mistaken for one.
+    #[test]
+    fn parse_clevis_tokens_ignores_systemd_tokens() {
+        let meta = r#"{"tokens":{
+            "0":{"type":"systemd-tpm2","keyslots":["2"]},
+            "1":{"type":"systemd-fido2","keyslots":["3"]}
+        }}"#;
+        assert_eq!(parse_clevis_tokens(meta).unwrap().len(), 0);
     }
 
     // ── evaluate_clevis_binding: topology ────────────────────────────────────
@@ -1186,24 +1501,70 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     fn clevis_binding_fails_closed_on_empty_output() {
         // verify_host uses unwrap_or_default(), so an SSH failure lands here.
         assert!(!evaluate_clevis_binding("").passed);
-        assert!(!evaluate_clevis_binding("1: sss 'not json'").passed);
+        assert!(!evaluate_clevis_bindings(&sss_binding("not json")).passed);
+    }
+
+    /// End-to-end through the REAL capture: metadata in, verdict out.
+    #[test]
+    fn clevis_binding_evaluates_a_real_luksdump_capture() {
+        let r = evaluate_clevis_binding(LUKSDUMP_NESTED_JSON);
+        assert!(
+            r.passed,
+            "the captured policy is AND(null, 2-of-3 tang) over the fleet's \
+             Tang servers and must pass: {}",
+            r.detail
+        );
     }
 
     #[test]
     fn clevis_binding_rejects_vulnerable_slot_even_if_another_slot_is_good() {
-        let out = format!("{CLEVIS_NESTED_CORRECT}\n{CLEVIS_VULNERABLE_2_OF_4}");
-        assert!(!evaluate_clevis_binding(&out).passed);
+        let mut out = sss_binding(CLEVIS_NESTED_CORRECT);
+        out.extend(sss_binding(CLEVIS_VULNERABLE_2_OF_4));
+        assert!(!evaluate_clevis_bindings(&out).passed);
     }
 
     #[test]
     fn clevis_binding_rejects_bare_tang_slot_beside_a_good_sss_slot() {
         // Slot 2 has no threshold at all: one Tang server unlocks the volume,
         // which defeats the correct sss policy in slot 1.
-        let out = format!("{CLEVIS_NESTED_CORRECT}\n2: tang '{{\"url\":\"http://172.16.2.45\"}}'");
-        let r = evaluate_clevis_binding(&out);
-        assert!(!r.passed, "a bare pin slot must fail the check: {}", r.detail);
+        let mut out = sss_binding(CLEVIS_NESTED_CORRECT);
+        out.push(ClevisBindingLine {
+            slot: "2".to_string(),
+            pin: "tang".to_string(),
+            json: r#"{"url":"http://172.16.2.45"}"#.to_string(),
+        });
+        let r = evaluate_clevis_bindings(&out);
+        assert!(
+            !r.passed,
+            "a bare pin slot must fail the check: {}",
+            r.detail
+        );
         assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
     }
+
+    // RETIRED: `clevis_binding_rejects_single_tang_nested_threshold` asserted
+    // that an inner Tang group with `t=1` is VULNERABLE. That local rule rejects
+    // the settled policy, whose group 3 is exactly `AND(any-one-Tang,
+    // either-carried-key)` — two inner `t=1` groups that are sound because the
+    // enclosing group requires BOTH. Superseded by
+    // `clevis_binding_accepts_and_of_tpm2_and_a_single_tang_group`, which asserts
+    // the real property (cheapest satisfying set >= 2) on the same shape.
+
+    #[test]
+    fn clevis_binding_rejects_unsatisfiable_nested_threshold() {
+        // inner t=4 of 3 Tang servers: can never unlock.
+        let r = evaluate_clevis_bindings(&sss_binding(
+            "{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\"},\"sss\":[{\"t\":4,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}",
+        ));
+        assert!(!r.passed);
+        assert!(r.detail.contains("unsatisfiable"), "{}", r.detail);
+    }
+
+    // RETIRED: `clevis_binding_rejects_extra_outer_share` asserted the
+    // `shares == t` rule, which also rejects the settled policy's outer `t=1` of
+    // 3 groups. The shape it guarded against is only dangerous when the extra
+    // share makes some path cost 1 — asserted directly by
+    // `clevis_binding_rejects_an_extra_outer_share_that_makes_one_factor_enough`.
 
     /// SEMANTIC CHANGE, deliberate: `AND(tpm2, any-one-Tang)` is ACCEPTED.
     ///
@@ -1230,7 +1591,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             Ok(2),
             "tpm2 + one Tang = two factors"
         );
-        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(r.passed, "{}", r.detail);
     }
 
@@ -1246,19 +1607,9 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         for _ in 0..40 {
             policy = serde_json::json!({"t": 1, "pins": {"sss": [policy]}});
         }
-        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(!r.passed, "{}", r.detail);
         assert!(r.detail.contains("nests deeper"), "{}", r.detail);
-    }
-
-    #[test]
-    fn clevis_binding_rejects_unsatisfiable_nested_threshold() {
-        // inner t=4 of 3 Tang servers: can never unlock.
-        let r = evaluate_clevis_binding(
-            "1: sss '{\"t\":2,\"pins\":{\"tpm2\":{\"pcr_ids\":\"7\"},\"sss\":[{\"t\":4,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'",
-        );
-        assert!(!r.passed);
-        assert!(r.detail.contains("unsatisfiable"), "{}", r.detail);
     }
 
     /// Replaces `clevis_binding_rejects_extra_outer_share`, whose `shares == t`
@@ -1270,9 +1621,9 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     fn clevis_binding_rejects_an_extra_outer_share_that_makes_one_factor_enough() {
         // t=1 over [tpm2, sshd, nested 2-of-3 Tang]: the tpm2 share ALONE opens
         // the volume.
-        let r = evaluate_clevis_binding(
-            "1: sss '{\"t\":1,\"pins\":{\"tpm2\":[{\"pcr_ids\":\"7\"}],\"sshd\":[{\"host\":\"h\"}],\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}'",
-        );
+        let r = evaluate_clevis_bindings(&sss_binding(
+            "{\"t\":1,\"pins\":{\"tpm2\":[{\"pcr_ids\":\"7\"}],\"sshd\":[{\"host\":\"h\"}],\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}]}}",
+        ));
         assert!(!r.passed);
         assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
     }
@@ -1347,14 +1698,15 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         })
     }
 
-    /// Render a policy as one `clevis luks list` line.
-    fn clevis_line(policy: &serde_json::Value) -> String {
-        format!("1: sss '{policy}'")
+    /// One recovered `sss` binding carrying this policy, as
+    /// [`parse_clevis_tokens`] would return it from the LUKS2 token.
+    fn bound(policy: &serde_json::Value) -> Vec<ClevisBindingLine> {
+        sss_binding(&policy.to_string())
     }
 
     #[test]
     fn clevis_binding_passes_on_settled_rpi_fleet_policy() {
-        let r = evaluate_clevis_binding(&clevis_line(&settled_fleet_policy(None)));
+        let r = evaluate_clevis_bindings(&bound(&settled_fleet_policy(None)));
         assert!(
             r.passed,
             "the settled fleet policy is the design this check exists to protect \
@@ -1365,7 +1717,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn clevis_binding_passes_on_settled_lenserv_fleet_policy() {
-        let r = evaluate_clevis_binding(&clevis_line(&settled_fleet_policy(Some("7"))));
+        let r = evaluate_clevis_bindings(&bound(&settled_fleet_policy(Some("7"))));
         assert!(
             r.passed,
             "the lenserv variant (tpm2 ANDed into group 1) MUST verify clean: {}",
@@ -1382,7 +1734,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         // Degrade group 1 to `t=1` over the two Tang peers: ONE Tang server now
         // opens the volume via that branch, even though groups 2 and 3 are fine.
         policy["pins"]["sss"][0] = tang_group(1);
-        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(
             !r.passed,
             "an outer t=1 OR with a single-share branch is opened by one share \
@@ -1396,9 +1748,9 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// one factor opens it.
     #[test]
     fn clevis_binding_rejects_outer_or_over_bare_pins() {
-        let r = evaluate_clevis_binding(
-            "1: sss '{\"t\":1,\"pins\":{\"tpm2\":[{\"pcr_ids\":\"7\"}],\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"}]}}]}}'",
-        );
+        let r = evaluate_clevis_bindings(&sss_binding(
+            "{\"t\":1,\"pins\":{\"tpm2\":[{\"pcr_ids\":\"7\"}],\"sss\":[{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"}]}}]}}",
+        ));
         assert!(!r.passed, "{}", r.detail);
         assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
     }
@@ -1408,7 +1760,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// the flattening bug.
     #[test]
     fn clevis_binding_accepts_single_element_pin_array_beside_a_sibling() {
-        let r = evaluate_clevis_binding(&clevis_line(&serde_json::json!({
+        let r = evaluate_clevis_bindings(&bound(&serde_json::json!({
             "t": 2,
             "pins": {
                 "tpm2": [{"pcr_ids": "7", "pcr_bank": "sha256"}],
@@ -1436,7 +1788,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
                 "tang": [tang_entry(PEER_A, 0), tang_entry(PEER_B, 1)],
             }
         });
-        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(
             !r.passed,
             "a flattened Tang group inside an OR branch is still Tang-satisfiable: {}",
@@ -1454,7 +1806,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             "t": 2,
             "pins": {"tang": [tang_entry(PEER_A, 0), tang_entry("http://10.0.0.9", 1)]}
         });
-        let r = evaluate_clevis_binding(&clevis_line(&policy));
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(!r.passed, "an unknown Tang server must fail: {}", r.detail);
         assert!(r.detail.contains("10.0.0.9"), "{}", r.detail);
     }
@@ -1463,7 +1815,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     fn clevis_binding_rejects_a_policy_with_no_tang_server_at_all() {
         // pkcs11-only: nothing unlocks unattended, so this is not the fleet
         // policy and must not verify clean.
-        let r = evaluate_clevis_binding(&clevis_line(&serde_json::json!({
+        let r = evaluate_clevis_bindings(&bound(&serde_json::json!({
             "t": 1, "pins": {"sss": [group_two(), group_two()]}
         })));
         assert!(!r.passed, "{}", r.detail);
@@ -1521,7 +1873,11 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
     #[test]
     fn clevis_binding_fails_without_sss() {
-        let r = evaluate_clevis_binding("1: tang '{\"url\":\"http://172.16.2.45\"}'");
+        let r = evaluate_clevis_bindings(&[ClevisBindingLine {
+            slot: "1".to_string(),
+            pin: "tang".to_string(),
+            json: "{\"url\":\"http://172.16.2.45\"}".to_string(),
+        }]);
         assert!(!r.passed);
         assert!(r.detail.contains("sss"));
     }
@@ -1532,9 +1888,9 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// server satisfies this flat group.
     #[test]
     fn clevis_binding_fails_on_a_flat_policy_one_share_can_open() {
-        let r = evaluate_clevis_binding(
-            "1: sss '{\"t\":1,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}'",
-        );
+        let r = evaluate_clevis_bindings(&sss_binding(
+            "{\"t\":1,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"},{\"url\":\"http://172.16.2.47\"}]}}",
+        ));
         assert!(!r.passed);
         assert!(r.detail.contains("VULNERABLE"), "{}", r.detail);
         assert!(r.detail.contains("1 share"), "{}", r.detail);
@@ -1546,9 +1902,9 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// `clevis_binding_rejects_an_unknown_tang_url`.
     #[test]
     fn clevis_binding_accepts_a_subset_of_the_fleet_tang_servers() {
-        let r = evaluate_clevis_binding(
-            "1: sss '{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"}]}}'",
-        );
+        let r = evaluate_clevis_bindings(&sss_binding(
+            "{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"}]}}",
+        ));
         assert!(r.passed, "{}", r.detail);
     }
 
@@ -1661,7 +2017,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
             ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
             ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            (
+                "sudo -n cryptsetup luksDump --dump-json-metadata /dev/nvme0n1p4",
+                LUKSDUMP_NESTED_JSON,
+            ),
             ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
@@ -1692,7 +2051,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
             ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
             ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            (
+                "sudo -n cryptsetup luksDump --dump-json-metadata /dev/nvme0n1p4",
+                LUKSDUMP_NESTED_JSON,
+            ),
             ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
@@ -1708,7 +2070,11 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let report = verify_host(&mut mock, &spec, "172.16.3.92").await.unwrap();
         assert!(!report.all_passed());
-        let hn_check = report.checks.iter().find(|c| c.name == "hostname_matches").unwrap();
+        let hn_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "hostname_matches")
+            .unwrap();
         assert!(!hn_check.passed);
     }
 
@@ -1723,7 +2089,10 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             ("findmnt -n -o FSTYPE,SOURCE /", FINDMNT_ROOT_003),
             ("findmnt -n -o FSTYPE,SOURCE /boot", FINDMNT_BOOT_003),
             ("ls -1 /boot/efi/EFI/ubuntu/", ESP_LISTING_003),
-            ("sudo -n clevis luks list -d /dev/nvme0n1p4", CLEVIS_003),
+            (
+                "sudo -n cryptsetup luksDump --dump-json-metadata /dev/nvme0n1p4",
+                LUKSDUMP_NESTED_JSON,
+            ),
             ("sudo -n cryptsetup luksDump /dev/nvme0n1p4", LUKSDUMP_003),
             ("cat /etc/crypttab", CRYPTTAB_003),
             ("cat /etc/dracut.conf.d/clevis.conf", DRACUT_CONF_003),
@@ -1738,7 +2107,11 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
 
         let report = verify_host(&mut mock, &spec, "len-serv-003").await.unwrap();
         assert!(!report.all_passed());
-        let luks_check = report.checks.iter().find(|c| c.name == "luks_partition").unwrap();
+        let luks_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "luks_partition")
+            .unwrap();
         assert!(!luks_check.passed);
     }
 
@@ -1824,5 +2197,61 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         let r = evaluate_shim_present("grub.cfg\ngrubx64.efi\n");
         assert!(!r.passed);
         assert!(r.detail.contains("shimx64.efi"));
+    }
+}
+
+#[cfg(test)]
+mod emitter_verifier_loop {
+    use super::*;
+
+    /// THE LOOP: the settled fleet policy shape, exactly as the emitter writes
+    /// it (outer t=1 OR over three groups) — fed to the verifier.
+    ///
+    /// This assertion was inverted until 2026-08-05. It recorded a KNOWN GAP:
+    /// `validate_sss_policy` hardcoded `t == CLEVIS_THRESHOLD` (2), which
+    /// predated `SssPolicy::fleet_three_group`, so the verifier rejected the
+    /// very policy the installer emits and every correctly-built host failed
+    /// its own check. Closing it needed the tree-walking semantics
+    /// ([`min_satisfying_shares`] + [`lint_flattened_groups`]) that landed
+    /// alongside the JWE-backed data source in this merge. The gap-tracking
+    /// fragment `todo.d/2026-08-03-verifier-rejects-the-emitted-fleet-policy.md`
+    /// was deleted with the inversion, per its own instructions.
+    #[test]
+    fn verifier_accepts_the_emitted_fleet_policy() {
+        let tang = |t: u64| {
+            serde_json::json!({"t": t, "pins": {"tang": [
+            {"url":"http://172.16.2.45","adv":"/run/uaa-tang-0.adv"},
+            {"url":"http://172.16.2.46","adv":"/run/uaa-tang-1.adv"},
+            {"url":"http://172.16.2.47","adv":"/run/uaa-tang-2.adv"}]}})
+        };
+        let tok = |u: &str| serde_json::json!({"uri": u, "mechanism": "RSA-PKCS"});
+        let policy = serde_json::json!({"t": 1, "pins": {"sss": [
+            {"t": 2, "pins": {"tpm2": [{"pcr_ids":"7","pcr_bank":"sha256"}], "sss": [tang(2)]}},
+            {"t": 2, "pins": {"pkcs11": [tok("pkcs11:serial=N;token=N"), tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}},
+            {"t": 2, "pins": {"sss": [tang(1), {"t": 1, "pins": {"pkcs11": [tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}}]}}
+        ]}});
+        let r = evaluate_clevis_bindings(&[ClevisBindingLine {
+            slot: "1".into(),
+            pin: "sss".into(),
+            json: policy.to_string(),
+        }]);
+        // The emitter and the verifier must agree: what `fleet_three_group`
+        // writes is what `validate_sss_policy` blesses. A regression in either
+        // one breaks this test, which is the whole point of the loop.
+        assert!(
+            r.passed,
+            "the verifier must accept the policy the emitter produces: {}",
+            r.detail
+        );
+
+        // And it passes for the RIGHT reason — no path through the tree is
+        // satisfiable by a single factor. Asserted on the number, not on a
+        // shape, because an outer t=1 is an OR: it is exactly as strong as its
+        // cheapest branch.
+        assert_eq!(
+            min_satisfying_shares(&policy),
+            Ok(2),
+            "every branch of the settled policy must cost at least 2 factors"
+        );
     }
 }
