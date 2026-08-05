@@ -1267,11 +1267,36 @@ pub async fn verify_policy_command(device: Option<&str>, file: Option<&str>) -> 
             ))
         }
         (Some(dev), None) => {
-            // Same command string the SSH path runs, so the two cannot diverge
-            // in what they ask the kernel for.
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("{CLEVIS_PROBE_COMMAND} {dev}"))
+            // NO SHELL. `dev` comes from the command line, and this runs as
+            // root under the VM gate, so `sh -c "<cmd> {dev}"` would execute
+            // anything after a `;` in --device. Split the shared command
+            // string into argv instead: same program and flags as the SSH
+            // path (so the two cannot diverge in what they ask the kernel
+            // for), but `dev` is its own argv element and is never parsed by
+            // a shell.
+            let mut argv = CLEVIS_PROBE_COMMAND.split_whitespace();
+            let program = argv.next().ok_or_else(|| {
+                uaa_core::error::AutoInstallError::ValidationError(
+                    "CLEVIS_PROBE_COMMAND is empty".to_string(),
+                )
+            })?;
+
+            // Argv separation kills shell injection but not ARGUMENT
+            // injection: a `dev` beginning with `-` would still be read as a
+            // flag by cryptsetup. `--` is not used because cryptsetup's popt
+            // handling of it is not something this code can assume; rejecting
+            // the shape outright is unambiguous and costs nothing, since no
+            // real device node begins with a dash.
+            if dev.starts_with('-') {
+                return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "--device {dev:?} starts with '-'; refusing to pass it where it \
+                     would be read as a flag"
+                )));
+            }
+
+            let out = std::process::Command::new(program)
+                .args(argv)
+                .arg(dev)
                 .output()
                 .map_err(|e| {
                     uaa_core::error::AutoInstallError::ValidationError(format!(
@@ -1396,6 +1421,76 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tokio::fs;
+
+    /// REGRESSION: `--device` must never reach a shell.
+    ///
+    /// The first version of `verify_policy_command` ran
+    /// `sh -c "{CLEVIS_PROBE_COMMAND} {dev}"`, so
+    /// `--device '/dev/x; touch /tmp/pwned'` executed the `touch` — as root,
+    /// since the VM gate invokes this under sudo. It is argv-separated now.
+    ///
+    /// This asserts the observable half: the payload must NOT run. A passing
+    /// result is only meaningful because the shell form demonstrably DOES run
+    /// it, which is checked first — otherwise this would pass just as happily
+    /// against a build where the injection still existed but `cryptsetup`
+    /// merely happened to be missing.
+    #[tokio::test]
+    async fn verify_policy_device_is_not_shell_interpreted() {
+        // Plain [A-Za-z0-9-] only. An earlier version interpolated
+        // `ThreadId(N)` here, and the unquoted parens made the CONTROL's own
+        // `sh -c` a syntax error — so the payload never ran, the control
+        // tripped, and the test correctly refused to report a pass it had not
+        // earned.
+        let marker = std::env::temp_dir()
+            .join(format!("uaa-injection-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let payload = format!("/dev/does-not-exist; touch {}", marker.display());
+
+        // CONTROL: prove the payload is live under a shell, so a clean result
+        // below cannot be a false negative.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("true {payload}"))
+            .output();
+        assert!(
+            marker.exists(),
+            "control failed: the payload never executed even under `sh -c`, \
+             so this test could not detect an injection"
+        );
+        std::fs::remove_file(&marker).expect("control marker should be removable");
+
+        // LIVE: the same payload through the real entrypoint.
+        let _ = verify_policy_command(Some(&payload), None).await;
+        assert!(
+            !marker.exists(),
+            "COMMAND INJECTION: --device was interpreted by a shell"
+        );
+    }
+
+    /// Argv separation stops shell injection but not a `dev` that looks like a
+    /// flag, so the leading-dash shape is rejected outright. `--device=-x`
+    /// reaches the function because clap only intercepts the space-separated
+    /// form.
+    #[tokio::test]
+    async fn verify_policy_rejects_a_device_that_looks_like_a_flag() {
+        let err = verify_policy_command(Some("-x"), None)
+            .await
+            .expect_err("a device starting with '-' must be refused");
+        assert!(
+            err.to_string().contains("starts with '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `--device` and `--file` name two different sources of truth; taking
+    /// either silently would make the other a lie.
+    #[tokio::test]
+    async fn verify_policy_refuses_device_and_file_together() {
+        let err = verify_policy_command(Some("/dev/loop0"), Some("/tmp/x.json"))
+            .await
+            .expect_err("device+file must be refused");
+        assert!(err.to_string().contains("not both"), "unexpected: {err}");
+    }
 
     #[test]
     fn test_target_marker_present_detects_marker() {
