@@ -1908,6 +1908,56 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
         assert!(r.passed, "{}", r.detail);
     }
 
+
+    /// KNOWN LIMITATION, recorded so it cannot be forgotten.
+    ///
+    /// The rule this module enforces is *no single SHARE opens the volume*
+    /// ([`min_satisfying_shares`] >= 2). That is strictly weaker than the
+    /// fleet's actual requirement, which is about the *kind* of factor: the
+    /// whole point of the nested redesign was that **Tang alone must not open
+    /// a lenserv disk**.
+    ///
+    /// Those two come apart at the outer OR. Drop `tpm2` from group 1 and it
+    /// becomes `{"t":2,"pins":{"tang":[a,b,c]}}` — two shares, so the count
+    /// says 2 and the check PASSES, yet the satisfying set is two Tang servers
+    /// and the outer `t=1` means group 1 alone unlocks the host. That is the
+    /// original vulnerability re-entering through the back door, in a shape the
+    /// share arithmetic cannot see, because share arithmetic counts factors and
+    /// has no notion of their independence.
+    ///
+    /// This is asserted as PASSING deliberately: it documents what the verifier
+    /// does today, not what the fleet wants. Closing it means a factor-diversity
+    /// rule (e.g. no branch may be satisfiable by one pin KIND alone), which is
+    /// a security-policy decision, not a bug fix — so it is not smuggled in
+    /// here. See `todo.d/2026-08-05-verifier-has-no-factor-diversity-rule.md`.
+    ///
+    /// Practical consequence: dropping `tpm2` is NOT a safe way to dodge the
+    /// PCR7/Secure-Boot ordering problem on len-serv-003.
+    #[test]
+    fn known_limitation_tang_only_group_passes_the_share_count() {
+        let tang = |t: u64| {
+            serde_json::json!({"t": t, "pins": {"tang": [
+            {"url":"http://172.16.2.45"},{"url":"http://172.16.2.46"},
+            {"url":"http://172.16.2.47"}]}})
+        };
+        let tok = |u: &str| serde_json::json!({"uri": u, "mechanism": "RSA-PKCS"});
+        let policy = serde_json::json!({"t": 1, "pins": {"sss": [
+            tang(2),
+            {"t": 2, "pins": {"pkcs11": [tok("pkcs11:serial=N;token=N"), tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}},
+            {"t": 2, "pins": {"sss": [tang(1), {"t": 1, "pins": {"pkcs11": [tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}}]}}
+        ]}});
+
+        // Two shares — but both of them are Tang.
+        assert_eq!(min_satisfying_shares(&policy), Ok(2));
+        let r = evaluate_clevis_bindings(&sss_binding(&policy.to_string()));
+        assert!(
+            r.passed,
+            "recording current behaviour; if this starts FAILING a factor-diversity \
+             rule was added — update this test and drop the todo fragment: {}",
+            r.detail
+        );
+    }
+
     #[test]
     fn crypttab_passes_with_entry() {
         assert!(evaluate_crypttab(CRYPTTAB_003).passed);
