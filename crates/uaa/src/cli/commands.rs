@@ -1237,6 +1237,88 @@ pub async fn verify_command(
     Ok(())
 }
 
+/// Judge a clevis policy's share topology locally, without SSH.
+///
+/// # Why this exists
+///
+/// The VM gate used to decide "is this binding safe?" with its own `jq`
+/// predicate over `clevis luks list` output, while the installer decided it in
+/// [`uaa_core::autoinstall::verify::evaluate_clevis_binding`]. Two
+/// implementations of one security rule drift, and these two did: the gate
+/// asked only "is `tang` a direct child of the outer `pins`?", which blesses a
+/// policy whose cheapest satisfying set is a single share, and it asked that
+/// question of `clevis luks list`, whose rendering of a nested policy drops
+/// shares and collapses arrays.
+///
+/// So the rule lives in exactly one place and this is the local entrypoint to
+/// it. The gate calls this; `uaa verify` calls the same evaluator over SSH.
+///
+/// Fails CLOSED: unreadable metadata, an unparseable JWE, or no clevis token at
+/// all are all non-zero exits, because a policy we cannot read is not a policy
+/// we can bless.
+pub async fn verify_policy_command(device: Option<&str>, file: Option<&str>) -> Result<()> {
+    use std::io::Read as _;
+    use uaa_core::autoinstall::verify::{evaluate_clevis_binding, CLEVIS_PROBE_COMMAND};
+
+    let luks_json = match (device, file) {
+        (Some(_), Some(_)) => {
+            return Err(uaa_core::error::AutoInstallError::ValidationError(
+                "pass --device or --file, not both".to_string(),
+            ))
+        }
+        (Some(dev), None) => {
+            // Same command string the SSH path runs, so the two cannot diverge
+            // in what they ask the kernel for.
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{CLEVIS_PROBE_COMMAND} {dev}"))
+                .output()
+                .map_err(|e| {
+                    uaa_core::error::AutoInstallError::ValidationError(format!(
+                        "could not run `{CLEVIS_PROBE_COMMAND} {dev}`: {e}"
+                    ))
+                })?;
+            if !out.status.success() {
+                return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "`{CLEVIS_PROBE_COMMAND} {dev}` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        (None, Some(path)) if path != "-" => std::fs::read_to_string(path).map_err(|e| {
+            uaa_core::error::AutoInstallError::ValidationError(format!(
+                "could not read LUKS2 metadata from {path}: {e}"
+            ))
+        })?,
+        (None, _) => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "could not read LUKS2 metadata from stdin: {e}"
+                ))
+            })?;
+            buf
+        }
+    };
+
+    let result = evaluate_clevis_binding(&luks_json);
+    println!(
+        "{} {}: {}",
+        if result.passed { "PASS" } else { "FAIL" },
+        result.name,
+        result.detail
+    );
+
+    if result.passed {
+        Ok(())
+    } else {
+        Err(uaa_core::error::AutoInstallError::ValidationError(
+            result.detail,
+        ))
+    }
+}
+
 /// Render a subiquity autoinstall `user-data` from the template + per-host values.
 ///
 /// Uses the embedded len-serv template unless `--template` points at a custom

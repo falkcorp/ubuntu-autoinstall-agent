@@ -276,6 +276,28 @@ pub enum Commands {
         strict: bool,
     },
 
+    /// Judge a clevis unlock policy's share topology, locally, with no SSH
+    ///
+    /// Reads LUKS2 metadata (`cryptsetup luksDump --dump-json-metadata`) and
+    /// applies the SAME evaluator `uaa verify` runs on a deployed host, so a
+    /// gate script cannot drift from the installer's notion of a safe policy.
+    /// Exits non-zero when the policy is satisfiable by a single share.
+    VerifyPolicy {
+        #[arg(
+            short,
+            long,
+            help = "LUKS2 device to dump, e.g. /dev/loop0 (needs root). Omit to read metadata JSON from --file or stdin"
+        )]
+        device: Option<String>,
+
+        #[arg(
+            short,
+            long,
+            help = "File holding `cryptsetup luksDump --dump-json-metadata` output. '-' or omitted (with no --device) reads stdin"
+        )]
+        file: Option<String>,
+    },
+
     /// Render a subiquity autoinstall user-data from the proven template + per-host values
     RenderUserData {
         #[arg(short = 'n', long, help = "Target hostname, e.g. len-serv-003")]

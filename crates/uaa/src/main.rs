@@ -164,6 +164,9 @@ async fn main() -> Result<()> {
                 username,
                 strict,
             } => verify_command(&host, &hostname, &address, &username, strict).await,
+            uaa::cli::args::Commands::VerifyPolicy { device, file } => {
+                verify_policy_command(device.as_deref(), file.as_deref()).await
+            }
             uaa::cli::args::Commands::RenderUserData {
                 hostname,
                 address,
