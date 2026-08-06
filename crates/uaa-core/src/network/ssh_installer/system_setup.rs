@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/system_setup.rs
-// version: 2.34.0
+// version: 2.35.0
 // guid: sshsys01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-08-03
+// last-edited: 2026-08-06
 
 //! System setup and configuration for SSH/local installation.
 //!
@@ -2676,7 +2676,20 @@ mod tests {
             "pins": {"sss": [
                 // group 1 — automatic unlock while both peers are up. NO tpm2:
                 // the RPis have no TPM and deliberately get none anywhere.
-                tang_group(2),
+                //
+                // The chassis nano is ANDed in precisely BECAUSE there is no
+                // TPM. This golden previously expected a bare `tang_group(2)`,
+                // which was two shares but both of them Tang — so two Tang keys
+                // decrypted the volume, and the outer t=1 OR propagated that to
+                // the whole policy. The nano fills the structural role a TPM
+                // plays on a lenserv: a factor that is always present at boot.
+                {
+                    "t": 2,
+                    "pins": {
+                        "pkcs11": [pkcs11_entry(NANO)],
+                        "sss": [tang_group(2)],
+                    }
+                },
                 // group 2 — any 2 of the 3 tokens.
                 group_two(),
                 // group 3 — (any one Tang) AND (either CARRIED key).
@@ -2901,13 +2914,57 @@ mod tests {
             let mut found = 0usize;
             walk(&got, &mut found);
             // The absence assertion above is vacuous if the walk found nothing,
-            // so pin the count: group 2 holds nano + 2 carried, group 3 holds
-            // the 2 carried again = 5 pkcs11 shares.
+            // so pin the count. Group 2 holds nano + 2 carried and group 3 holds
+            // the 2 carried again = 5. A TPM-less host adds a sixth: the nano
+            // ANDed into group 1, standing in for the TPM it does not have.
+            let expected = if tpm2.is_none() { 6 } else { 5 };
             assert_eq!(
-                found, 5,
-                "expected 5 pkcs11 shares in the fleet tree (tpm2={tpm2:?}): {got}"
+                found, expected,
+                "expected {expected} pkcs11 shares in the fleet tree (tpm2={tpm2:?}): {got}"
             );
         }
+    }
+
+    /// SECURITY PROPERTY — no EMITTED policy is satisfiable by one kind of
+    /// factor, checked by the shipping verifier rather than by a second opinion.
+    ///
+    /// The emitter and `verify.rs`'s test fixtures are separate hand-written
+    /// trees, so they can drift — and did: the fixture and the emitter both
+    /// carried a bare Tang group 1 for TPM-less hosts, and each looked correct
+    /// against the other. Running the REAL emitter output through the REAL
+    /// verifier is the only assertion that cannot be satisfied by fixing one
+    /// side alone.
+    #[test]
+    fn test_emitted_fleet_policy_is_never_satisfiable_by_one_factor_kind() {
+        use crate::autoinstall::verify::satisfiable_with_only;
+
+        for tpm2 in [None, Some("7")] {
+            let got = emit_fleet_policy(tpm2);
+            for kind in ["tang", "tpm2"] {
+                assert!(
+                    !satisfiable_with_only(&got, kind),
+                    "the emitted policy (tpm2={tpm2:?}) must not be satisfiable by \
+                     {kind} alone — multiple shares of one kind fall to a single \
+                     compromise: {got}"
+                );
+            }
+        }
+    }
+
+    /// The counterpart: `pkcs11` alone IS allowed to satisfy a policy, because
+    /// group 2 is deliberately all-token with zero Tang — it is the cold-outage
+    /// bootstrap. If this ever starts failing, someone has broadened the
+    /// factor-diversity rule into rejecting the design it exists to protect.
+    #[test]
+    fn test_group_two_is_deliberately_reachable_with_tokens_alone() {
+        use crate::autoinstall::verify::satisfiable_with_only;
+
+        let got = emit_fleet_policy(Some("7"));
+        assert!(
+            satisfiable_with_only(&got, "pkcs11"),
+            "group 2 (2-of-3 tokens, zero Tang) must remain reachable with tokens \
+             alone — that is the whole point of a cold-outage bootstrap: {got}"
+        );
     }
 
     /// SECURITY PROPERTY — the nano is not a group-3 factor, in the EMITTED

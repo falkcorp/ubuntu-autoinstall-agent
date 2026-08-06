@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/autoinstall/verify.rs
-// version: 2.1.0
+// version: 2.2.0
 // guid: c2d3e4f5-a6b7-8c9d-0e1f-2a3b4c5d6e7f
-// last-edited: 2026-08-05
+// last-edited: 2026-08-06
 
 //! Post-install verification for Lenovo fleet hosts.
 //!
@@ -682,6 +682,85 @@ fn lint_flattened_groups(policy: &serde_json::Value, path: &str) -> std::result:
 /// mis-encoding (a multi-element pin array beside a sibling), which the
 /// satisfying-set count cannot see: clevis really does read `2-of-4` there, so
 /// the number is 2 even though the author wrote an AND.
+/// Pin kinds that must NEVER be sufficient on their own — see
+/// [`satisfiable_with_only`] for why `pkcs11` is deliberately absent.
+const SINGLE_FACTOR_KINDS: [&str; 2] = ["tang", "tpm2"];
+
+/// Can this policy be satisfied using ONLY pins of kind `kind`?
+///
+/// The share count in [`min_satisfying_shares`] answers "how many shares",
+/// never "how many *independent things*". Those come apart badly:
+///
+/// ```text
+/// {"t":2,"pins":{"tang":[a,b,c]}}      // 2 shares — and 2 Tang keys open it
+/// ```
+///
+/// That scores `min_satisfying_shares == 2` and passes the count, yet an
+/// attacker holding two Tang keys and nothing else decrypts the volume. It is
+/// also the measured legacy len-serv-001/002 policy, and the shape of the
+/// tang-only "online" group drafted for the RPi Tang servers on 2026-08-06 —
+/// which is precisely the flat-policy bug in a new costume.
+///
+/// A node with threshold `t` is satisfiable with only `kind` when at least `t`
+/// of its children are: a leaf pin qualifies iff its key IS `kind`, and a nested
+/// `sss` qualifies iff it recursively qualifies (still counting as ONE share to
+/// its parent, exactly as [`min_satisfying_shares_at`] accounts for it).
+///
+/// # Why `pkcs11` is not in [`SINGLE_FACTOR_KINDS`]
+///
+/// Two `tang` shares are two network services on one LAN, and two `tpm2` shares
+/// are the same soldered chip counted twice — in both cases one compromise
+/// yields every share. Two `pkcs11` shares are two distinct physical tokens in
+/// two different places (a pocket and an offsite vault), so satisfying them
+/// takes two independent events. That is why the settled fleet policy's group 2
+/// is deliberately all-`pkcs11` with zero Tang: it is the cold-outage bootstrap,
+/// and flagging it here would reject the design this rule exists to protect.
+pub fn satisfiable_with_only(policy: &serde_json::Value, kind: &str) -> bool {
+    satisfiable_with_only_at(policy, kind, 0)
+}
+
+fn satisfiable_with_only_at(policy: &serde_json::Value, kind: &str, depth: usize) -> bool {
+    if depth > MAX_POLICY_DEPTH {
+        // Consistent with `min_satisfying_shares_at`, which refuses to evaluate
+        // past this depth. Reporting "not satisfiable by one kind" for a tree we
+        // declined to walk would be an unearned clean bill of health, but the
+        // caller has already failed such a policy closed on the share count, so
+        // this arm is unreachable in practice.
+        return false;
+    }
+    let Some(obj) = policy.as_object() else {
+        return false;
+    };
+    let Some(t) = obj.get("t").and_then(|t| t.as_u64()).map(|t| t as usize) else {
+        return false;
+    };
+    let Some(pins) = obj.get("pins").and_then(|p| p.as_object()) else {
+        return false;
+    };
+    if t == 0 {
+        return false;
+    }
+
+    let mut qualifying = 0usize;
+    for (key, value) in pins {
+        let entries: Vec<&serde_json::Value> = match value {
+            serde_json::Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        for entry in entries {
+            let qualifies = if key == "sss" {
+                satisfiable_with_only_at(entry, kind, depth + 1)
+            } else {
+                key == kind
+            };
+            if qualifies {
+                qualifying += 1;
+            }
+        }
+    }
+    qualifying >= t
+}
+
 fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String, String> {
     lint_flattened_groups(policy, "policy")?;
 
@@ -696,6 +775,24 @@ fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String
         ));
     }
 
+    // The share count above proves no SINGLE share opens the volume. It says
+    // nothing about whether the shares are independent things — two Tang shares
+    // score 2 and are opened by one LAN compromise. See `satisfiable_with_only`.
+    for kind in SINGLE_FACTOR_KINDS {
+        if satisfiable_with_only(policy, kind) {
+            return Err(format!(
+                "VULNERABLE: this policy is satisfiable by {kind} alone. It clears \
+                 the {MIN_SATISFYING_SHARES}-share floor, but every share on that \
+                 path is the same kind of factor: multiple `tang` shares are network \
+                 services on one LAN, and multiple `tpm2` shares are one soldered \
+                 chip counted twice, so a single compromise yields all of them. AND \
+                 the {kind} group with a factor of a different kind — nest it under \
+                 an inner sss beside a tpm2 or pkcs11 pin. (`pkcs11` is exempt: two \
+                 tokens are two physical objects in two places.)"
+            ));
+        }
+    }
+
     let obj = policy
         .as_object()
         .ok_or_else(|| "sss policy is not a JSON object".to_string())?;
@@ -706,7 +803,8 @@ fn validate_sss_policy(policy: &serde_json::Value) -> std::result::Result<String
         .map(count_shares)
         .unwrap_or_default();
     Ok(format!(
-        "outer t={t} of {shares} share(s); cheapest satisfying set = {min} factors"
+        "outer t={t} of {shares} share(s); cheapest satisfying set = {min} factors; \
+         no single factor kind suffices"
     ))
 }
 
@@ -1269,8 +1367,23 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     }
 
     #[test]
-    fn clevis_binding_passes_on_live_fixture() {
-        assert!(evaluate_clevis_bindings(&sss_binding(CLEVIS_003)).passed);
+    fn the_live_fleet_policy_is_tang_only_and_must_now_fail() {
+        let r = evaluate_clevis_bindings(&sss_binding(CLEVIS_003));
+        assert!(
+            !r.passed,
+            "the LIVE fleet policy is a bare tang t=2-of-3 — two Tang keys and \
+             nothing else decrypt it. This test asserted it PASSED until the \
+             factor-diversity rule landed, which is exactly the blind spot the \
+             nested redesign exists to close. It must stay failing until the \
+             fleet is re-bound: {}",
+            r.detail
+        );
+        assert!(r.detail.contains("satisfiable by tang alone"), "{}", r.detail);
+        // The share count was never the thing that was wrong.
+        assert_eq!(
+            min_satisfying_shares(&serde_json::from_str(CLEVIS_003).unwrap()),
+            Ok(2)
+        );
     }
 
     /// The VULNERABLE shape: `tang` is a DIRECT child of the outer `pins`, so
@@ -1681,7 +1794,17 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// group 1.
     fn settled_fleet_policy(tpm2_pcr_ids: Option<&str>) -> serde_json::Value {
         let group_one = match tpm2_pcr_ids {
-            None => tang_group(2),
+            // No TPM (the RPi Tang servers): the chassis nano takes the TPM's
+            // structural role — an always-present second factor ANDed with the
+            // Tang group. A bare `tang_group(2)` here was Tang-satisfiable, and
+            // an outer t=1 OR propagated that to the whole policy.
+            None => serde_json::json!({
+                "t": 2,
+                "pins": {
+                    "pkcs11": [{"uri": "pkcs11:serial=N;token=N", "mechanism": "RSA-PKCS"}],
+                    "sss": [tang_group(2)],
+                }
+            }),
             Some(pcr_ids) => serde_json::json!({
                 "t": 2,
                 "pins": {
@@ -1802,9 +1925,16 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     #[test]
     fn clevis_binding_rejects_an_unknown_tang_url() {
         let mut policy = settled_fleet_policy(None);
+        // Topology-valid (nano ANDed with the Tang group) so the binding fails
+        // on the UNKNOWN URL specifically, rather than tripping the
+        // factor-diversity rule first and never exercising the URL check.
         policy["pins"]["sss"][0] = serde_json::json!({
             "t": 2,
-            "pins": {"tang": [tang_entry(PEER_A, 0), tang_entry("http://10.0.0.9", 1)]}
+            "pins": {
+                "pkcs11": [{"uri": "pkcs11:serial=N;token=N", "mechanism": "RSA-PKCS"}],
+                "sss": [{"t": 2, "pins": {"tang": [
+                    tang_entry(PEER_A, 0), tang_entry("http://10.0.0.9", 1)]}}],
+            }
         });
         let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(!r.passed, "an unknown Tang server must fail: {}", r.detail);
@@ -1902,9 +2032,19 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// `clevis_binding_rejects_an_unknown_tang_url`.
     #[test]
     fn clevis_binding_accepts_a_subset_of_the_fleet_tang_servers() {
-        let r = evaluate_clevis_bindings(&sss_binding(
-            "{\"t\":2,\"pins\":{\"tang\":[{\"url\":\"http://172.16.2.45\"},{\"url\":\"http://172.16.2.46\"}]}}",
-        ));
+        // This test is about the Tang URL ALLOWLIST — binding to two of the
+        // three fleet servers is legitimate. The topology around it therefore
+        // has to be valid on its own, or the policy fails for an unrelated
+        // reason and the URL rule is never reached.
+        let policy = serde_json::json!({
+            "t": 2,
+            "pins": {
+                "pkcs11": [{"uri": "pkcs11:serial=N;token=N", "mechanism": "RSA-PKCS"}],
+                "sss": [{"t": 2, "pins": {"tang": [
+                    {"url": "http://172.16.2.45"}, {"url": "http://172.16.2.46"}]}}],
+            }
+        });
+        let r = evaluate_clevis_bindings(&bound(&policy));
         assert!(r.passed, "{}", r.detail);
     }
 
@@ -1934,7 +2074,7 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
     /// Practical consequence: dropping `tpm2` is NOT a safe way to dodge the
     /// PCR7/Secure-Boot ordering problem on len-serv-003.
     #[test]
-    fn known_limitation_tang_only_group_passes_the_share_count() {
+    fn a_tang_only_branch_is_rejected_even_though_it_costs_two_shares() {
         let tang = |t: u64| {
             serde_json::json!({"t": t, "pins": {"tang": [
             {"url":"http://172.16.2.45"},{"url":"http://172.16.2.46"},
@@ -1947,13 +2087,31 @@ GRUB_DEFAULT=0\nGRUB_TIMEOUT=5\nGRUB_DISTRIBUTOR=`lsb_release -i -s 2>/dev/null 
             {"t": 2, "pins": {"sss": [tang(1), {"t": 1, "pins": {"pkcs11": [tok("pkcs11:serial=A;token=A"), tok("pkcs11:serial=B;token=B")]}}]}}
         ]}});
 
-        // Two shares — but both of them are Tang.
-        assert_eq!(min_satisfying_shares(&policy), Ok(2));
+        // The share count still reads 2 — and always did. That was never the
+        // problem: both of those shares are Tang, so two Tang keys and nothing
+        // else open the volume.
+        assert_eq!(
+            min_satisfying_shares(&policy),
+            Ok(2),
+            "the share count is not what changed — it scored 2 before the \
+             factor-diversity rule existed, and still does"
+        );
+        assert!(
+            satisfiable_with_only(&policy, "tang"),
+            "group 1 here is a bare tang t=2, so the outer t=1 OR is reachable \
+             with Tang alone"
+        );
+
         let r = evaluate_clevis_bindings(&sss_binding(&policy.to_string()));
         assert!(
-            r.passed,
-            "recording current behaviour; if this starts FAILING a factor-diversity \
-             rule was added — update this test and drop the todo fragment: {}",
+            !r.passed,
+            "a policy whose cheapest branch is Tang-only must now FAIL: {}",
+            r.detail
+        );
+        assert!(
+            r.detail.contains("satisfiable by tang alone"),
+            "the failure must name the actual defect so an operator can fix the \
+             right branch, not just report a number: {}",
             r.detail
         );
     }
