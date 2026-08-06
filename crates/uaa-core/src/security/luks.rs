@@ -1,11 +1,45 @@
 // file: crates/uaa-core/src/security/luks.rs
-// version: 1.0.2
+// version: 1.1.0
 // guid: q7r8s9t0-u1v2-3456-7890-123456qrstuv
+// last-edited: 2026-08-03
 
 //! LUKS encryption operations
 
 use crate::{config::LuksConfig, network::ssh::SshClient, Result};
 use tracing::{debug, info};
+
+/// `cryptsetup luksFormat` flags that every LUKS2 volume this project creates
+/// MUST carry, because the metadata area size can only be chosen at FORMAT
+/// time and cannot be changed afterwards.
+///
+/// # Why (measured, not assumed)
+///
+/// The fleet's nested `sss` unlock policy produces a JWE of roughly 22 KB. The
+/// clevis binding is stored as a LUKS2 *token*, and tokens live in the metadata
+/// area — whose default size is 16 KiB. A 22 KB token therefore does not fit,
+/// and `clevis luks bind` dies with the maximally unhelpful
+/// `Failed to import token from file.`
+///
+/// Measured on cryptsetup 2.8.4 with a 22064-byte token and 64 MiB backing
+/// files:
+///
+/// | luksFormat flags | metadata area | keyslots area | data offset | 22 KB token import |
+/// |---|---|---|---|---|
+/// | (default) | 16384 B | 16744448 B | 16777216 B | **FAILS** |
+/// | `--luks2-metadata-size 1m` | 1048576 B | 14680064 B | 16777216 B | **OK** |
+/// | `+ --luks2-keyslots-size 4m` | 1048576 B | 4194304 B | **6291456 B** | OK |
+///
+/// Two conclusions the table settles:
+///
+/// * `--luks2-metadata-size 1m` alone is sufficient — 1 MiB holds the ~22 KB
+///   token with two orders of magnitude to spare.
+/// * `--luks2-keyslots-size` must **NOT** be raised. The metadata growth is
+///   taken out of the keyslots area automatically, leaving 14 MiB (ample:
+///   a 512-bit keyslot's AF area is ~256 KiB), and the payload offset stays at
+///   16 MiB — byte-compatible with every header this installer has already
+///   written. Passing `--luks2-keyslots-size` *moves the data offset*, which
+///   changes the on-disk layout for no benefit.
+pub const LUKS2_FORMAT_HEADER_FLAGS: &str = "--type luks2 --luks2-metadata-size 1m";
 
 /// Manager for LUKS encryption operations
 pub struct LuksManager;
@@ -34,8 +68,13 @@ impl LuksManager {
 
         // Create LUKS partition
         let luks_format_cmd = format!(
-            "echo '{}' | cryptsetup luksFormat --cipher {} --key-size {} --hash {} --use-random {}",
-            config.passphrase, config.cipher, config.key_size, config.hash, device
+            "echo '{}' | cryptsetup luksFormat {} --cipher {} --key-size {} --hash {} --use-random {}",
+            config.passphrase,
+            LUKS2_FORMAT_HEADER_FLAGS,
+            config.cipher,
+            config.key_size,
+            config.hash,
+            device
         );
 
         ssh.execute(&luks_format_cmd).await?;

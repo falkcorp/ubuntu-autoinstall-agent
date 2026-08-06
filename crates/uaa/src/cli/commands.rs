@@ -1,10 +1,12 @@
 // file: crates/uaa/src/cli/commands.rs
-// version: 2.15.0
+// version: 2.15.1
 // guid: g7h8i9j0-k1l2-3456-7890-123456ghijkl
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! Command implementations for the CLI
 
+use std::io::Write;
+use tracing::{error, info, warn};
 use uaa_core::{
     config::{loader::ConfigLoader, Architecture, ImageSpec},
     image::deployer::ImageDeployer,
@@ -13,8 +15,6 @@ use uaa_core::{
     utils::system::SystemUtils,
     Result,
 };
-use std::io::Write;
-use tracing::{error, info, warn};
 
 /// Create a golden Ubuntu image
 pub async fn create_image_command(
@@ -290,12 +290,10 @@ pub async fn ssh_install_command(
     // Build the phase selection up front so a bad --phases/--from-phase spec
     // fails BEFORE any connection or investigation side effects.
     let selection = match (phases.as_deref(), from_phase) {
-        (Some(spec), _) => {
-            PhaseSelection::parse(spec).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
-        (None, Some(n)) => {
-            PhaseSelection::from_phase(n).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
+        (Some(spec), _) => PhaseSelection::parse(spec)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
+        (None, Some(n)) => PhaseSelection::from_phase(n)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
         (None, None) => PhaseSelection::full(),
     };
 
@@ -435,12 +433,10 @@ pub async fn local_install_command(
     // Build the phase selection up front so a bad --phases/--from-phase spec
     // fails BEFORE any root check or destructive work.
     let selection = match (phases.as_deref(), from_phase) {
-        (Some(spec), _) => {
-            PhaseSelection::parse(spec).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
-        (None, Some(n)) => {
-            PhaseSelection::from_phase(n).map_err(uaa_core::error::AutoInstallError::ValidationError)?
-        }
+        (Some(spec), _) => PhaseSelection::parse(spec)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
+        (None, Some(n)) => PhaseSelection::from_phase(n)
+            .map_err(uaa_core::error::AutoInstallError::ValidationError)?,
         (None, None) => PhaseSelection::full(),
     };
 
@@ -518,8 +514,11 @@ pub async fn local_install_command(
     } else {
         uaa_core::network::ssh_installer::credentials::resolve_random_passwords(&mut config)
     };
-    let credentials_report =
-        render_credentials_report(&generated_credentials, &config.hostname, &config.network_address);
+    let credentials_report = render_credentials_report(
+        &generated_credentials,
+        &config.hostname,
+        &config.network_address,
+    );
 
     if in_target {
         if dry_run {
@@ -637,7 +636,8 @@ fn render_credentials_report(
 /// log file couldn't be written would be strictly worse.
 fn persist_credentials_report(report: &Option<String>, host_label: &str) {
     let Some(report) = report else { return };
-    match uaa_core::network::ssh_installer::credentials::write_credentials_file(host_label, report) {
+    match uaa_core::network::ssh_installer::credentials::write_credentials_file(host_label, report)
+    {
         Ok(path) => info!(
             "Recorded generated password(s) to {} (0600) before install",
             path.display()
@@ -880,6 +880,7 @@ fn create_local_installation_config(
         tpm2_pin: None,
         tpm2_pcr_ids: "7".to_string(),
         expect_fido2: true,
+        clevis_pkcs11_pin: false,
         // No place-time delivery on this interactive path (it runs live, off the
         // netboot server) — leave the fail-closed placeholder; `uaa enroll` will
         // refuse to trust it until the CA is delivered by hand.
@@ -894,6 +895,7 @@ fn create_local_installation_config(
         role: Default::default(),
         firmware_quirks: Vec::new(),
         hooks: Default::default(),
+        unlock_sss: None,
     })
 }
 
@@ -1048,8 +1050,7 @@ fn detect_network_config(
     let global_inet = iface_entry.and_then(|entry| {
         entry["addr_info"].as_array().and_then(|addr_info| {
             addr_info.iter().find(|info| {
-                info["family"].as_str() == Some("inet")
-                    && info["scope"].as_str() == Some("global")
+                info["family"].as_str() == Some("inet") && info["scope"].as_str() == Some("global")
             })
         })
     });
@@ -1108,7 +1109,8 @@ fn prompt_for_luks_passphrase() -> Result<String> {
         // stdin EOF (non-interactive) or bare Enter — never format with an
         // empty passphrase.
         return Err(uaa_core::error::AutoInstallError::ValidationError(
-            "Empty LUKS passphrase (non-interactive stdin?) — use --config with a luks_key instead".to_string(),
+            "Empty LUKS passphrase (non-interactive stdin?) — use --config with a luks_key instead"
+                .to_string(),
         ));
     }
     Ok(passphrase)
@@ -1186,7 +1188,9 @@ pub async fn place_command(
 
     let report = place_and_drive(
         &mut server_conn,
-        target_opt.as_mut().map(|t| t as &mut dyn uaa_core::network::executor::CommandExecutor),
+        target_opt
+            .as_mut()
+            .map(|t| t as &mut dyn uaa_core::network::executor::CommandExecutor),
         &spec,
         &opts,
     )
@@ -1195,10 +1199,7 @@ pub async fn place_command(
     report.print();
 
     if !report.dry_run {
-        info!(
-            "Seed written for {} → hexmac {}",
-            hostname, report.hexmac
-        );
+        info!("Seed written for {} → hexmac {}", hostname, report.hexmac);
     }
 
     Ok(())
@@ -1227,12 +1228,120 @@ pub async fn verify_command(
     report.print();
 
     if strict && !report.all_passed() {
-        return Err(uaa_core::error::AutoInstallError::ValidationError(
-            format!("{} check(s) failed on {host}", report.checks.iter().filter(|c| !c.passed).count()),
-        ));
+        return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+            "{} check(s) failed on {host}",
+            report.checks.iter().filter(|c| !c.passed).count()
+        )));
     }
 
     Ok(())
+}
+
+/// Judge a clevis policy's share topology locally, without SSH.
+///
+/// # Why this exists
+///
+/// The VM gate used to decide "is this binding safe?" with its own `jq`
+/// predicate over `clevis luks list` output, while the installer decided it in
+/// [`uaa_core::autoinstall::verify::evaluate_clevis_binding`]. Two
+/// implementations of one security rule drift, and these two did: the gate
+/// asked only "is `tang` a direct child of the outer `pins`?", which blesses a
+/// policy whose cheapest satisfying set is a single share, and it asked that
+/// question of `clevis luks list`, whose rendering of a nested policy drops
+/// shares and collapses arrays.
+///
+/// So the rule lives in exactly one place and this is the local entrypoint to
+/// it. The gate calls this; `uaa verify` calls the same evaluator over SSH.
+///
+/// Fails CLOSED: unreadable metadata, an unparseable JWE, or no clevis token at
+/// all are all non-zero exits, because a policy we cannot read is not a policy
+/// we can bless.
+pub async fn verify_policy_command(device: Option<&str>, file: Option<&str>) -> Result<()> {
+    use std::io::Read as _;
+    use uaa_core::autoinstall::verify::{evaluate_clevis_binding, CLEVIS_PROBE_COMMAND};
+
+    let luks_json = match (device, file) {
+        (Some(_), Some(_)) => {
+            return Err(uaa_core::error::AutoInstallError::ValidationError(
+                "pass --device or --file, not both".to_string(),
+            ))
+        }
+        (Some(dev), None) => {
+            // NO SHELL. `dev` comes from the command line, and this runs as
+            // root under the VM gate, so `sh -c "<cmd> {dev}"` would execute
+            // anything after a `;` in --device. Split the shared command
+            // string into argv instead: same program and flags as the SSH
+            // path (so the two cannot diverge in what they ask the kernel
+            // for), but `dev` is its own argv element and is never parsed by
+            // a shell.
+            let mut argv = CLEVIS_PROBE_COMMAND.split_whitespace();
+            let program = argv.next().ok_or_else(|| {
+                uaa_core::error::AutoInstallError::ValidationError(
+                    "CLEVIS_PROBE_COMMAND is empty".to_string(),
+                )
+            })?;
+
+            // Argv separation kills shell injection but not ARGUMENT
+            // injection: a `dev` beginning with `-` would still be read as a
+            // flag by cryptsetup. `--` is not used because cryptsetup's popt
+            // handling of it is not something this code can assume; rejecting
+            // the shape outright is unambiguous and costs nothing, since no
+            // real device node begins with a dash.
+            if dev.starts_with('-') {
+                return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "--device {dev:?} starts with '-'; refusing to pass it where it \
+                     would be read as a flag"
+                )));
+            }
+
+            let out = std::process::Command::new(program)
+                .args(argv)
+                .arg(dev)
+                .output()
+                .map_err(|e| {
+                    uaa_core::error::AutoInstallError::ValidationError(format!(
+                        "could not run `{CLEVIS_PROBE_COMMAND} {dev}`: {e}"
+                    ))
+                })?;
+            if !out.status.success() {
+                return Err(uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "`{CLEVIS_PROBE_COMMAND} {dev}` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        (None, Some(path)) if path != "-" => std::fs::read_to_string(path).map_err(|e| {
+            uaa_core::error::AutoInstallError::ValidationError(format!(
+                "could not read LUKS2 metadata from {path}: {e}"
+            ))
+        })?,
+        (None, _) => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+                uaa_core::error::AutoInstallError::ValidationError(format!(
+                    "could not read LUKS2 metadata from stdin: {e}"
+                ))
+            })?;
+            buf
+        }
+    };
+
+    let result = evaluate_clevis_binding(&luks_json);
+    println!(
+        "{} {}: {}",
+        if result.passed { "PASS" } else { "FAIL" },
+        result.name,
+        result.detail
+    );
+
+    if result.passed {
+        Ok(())
+    } else {
+        Err(uaa_core::error::AutoInstallError::ValidationError(
+            result.detail,
+        ))
+    }
 }
 
 /// Render a subiquity autoinstall `user-data` from the template + per-host values.
@@ -1313,6 +1422,76 @@ mod tests {
     use tempfile::TempDir;
     use tokio::fs;
 
+    /// REGRESSION: `--device` must never reach a shell.
+    ///
+    /// The first version of `verify_policy_command` ran
+    /// `sh -c "{CLEVIS_PROBE_COMMAND} {dev}"`, so
+    /// `--device '/dev/x; touch /tmp/pwned'` executed the `touch` — as root,
+    /// since the VM gate invokes this under sudo. It is argv-separated now.
+    ///
+    /// This asserts the observable half: the payload must NOT run. A passing
+    /// result is only meaningful because the shell form demonstrably DOES run
+    /// it, which is checked first — otherwise this would pass just as happily
+    /// against a build where the injection still existed but `cryptsetup`
+    /// merely happened to be missing.
+    #[tokio::test]
+    async fn verify_policy_device_is_not_shell_interpreted() {
+        // Plain [A-Za-z0-9-] only. An earlier version interpolated
+        // `ThreadId(N)` here, and the unquoted parens made the CONTROL's own
+        // `sh -c` a syntax error — so the payload never ran, the control
+        // tripped, and the test correctly refused to report a pass it had not
+        // earned.
+        let marker = std::env::temp_dir()
+            .join(format!("uaa-injection-probe-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let payload = format!("/dev/does-not-exist; touch {}", marker.display());
+
+        // CONTROL: prove the payload is live under a shell, so a clean result
+        // below cannot be a false negative.
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("true {payload}"))
+            .output();
+        assert!(
+            marker.exists(),
+            "control failed: the payload never executed even under `sh -c`, \
+             so this test could not detect an injection"
+        );
+        std::fs::remove_file(&marker).expect("control marker should be removable");
+
+        // LIVE: the same payload through the real entrypoint.
+        let _ = verify_policy_command(Some(&payload), None).await;
+        assert!(
+            !marker.exists(),
+            "COMMAND INJECTION: --device was interpreted by a shell"
+        );
+    }
+
+    /// Argv separation stops shell injection but not a `dev` that looks like a
+    /// flag, so the leading-dash shape is rejected outright. `--device=-x`
+    /// reaches the function because clap only intercepts the space-separated
+    /// form.
+    #[tokio::test]
+    async fn verify_policy_rejects_a_device_that_looks_like_a_flag() {
+        let err = verify_policy_command(Some("-x"), None)
+            .await
+            .expect_err("a device starting with '-' must be refused");
+        assert!(
+            err.to_string().contains("starts with '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `--device` and `--file` name two different sources of truth; taking
+    /// either silently would make the other a lie.
+    #[tokio::test]
+    async fn verify_policy_refuses_device_and_file_together() {
+        let err = verify_policy_command(Some("/dev/loop0"), Some("/tmp/x.json"))
+            .await
+            .expect_err("device+file must be refused");
+        assert!(err.to_string().contains("not both"), "unexpected: {err}");
+    }
+
     #[test]
     fn test_target_marker_present_detects_marker() {
         let root = std::env::temp_dir().join(format!(
@@ -1324,8 +1503,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(root.join("etc")).unwrap();
-        std::fs::write(root.join("etc").join("uaa-target-marker"), b"installed-by=uaa\n")
-            .unwrap();
+        std::fs::write(
+            root.join("etc").join("uaa-target-marker"),
+            b"installed-by=uaa\n",
+        )
+        .unwrap();
 
         assert!(target_marker_present(&root));
 

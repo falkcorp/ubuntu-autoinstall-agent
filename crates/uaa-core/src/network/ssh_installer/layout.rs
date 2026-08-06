@@ -271,8 +271,14 @@ pub fn plan_layout(disks: &[DiskSpec]) -> Result<PartitionPlan, LayoutError> {
         }
     }
 
-    let system: Vec<&DiskSpec> = disks.iter().filter(|d| d.role == DiskRole::System).collect();
-    let special: Vec<&DiskSpec> = disks.iter().filter(|d| d.role == DiskRole::Special).collect();
+    let system: Vec<&DiskSpec> = disks
+        .iter()
+        .filter(|d| d.role == DiskRole::System)
+        .collect();
+    let special: Vec<&DiskSpec> = disks
+        .iter()
+        .filter(|d| d.role == DiskRole::Special)
+        .collect();
 
     // At least one System disk is required — it carries ESP + bpool + rpool
     // data, so with none there is nothing to install onto.
@@ -355,14 +361,22 @@ mod tests {
 
         let shapes0: Vec<_> = system[0].partitions.iter().map(shape).collect();
         let shapes1: Vec<_> = system[1].partitions.iter().map(shape).collect();
-        assert_eq!(shapes0, shapes1, "both System SSDs get identical partition shapes");
+        assert_eq!(
+            shapes0, shapes1,
+            "both System SSDs get identical partition shapes"
+        );
 
         // p1=ESP(1G), p2=bpool(2G), p3=data(rest).
         assert_eq!(
             shapes0,
             vec![
                 (1, PartKind::Esp, PartSize::Fixed(ESP_SIZE_BYTES), "EF00"),
-                (2, PartKind::Bpool, PartSize::Fixed(BPOOL_SIZE_BYTES), "BE00"),
+                (
+                    2,
+                    PartKind::Bpool,
+                    PartSize::Fixed(BPOOL_SIZE_BYTES),
+                    "BE00"
+                ),
                 (3, PartKind::Data, PartSize::Remainder, "BF00"),
             ]
         );
@@ -376,12 +390,20 @@ mod tests {
 
         let shapes0: Vec<_> = special[0].partitions.iter().map(shape).collect();
         let shapes1: Vec<_> = special[1].partitions.iter().map(shape).collect();
-        assert_eq!(shapes0, shapes1, "both Optanes get identical special shapes");
+        assert_eq!(
+            shapes0, shapes1,
+            "both Optanes get identical special shapes"
+        );
 
         // A single half-disk special member; the remainder is left free.
         assert_eq!(
             shapes0,
-            vec![(1, PartKind::Special, PartSize::Fixed(SPECIAL_SIZE_BYTES), "BF00")]
+            vec![(
+                1,
+                PartKind::Special,
+                PartSize::Fixed(SPECIAL_SIZE_BYTES),
+                "BF00"
+            )]
         );
     }
 
@@ -418,7 +440,11 @@ mod tests {
     #[test]
     fn exactly_two_esps_on_the_bootable_disks() {
         let plan = plan_layout(&u1_roster()).expect("valid roster");
-        assert_eq!(plan.esp_count(), 2, "one ESP per system disk, both in NVRAM");
+        assert_eq!(
+            plan.esp_count(),
+            2,
+            "one ESP per system disk, both in NVRAM"
+        );
         // ESPs live only on System (bootable SATA) disks, never on the Optanes.
         for sp in plan.special_disks() {
             assert!(
@@ -451,7 +477,13 @@ mod tests {
         let plan = plan_layout(&roster).expect("one system disk is a valid roster");
         assert_eq!(plan.system_disks().count(), 1);
         assert_eq!(plan.special_disks().count(), 2);
-        let sys0: Vec<_> = plan.system_disks().next().unwrap().partitions.iter().collect();
+        let sys0: Vec<_> = plan
+            .system_disks()
+            .next()
+            .unwrap()
+            .partitions
+            .iter()
+            .collect();
         assert_eq!(sys0.len(), 3, "ESP + bpool + data even on a lone disk");
         assert_eq!(sys0[0].label, "ESP1");
         assert_eq!(sys0[1].label, "bpool-0");
@@ -468,8 +500,18 @@ mod tests {
         }];
         let plan = plan_layout(&roster).expect("single-disk native-keystore roster is valid");
         assert_eq!(plan.system_disks().count(), 1);
-        assert_eq!(plan.special_disks().count(), 0, "no special vdev on a 1-disk host");
-        let parts: Vec<_> = plan.system_disks().next().unwrap().partitions.iter().collect();
+        assert_eq!(
+            plan.special_disks().count(),
+            0,
+            "no special vdev on a 1-disk host"
+        );
+        let parts: Vec<_> = plan
+            .system_disks()
+            .next()
+            .unwrap()
+            .partitions
+            .iter()
+            .collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].kind, PartKind::Esp);
         assert_eq!(parts[1].kind, PartKind::Bpool);

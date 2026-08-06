@@ -42,8 +42,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, PKCS_ECDSA_P256_SHA256,
-    SanType,
+    CertificateParams, DistinguishedName, DnType, Ia5String, KeyPair, SanType,
+    PKCS_ECDSA_P256_SHA256,
 };
 use x509_parser::certification_request::X509CertificationRequest;
 use x509_parser::pem::parse_x509_pem;
@@ -211,12 +211,12 @@ fn cert_lifecycle(cert_pem: &str) -> Result<CertLifecycle> {
 /// and `uaa-mac:<mac>` (URI) — mirrors what PK-01's server signs onto the issued
 /// certificate.
 pub fn generate_keypair_and_csr(identity: &AgentIdentity) -> Result<(KeyPem, CsrPem)> {
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
-        .map_err(|e| AutoInstallError::ConfigError(format!("P-256 keypair generation failed: {e}")))?;
-
-    let mut params = CertificateParams::new(vec![identity.hostname.clone()]).map_err(|e| {
-        AutoInstallError::ConfigError(format!("CSR hostname SAN failed: {e}"))
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
+        AutoInstallError::ConfigError(format!("P-256 keypair generation failed: {e}"))
     })?;
+
+    let mut params = CertificateParams::new(vec![identity.hostname.clone()])
+        .map_err(|e| AutoInstallError::ConfigError(format!("CSR hostname SAN failed: {e}")))?;
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, identity.hostname.clone());
@@ -374,7 +374,8 @@ pub struct GetCredentialResponse {
 #[async_trait::async_trait]
 pub trait EnrollTransport: Send + Sync {
     async fn submit_csr(&self, req: SubmitCsrRequest) -> Result<SubmitCsrResponse>;
-    async fn get_credential(&self, spki_fingerprint: &str) -> Result<Option<GetCredentialResponse>>;
+    async fn get_credential(&self, spki_fingerprint: &str)
+        -> Result<Option<GetCredentialResponse>>;
 }
 
 /// Production [`EnrollTransport`]: reqwest with rustls, system roots DISABLED,
@@ -414,7 +415,10 @@ impl EnrollTransport for ReqwestEnrollTransport {
         Ok(resp.json::<SubmitCsrResponse>().await?)
     }
 
-    async fn get_credential(&self, spki_fingerprint: &str) -> Result<Option<GetCredentialResponse>> {
+    async fn get_credential(
+        &self,
+        spki_fingerprint: &str,
+    ) -> Result<Option<GetCredentialResponse>> {
         let url = self.join(&format!("/enroll/credential/{spki_fingerprint}"))?;
         let resp = self.client.get(url).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -578,8 +582,11 @@ mod tests {
 
     fn write_dummy_ca(dir: &Path) -> PathBuf {
         let path = dir.join("install-ca.crt");
-        fs::write(&path, "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        fs::write(
+            &path,
+            "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         path
     }
 
@@ -727,8 +734,14 @@ mod tests {
         drop(first);
 
         let second = EnrollState::load_or_init(dir.path(), &identity).unwrap();
-        assert_eq!(first_fp, second.spki_fp, "SPKI fp must be stable across reload");
-        assert_eq!(first_csr, second.csr_pem, "CSR bytes must be identical (no re-mint)");
+        assert_eq!(
+            first_fp, second.spki_fp,
+            "SPKI fp must be stable across reload"
+        );
+        assert_eq!(
+            first_csr, second.csr_pem,
+            "CSR bytes must be identical (no re-mint)"
+        );
     }
 
     #[tokio::test]
@@ -790,7 +803,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&cert_path).unwrap(), cert_content);
 
         // Backoff must have been used for the two `pending` responses.
-        assert_eq!(sleeper.durations(), vec![Duration::from_secs(30), Duration::from_secs(60)]);
+        assert_eq!(
+            sleeper.durations(),
+            vec![Duration::from_secs(30), Duration::from_secs(60)]
+        );
     }
 
     #[tokio::test]
@@ -850,10 +866,9 @@ mod tests {
         let transport = MockTransport::default();
         let sleeper = MockSleeper::default();
 
-        let credential =
-            enroll_poll_with(&identity, &transport, &sleeper, &ca_path, dir.path())
-                .await
-                .expect("valid persisted cert must short-circuit");
+        let credential = enroll_poll_with(&identity, &transport, &sleeper, &ca_path, dir.path())
+            .await
+            .expect("valid persisted cert must short-circuit");
 
         assert_eq!(credential.cert_pem, cert_pem);
         assert_eq!(transport.submit_call_count(), 0);
@@ -868,8 +883,14 @@ mod tests {
         let not_before = 0i64;
         let not_after = 900i64;
 
-        assert_eq!(classify_lifecycle(0, not_before, not_after), CertLifecycle::Fresh);
-        assert_eq!(classify_lifecycle(599, not_before, not_after), CertLifecycle::Fresh);
+        assert_eq!(
+            classify_lifecycle(0, not_before, not_after),
+            CertLifecycle::Fresh
+        );
+        assert_eq!(
+            classify_lifecycle(599, not_before, not_after),
+            CertLifecycle::Fresh
+        );
         // Exactly 2/3 through (600/900) and beyond -> due for renewal.
         assert_eq!(
             classify_lifecycle(600, not_before, not_after),
@@ -880,8 +901,14 @@ mod tests {
             CertLifecycle::NeedsRenewal
         );
         // At/after not_after -> expired.
-        assert_eq!(classify_lifecycle(900, not_before, not_after), CertLifecycle::Expired);
-        assert_eq!(classify_lifecycle(1000, not_before, not_after), CertLifecycle::Expired);
+        assert_eq!(
+            classify_lifecycle(900, not_before, not_after),
+            CertLifecycle::Expired
+        );
+        assert_eq!(
+            classify_lifecycle(1000, not_before, not_after),
+            CertLifecycle::Expired
+        );
     }
 
     #[test]

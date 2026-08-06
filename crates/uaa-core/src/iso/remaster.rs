@@ -109,8 +109,7 @@ pub fn default_output_for(input: &str) -> String {
 /// the whole matched prefix, used as the insertion point for both patch
 /// functions below.
 fn vmlinuz_regex() -> Regex {
-    Regex::new(r"(linux(efi)?[[:space:]]+/casper/vmlinuz)")
-        .expect("static vmlinuz regex is valid")
+    Regex::new(r"(linux(efi)?[[:space:]]+/casper/vmlinuz)").expect("static vmlinuz regex is valid")
 }
 
 /// Insert the NoCloud cloud-init datasource tokens right after every
@@ -418,8 +417,11 @@ mod tests {
                    menuentry 'UEFI' {\n  linuxefi /casper/vmlinuz quiet\n}\n";
         let (patched, changed) = patch_kernel_cmdline(cfg);
         assert!(changed);
-        assert!(patched.contains("linux\t/casper/vmlinuz ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0 quiet"));
-        assert!(patched.contains("linuxefi /casper/vmlinuz ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0 quiet"));
+        assert!(patched
+            .contains("linux\t/casper/vmlinuz ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0 quiet"));
+        assert!(patched.contains(
+            "linuxefi /casper/vmlinuz ds=nocloud\\;s=/cdrom/nocloud/ autoinstall=0 quiet"
+        ));
     }
 
     #[test]
@@ -442,7 +444,8 @@ mod tests {
         assert!(patched.contains("uaa.autoinstall"));
         assert!(patched.contains("uaa.on_done=poweroff"));
 
-        let (patched_again, changed_again) = patch_autoinstall_tokens(&patched, Some(OnDone::Poweroff));
+        let (patched_again, changed_again) =
+            patch_autoinstall_tokens(&patched, Some(OnDone::Poweroff));
         assert_eq!(patched, patched_again);
         assert!(!changed_again);
     }

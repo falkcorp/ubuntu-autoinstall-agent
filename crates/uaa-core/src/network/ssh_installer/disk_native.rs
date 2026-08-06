@@ -94,7 +94,8 @@ impl<'a> DiskNativeManager<'a> {
             &format!("partprobe {} 2>/dev/null || true", all_ids.join(" ")),
         )
         .await?;
-        self.log_and_execute("Settle udev", "udevadm settle").await?;
+        self.log_and_execute("Settle udev", "udevadm settle")
+            .await?;
 
         // Format each System disk's ESP as FAT32 — the base-system install mounts
         // it at /boot/efi and grub-install writes the signed shim there. (bpool /
@@ -193,18 +194,36 @@ mod tests {
 
     fn u1_roster() -> Vec<DiskSpec> {
         vec![
-            DiskSpec { id: "/dev/disk/by-id/ata-SSD0".into(), role: DiskRole::System },
-            DiskSpec { id: "/dev/disk/by-id/ata-SSD1".into(), role: DiskRole::System },
-            DiskSpec { id: "/dev/disk/by-id/nvme-OPT0".into(), role: DiskRole::Special },
-            DiskSpec { id: "/dev/disk/by-id/nvme-OPT1".into(), role: DiskRole::Special },
+            DiskSpec {
+                id: "/dev/disk/by-id/ata-SSD0".into(),
+                role: DiskRole::System,
+            },
+            DiskSpec {
+                id: "/dev/disk/by-id/ata-SSD1".into(),
+                role: DiskRole::System,
+            },
+            DiskSpec {
+                id: "/dev/disk/by-id/nvme-OPT0".into(),
+                role: DiskRole::Special,
+            },
+            DiskSpec {
+                id: "/dev/disk/by-id/nvme-OPT1".into(),
+                role: DiskRole::Special,
+            },
         ]
     }
 
     #[test]
     fn sgdisk_end_formats_binary_units_and_remainder() {
         assert_eq!(DiskNativeManager::sgdisk_end(PartSize::Fixed(GIB)), "+1G");
-        assert_eq!(DiskNativeManager::sgdisk_end(PartSize::Fixed(2 * GIB)), "+2G");
-        assert_eq!(DiskNativeManager::sgdisk_end(PartSize::Fixed(512 * MIB)), "+512M");
+        assert_eq!(
+            DiskNativeManager::sgdisk_end(PartSize::Fixed(2 * GIB)),
+            "+2G"
+        );
+        assert_eq!(
+            DiskNativeManager::sgdisk_end(PartSize::Fixed(512 * MIB)),
+            "+512M"
+        );
         assert_eq!(DiskNativeManager::sgdisk_end(PartSize::Remainder), "0");
     }
 
@@ -229,10 +248,17 @@ mod tests {
     fn special_optane_gets_one_half_disk_partition() {
         let plan = plan_layout(&u1_roster()).expect("valid roster");
         let opt0 = plan.special_disks().next().expect("a special disk");
-        assert_eq!(opt0.partitions.len(), 1, "Optane has exactly one special member");
+        assert_eq!(
+            opt0.partitions.len(),
+            1,
+            "Optane has exactly one special member"
+        );
         let cmd = DiskNativeManager::build_sgdisk(&opt0.id, &opt0.partitions[0]);
         // p1 special, fixed 6G (half the drive, NOT ':0' remainder), BF00.
-        assert!(cmd.contains("sgdisk -n 1:0:+6G -t 1:BF00 -c 1:'special-0'"), "got: {cmd}");
+        assert!(
+            cmd.contains("sgdisk -n 1:0:+6G -t 1:BF00 -c 1:'special-0'"),
+            "got: {cmd}"
+        );
         assert!(cmd.ends_with(&opt0.id));
     }
 

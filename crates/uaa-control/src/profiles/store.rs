@@ -92,7 +92,8 @@ pub trait ProfileStore: Send + Sync {
     /// released one is reactivated at the SAME index. Reads fail CLOSED via
     /// `read_snapshot_strict` — an unreadable snapshot is an `Err`, never an
     /// allocate-from-1.
-    async fn allocate_index(&self, group_id: Uuid, identity: &str) -> Result<HostnameAllocationRow>;
+    async fn allocate_index(&self, group_id: Uuid, identity: &str)
+        -> Result<HostnameAllocationRow>;
     /// DS-REG-03 / spec D18 — the NIC-replacement runbook and the one deliberate
     /// exception to append-only. Moves the existing index+hostname to
     /// `new_identity` and tombstones the old row, audited via
@@ -336,7 +337,11 @@ impl ProfileStore for SnapshotProfileStore {
     /// holds no lock). There is therefore NO in-process serialization; under
     /// spec D4 `uaa-control` is single-writer, exactly as every other mutation
     /// in this store already assumes.
-    async fn allocate_index(&self, group_id: Uuid, identity: &str) -> Result<HostnameAllocationRow> {
+    async fn allocate_index(
+        &self,
+        group_id: Uuid,
+        identity: &str,
+    ) -> Result<HostnameAllocationRow> {
         let identity = normalize_mac(identity);
         let mut doc = read_snapshot_strict(&self.paths)?;
 
@@ -415,9 +420,11 @@ impl ProfileStore for SnapshotProfileStore {
                 anyhow!("rebind: old identity {old_identity} is not bound in group {group_id}")
             })?;
 
-        if doc.hostname_allocations.iter().any(|a| {
-            a.group_id == group_id && a.identity == new_identity && a.rebound_to.is_none()
-        }) {
+        if doc
+            .hostname_allocations
+            .iter()
+            .any(|a| a.group_id == group_id && a.identity == new_identity && a.rebound_to.is_none())
+        {
             return Err(anyhow!(
                 "rebind: new identity {new_identity} is already bound in group {group_id}"
             ));
@@ -659,7 +666,11 @@ impl ProfileStore for MemProfileStore {
             .collect())
     }
 
-    async fn allocate_index(&self, group_id: Uuid, identity: &str) -> Result<HostnameAllocationRow> {
+    async fn allocate_index(
+        &self,
+        group_id: Uuid,
+        identity: &str,
+    ) -> Result<HostnameAllocationRow> {
         let mut state = self.state.lock().expect("MemProfileStore state poisoned");
 
         // Idempotent: an identity that already holds an active allocation in
@@ -908,14 +919,26 @@ mod tests {
         let store = MemProfileStore::new();
         let audit = MemAuditStore::new();
         let group_id = Uuid::new_v4();
-        let first = store.allocate_index(group_id, "old-identity").await.unwrap();
-
-        let rebound = store
-            .rebind(&audit, "operator-login", group_id, "old-identity", "new-identity")
+        let first = store
+            .allocate_index(group_id, "old-identity")
             .await
             .unwrap();
 
-        assert_eq!(rebound.index, first.index, "rebind must keep the same index");
+        let rebound = store
+            .rebind(
+                &audit,
+                "operator-login",
+                group_id,
+                "old-identity",
+                "new-identity",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rebound.index, first.index,
+            "rebind must keep the same index"
+        );
         assert_eq!(rebound.identity, "new-identity");
 
         let all = store.list_allocations(group_id).await.unwrap();
@@ -942,7 +965,10 @@ mod tests {
         name: &str,
     ) -> SnapshotProfileStore {
         let store = SnapshotProfileStore::new(StatePaths::under(dir));
-        store.put_group(sample_group(group_id, name), "alice").await.unwrap();
+        store
+            .put_group(sample_group(group_id, name), "alice")
+            .await
+            .unwrap();
         store
     }
 
@@ -965,11 +991,23 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        let first = store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
-        let rows_after_first = read_snapshot_strict(&paths).unwrap().hostname_allocations.len();
+        let first = store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
+        let rows_after_first = read_snapshot_strict(&paths)
+            .unwrap()
+            .hostname_allocations
+            .len();
 
-        let second = store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
-        let rows_after_second = read_snapshot_strict(&paths).unwrap().hostname_allocations.len();
+        let second = store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
+        let rows_after_second = read_snapshot_strict(&paths)
+            .unwrap()
+            .hostname_allocations
+            .len();
 
         assert_eq!(first.index, second.index, "same identity -> same index");
         assert_eq!(
@@ -987,7 +1025,11 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        let ids = ["aa:bb:cc:dd:ee:01", "aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"];
+        let ids = [
+            "aa:bb:cc:dd:ee:01",
+            "aa:bb:cc:dd:ee:02",
+            "aa:bb:cc:dd:ee:03",
+        ];
         let mut original = Vec::new();
         for id in ids {
             original.push(store.allocate_index(group_id, id).await.unwrap().index);
@@ -1018,7 +1060,9 @@ mod tests {
         let paths = StatePaths::under(dir.path());
         let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
 
-        let result = store.allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01").await;
+        let result = store
+            .allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01")
+            .await;
         assert!(
             result.is_err(),
             "a missing snapshot must refuse to allocate, never allocate-from-1"
@@ -1036,7 +1080,9 @@ mod tests {
         std::fs::write(&paths.snapshot, b"not json").unwrap();
         let store = SnapshotProfileStore::new(StatePaths::under(dir.path()));
 
-        let result = store.allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01").await;
+        let result = store
+            .allocate_index(Uuid::new_v4(), "aa:bb:cc:dd:ee:01")
+            .await;
         assert!(
             result.is_err(),
             "a corrupt snapshot must refuse to allocate, never allocate-from-1"
@@ -1055,11 +1101,20 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
-        store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
+        store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
+        store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:02")
+            .await
+            .unwrap();
         soft_release(&paths, group_id, "aa:bb:cc:dd:ee:02");
 
-        let fresh = store.allocate_index(group_id, "aa:bb:cc:dd:ee:03").await.unwrap();
+        let fresh = store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:03")
+            .await
+            .unwrap();
         assert_eq!(
             fresh.index, 3,
             "a NEW identity must get 3, never reuse the released index 2"
@@ -1073,12 +1128,24 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        store.allocate_index(group_id, "aa:bb:cc:dd:ee:01").await.unwrap();
-        let second = store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
+        store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:01")
+            .await
+            .unwrap();
+        let second = store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:02")
+            .await
+            .unwrap();
         soft_release(&paths, group_id, "aa:bb:cc:dd:ee:02");
 
-        let returned = store.allocate_index(group_id, "aa:bb:cc:dd:ee:02").await.unwrap();
-        assert_eq!(returned.index, second.index, "returning machine keeps index 2");
+        let returned = store
+            .allocate_index(group_id, "aa:bb:cc:dd:ee:02")
+            .await
+            .unwrap();
+        assert_eq!(
+            returned.index, second.index,
+            "returning machine keeps index 2"
+        );
 
         let doc = read_snapshot_strict(&paths).unwrap();
         let row = doc
@@ -1086,7 +1153,10 @@ mod tests {
             .iter()
             .find(|a| a.identity == "aa:bb:cc:dd:ee:02" && a.rebound_to.is_none())
             .unwrap();
-        assert!(row.released_at.is_none(), "released_at must be cleared on return");
+        assert!(
+            row.released_at.is_none(),
+            "released_at must be cleared on return"
+        );
     }
 
     #[tokio::test]
@@ -1097,10 +1167,16 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        let first = store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        let first = store
+            .allocate_index(group_id, "6c:4b:90:bc:f7:f4")
+            .await
+            .unwrap();
         assert_eq!(first.index, 1, "first bound MAC gets index 1");
 
-        let lower = store.allocate_index(group_id, "6c:4b:90:bc:39:b3").await.unwrap();
+        let lower = store
+            .allocate_index(group_id, "6c:4b:90:bc:39:b3")
+            .await
+            .unwrap();
         assert_eq!(
             lower.index, 2,
             "the lower MAC added later gets the NEXT index, never index 1"
@@ -1141,13 +1217,25 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        let original = store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
+        let original = store
+            .allocate_index(group_id, "6c:4b:90:bc:f7:f4")
+            .await
+            .unwrap();
         let new_row = store
-            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .rebind(
+                &audit,
+                "op",
+                group_id,
+                "6c:4b:90:bc:f7:f4",
+                "6c:4b:90:bc:39:b3",
+            )
             .await
             .unwrap();
 
-        assert_eq!(new_row.index, original.index, "index moves to the new identity");
+        assert_eq!(
+            new_row.index, original.index,
+            "index moves to the new identity"
+        );
         assert_eq!(new_row.hostname, original.hostname, "hostname moves too");
         assert_eq!(new_row.identity, "6c:4b:90:bc:39:b3");
 
@@ -1172,7 +1260,13 @@ mod tests {
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
         let result = store
-            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .rebind(
+                &audit,
+                "op",
+                group_id,
+                "6c:4b:90:bc:f7:f4",
+                "6c:4b:90:bc:39:b3",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -1187,11 +1281,23 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
-        store.allocate_index(group_id, "6c:4b:90:bc:39:b3").await.unwrap();
+        store
+            .allocate_index(group_id, "6c:4b:90:bc:f7:f4")
+            .await
+            .unwrap();
+        store
+            .allocate_index(group_id, "6c:4b:90:bc:39:b3")
+            .await
+            .unwrap();
 
         let result = store
-            .rebind(&audit, "op", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .rebind(
+                &audit,
+                "op",
+                group_id,
+                "6c:4b:90:bc:f7:f4",
+                "6c:4b:90:bc:39:b3",
+            )
             .await;
         assert!(
             result.is_err(),
@@ -1206,14 +1312,27 @@ mod tests {
         let group_id = Uuid::new_v4();
         let store = snapshot_store_with_group(dir.path(), group_id, "len-serv").await;
 
-        store.allocate_index(group_id, "6c:4b:90:bc:f7:f4").await.unwrap();
         store
-            .rebind(&audit, "operator-jdfalk", group_id, "6c:4b:90:bc:f7:f4", "6c:4b:90:bc:39:b3")
+            .allocate_index(group_id, "6c:4b:90:bc:f7:f4")
+            .await
+            .unwrap();
+        store
+            .rebind(
+                &audit,
+                "operator-jdfalk",
+                group_id,
+                "6c:4b:90:bc:f7:f4",
+                "6c:4b:90:bc:39:b3",
+            )
             .await
             .unwrap();
 
         let events = audit.list_events(0).await.unwrap();
-        assert_eq!(events.len(), 1, "rebind must append exactly one audit event");
+        assert_eq!(
+            events.len(),
+            1,
+            "rebind must append exactly one audit event"
+        );
         assert_eq!(
             events[0].actor, "operator-jdfalk",
             "the audit actor must be the caller-supplied login"
@@ -1242,7 +1361,10 @@ mod tests {
             "updated_at": null
         });
         let row: HostGroupRow = serde_json::from_value(raw).unwrap();
-        assert_eq!(row.schema_version, 0, "a row missing the key must default to 0");
+        assert_eq!(
+            row.schema_version, 0,
+            "a row missing the key must default to 0"
+        );
 
         let raw_profile = serde_json::json!({
             "id": Uuid::new_v4(),
@@ -1289,7 +1411,8 @@ mod tests {
 
         let err = ensure_schema_servable(2).unwrap_err();
         assert!(
-            err.to_string().contains("schema version 2 exceeds binary max 1"),
+            err.to_string()
+                .contains("schema version 2 exceeds binary max 1"),
             "unexpected message: {err}"
         );
     }

@@ -90,8 +90,9 @@ pub async fn collect_status(
 
     for (kind, unit) in units {
         let cmd = format!("systemctl is-active '{}'", unit.replace("'", "'\\''"));
-        let (exit_code, stdout, _stderr) =
-            runner.execute_with_error_collection(&cmd, "systemctl is-active").await?;
+        let (exit_code, stdout, _stderr) = runner
+            .execute_with_error_collection(&cmd, "systemctl is-active")
+            .await?;
 
         let active = exit_code == 0;
         let detail = stdout.trim().to_string();
@@ -126,10 +127,17 @@ pub fn build_payload(mac: &str, reports: Vec<AppStatusReport>) -> Result<AppStat
 ///
 /// Read-only w.r.t. local state: this function never touches systemd state
 /// or any files.
-pub async fn post_status(control_url: &str, payload: &AppStatusPayload) -> Result<AppStatusOutcome> {
+pub async fn post_status(
+    control_url: &str,
+    payload: &AppStatusPayload,
+) -> Result<AppStatusOutcome> {
     let url = format!("{}/app-status", control_url.trim_end_matches('/'));
 
-    let response = reqwest::Client::new().post(&url).json(payload).send().await?;
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(payload)
+        .send()
+        .await?;
     let status = response.status();
     let body: serde_json::Value = response.json().await?;
 
@@ -273,10 +281,13 @@ mod tests {
         let mut mock = MockExecutor::new();
         let units: &[(String, String)] = &[];
 
-        let reports = collect_status(&mut mock, units).await.expect("collect empty units");
+        let reports = collect_status(&mut mock, units)
+            .await
+            .expect("collect empty units");
         assert_eq!(reports.len(), 0);
 
-        let payload = build_payload("aa:bb:cc:dd:ee:f0", reports).expect("valid mac + empty reports");
+        let payload =
+            build_payload("aa:bb:cc:dd:ee:f0", reports).expect("valid mac + empty reports");
         assert_eq!(payload.reports.len(), 0);
         assert_eq!(mock.record_commands_called(), 0);
     }
@@ -289,7 +300,8 @@ mod tests {
 
         let units = vec![("cockroach".to_string(), "cockroach.service".to_string())];
 
-        let reports = collect_status(&mut mock, &units).await
+        let reports = collect_status(&mut mock, &units)
+            .await
             .expect("non-zero systemctl is-active is not an error");
         assert_eq!(reports.len(), 1);
         assert!(!reports[0].active);
@@ -306,7 +318,8 @@ mod tests {
 
         let units = vec![("cockroach".to_string(), "cockroach.service".to_string())];
 
-        let reports = collect_status(&mut mock, &units).await
+        let reports = collect_status(&mut mock, &units)
+            .await
             .expect("systemctl is-active success");
         assert_eq!(reports.len(), 1);
         assert!(reports[0].active);

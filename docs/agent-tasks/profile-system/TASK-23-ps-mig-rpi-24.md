@@ -1,7 +1,7 @@
 <!-- file: docs/agent-tasks/profile-system/TASK-23-ps-mig-rpi-24.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 1.1.0 -->
 <!-- guid: 7a010ce0-666d-4642-8199-a2745040a621 -->
-<!-- last-edited: 2026-07-23 -->
+<!-- last-edited: 2026-08-04 -->
 
 # TASK-23 — author rpi-serv group (expressibility + validation only) (PS-MIG-RPI-24)
 
@@ -25,7 +25,7 @@ git rebase origin/main
 
 ## Goal
 
-Author a net-new rpi-serv group using the component shape established by PS-MIG-U1-23: arch=arm64, role=tang-server, base_image=(ubuntu arm64 mirror + initramfs=initramfs-tools), applications=[{kind:tang-server, port:80, key-directory:/etc/tang/keys}], firmware_quirks=[{kind:watchdog-staggered, slot:0, interval_secs:60}] (the PS-QUIRK-05 stub). EXPLICIT SCOPE: this delivers authoring/validation EXPRESSIBILITY + validate_resolved() coverage ONLY — NOT a bootable arm64 install (the x86-assumption audit of dracut/GRUB/tpm2 chroot phases is out of scope, tracked as an open question). Does NOT touch len-serv or U1. Deliverables: examples/configs/install/rpi-serv-001.yaml (arm64 tang-server group) + a Rust test module. Put the test at crates/uaa-core/tests/rpi_group.rs (integration test): deserialize the group+profile, resolve through merge, and (a) assert validate_resolved passes for the tang-server role (empty disks/unlock permitted because a tang-server application is present), (b) assert validate_resolved REJECTS a variant of the rpi config that adds firmware_quirks=[grub-removable-fallback] (rule 4: arm64 forbids GrubRemovableFallback) with the expected error message. Add a README/doc-comment noting expressibility-only. New files at 1.0.0.
+Author a net-new rpi-serv group using the component shape established by PS-MIG-U1-23: arch=arm64, role=tang-server, base_image=(ubuntu arm64 mirror + initramfs=dracut), applications=[{kind:tang-server, port:80, key-directory:/etc/tang/keys}], firmware_quirks=[{kind:watchdog-staggered, slot:0, interval_secs:60}] (the PS-QUIRK-05 stub). EXPLICIT SCOPE: this delivers authoring/validation EXPRESSIBILITY + validate_resolved() coverage ONLY — NOT a bootable arm64 install (the x86-assumption audit of dracut/GRUB/tpm2 chroot phases is out of scope, tracked as an open question). Does NOT touch len-serv or U1. Deliverables: examples/configs/install/rpi-serv-001.yaml (arm64 tang-server group) + a Rust test module. Put the test at crates/uaa-core/tests/rpi_group.rs (integration test): deserialize the group+profile, resolve through merge, and (a) assert validate_resolved passes for the tang-server role (empty disks/unlock permitted because a tang-server application is present), (b) assert validate_resolved REJECTS a variant of the rpi config that adds firmware_quirks=[grub-removable-fallback] (rule 4: arm64 forbids GrubRemovableFallback) with the expected error message. Add a README/doc-comment noting expressibility-only. New files at 1.0.0.
 
 ## Files (expected touch set)
 

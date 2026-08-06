@@ -63,9 +63,8 @@ use crate::auth::{
 use crate::ca::InstallCa;
 use crate::db::{
     store::{read_snapshot, write_snapshot, StatePaths},
-    AuditEventRow as DbAuditEventRow, BootTarget, EnrollmentRow as DbEnrollmentRow,
-    HostGroupRow, HostProfileRow, HostnameAllocationRow, MachineRow as DbMachineRow,
-    MachineStatus,
+    AuditEventRow as DbAuditEventRow, BootTarget, EnrollmentRow as DbEnrollmentRow, HostGroupRow,
+    HostProfileRow, HostnameAllocationRow, MachineRow as DbMachineRow, MachineStatus,
 };
 use crate::enroll::{self, EnrollmentStore, MemEnrollmentStore};
 use crate::machine_plane::lifecycle::normalize_mac;
@@ -653,10 +652,7 @@ fn build_router(
                 "/api/discovered/:mac/dismiss",
                 post(handle_dismiss_discovered),
             )
-            .route(
-                "/api/groups",
-                post(handle_create_group),
-            )
+            .route("/api/groups", post(handle_create_group))
             .route(
                 "/api/groups/:name",
                 axum::routing::put(handle_update_group).delete(handle_delete_group),
@@ -885,7 +881,10 @@ async fn handle_reject_enrollment(
 // the ARP/NDP neighbor-table scanner's `POST /api/discovered`. See `crate::discovered`.
 
 async fn handle_list_discovered(State(_state): State<AppState>) -> Response {
-    json_response(StatusCode::OK, crate::discovered::DiscoveredStore::default().list())
+    json_response(
+        StatusCode::OK,
+        crate::discovered::DiscoveredStore::default().list(),
+    )
 }
 
 async fn handle_dismiss_discovered(
@@ -1105,7 +1104,10 @@ async fn handle_list_groups(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn handle_get_group(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> Response {
+async fn handle_get_group(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
     match state.profile_store.get_group(&name).await {
         Ok(Some(row)) => json_response(StatusCode::OK, group_to_view(&row)),
         Ok(None) => not_found("group not found"),
@@ -1201,7 +1203,11 @@ async fn handle_create_group(
         return validation_error(message);
     }
 
-    if let Err(err) = state.profile_store.put_group(row.clone(), &session.login).await {
+    if let Err(err) = state
+        .profile_store
+        .put_group(row.clone(), &session.login)
+        .await
+    {
         tracing::error!(%err, "failed to persist new group");
         return store_unavailable("creating group");
     }
@@ -1260,7 +1266,11 @@ async fn handle_update_group(
         return validation_error(message);
     }
 
-    if let Err(err) = state.profile_store.put_group(updated.clone(), &session.login).await {
+    if let Err(err) = state
+        .profile_store
+        .put_group(updated.clone(), &session.login)
+        .await
+    {
         tracing::error!(%err, %name, "failed to persist group update");
         return store_unavailable("updating group");
     }
@@ -1281,9 +1291,7 @@ async fn handle_delete_group(
         }
     };
     if group.is_standalone {
-        return validation_error(
-            "the standalone group cannot be deleted (spec D3)".to_string(),
-        );
+        return validation_error("the standalone group cannot be deleted (spec D3)".to_string());
     }
     if let Err(err) = state.profile_store.delete_group(&name).await {
         tracing::error!(%err, %name, "failed to delete group");
@@ -1332,7 +1340,11 @@ async fn handle_create_group_profile(
         return validation_error(message);
     }
 
-    if let Err(err) = state.profile_store.put_profile(row.clone(), &session.login).await {
+    if let Err(err) = state
+        .profile_store
+        .put_profile(row.clone(), &session.login)
+        .await
+    {
         tracing::error!(%err, %name, "failed to persist new profile");
         return store_unavailable("creating profile");
     }
@@ -2498,7 +2510,10 @@ mod tests {
         let profile_store: Arc<dyn ProfileStore> =
             Arc::new(crate::profiles::store::MemProfileStore::new());
         profile_store
-            .put_group(sample_group_row(Uuid::new_v4(), "standalone", true), "test-operator")
+            .put_group(
+                sample_group_row(Uuid::new_v4(), "standalone", true),
+                "test-operator",
+            )
             .await
             .unwrap();
 
@@ -2560,7 +2575,10 @@ mod tests {
         let store = crate::profiles::store::MemProfileStore::new();
         let group_id = Uuid::new_v4();
         store
-            .put_group(sample_group_row(group_id, "len-serv", false), "test-operator")
+            .put_group(
+                sample_group_row(group_id, "len-serv", false),
+                "test-operator",
+            )
             .await
             .unwrap();
         store
@@ -2592,7 +2610,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let events = audit_store.list_events(0).await.unwrap();
-        assert_eq!(events.len(), 1, "rebind must append exactly one audit event");
+        assert_eq!(
+            events.len(),
+            1,
+            "rebind must append exactly one audit event"
+        );
         assert_eq!(
             events[0].actor, "test-operator",
             "the audit actor must be the session's login, never a placeholder"
@@ -2606,7 +2628,10 @@ mod tests {
         let store = crate::profiles::store::MemProfileStore::new();
         let group_id = Uuid::new_v4();
         store
-            .put_group(sample_group_row(group_id, "len-serv", false), "test-operator")
+            .put_group(
+                sample_group_row(group_id, "len-serv", false),
+                "test-operator",
+            )
             .await
             .unwrap();
 
@@ -2743,12 +2768,8 @@ mod tests {
             profile_store,
         );
 
-        let resp = handle_accept_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_accept_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let msg = body_json(resp).await["message"]
             .as_str()
@@ -2776,12 +2797,8 @@ mod tests {
             profile_store,
         );
 
-        let resp = handle_revert_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_revert_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let msg = body_json(resp).await["message"]
             .as_str()
@@ -2804,12 +2821,8 @@ mod tests {
         );
         let id = Uuid::new_v4();
 
-        let resp = handle_accept_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_accept_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -2830,17 +2843,16 @@ mod tests {
             profile_store,
         );
 
-        let resp = handle_accept_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_accept_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["object_id"], id.to_string());
         assert_eq!(body["object_kind"], "host_group");
-        assert!(body["note"].is_null(), "accept must not carry the revert note");
+        assert!(
+            body["note"].is_null(),
+            "accept must not carry the revert note"
+        );
     }
 
     #[tokio::test]
@@ -2866,17 +2878,17 @@ mod tests {
             profile_store,
         );
 
-        let resp = handle_revert_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_revert_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
-        let note = body["note"].as_str().expect("revert response must carry a note");
+        let note = body["note"]
+            .as_str()
+            .expect("revert response must carry a note");
         assert!(
-            note.contains("INTENT") && note.contains("machine") && note.to_lowercase().contains("re-deploy"),
+            note.contains("INTENT")
+                && note.contains("machine")
+                && note.to_lowercase().contains("re-deploy"),
             "the note must state revert restores intent (not the machine) and that \
              re-deploying is a separate action, got: {note}"
         );
@@ -2900,12 +2912,8 @@ mod tests {
             profile_store,
         );
 
-        let resp = handle_accept_drift(
-            State(state),
-            test_session(),
-            AxumPath(id.to_string()),
-        )
-        .await;
+        let resp =
+            handle_accept_drift(State(state), test_session(), AxumPath(id.to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let events = audit_store.list_events(0).await.unwrap();

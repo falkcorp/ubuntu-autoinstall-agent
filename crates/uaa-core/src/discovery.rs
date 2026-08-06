@@ -162,10 +162,7 @@ pub struct DiscoveryHandle {
 impl Drop for DiscoveryHandle {
     fn drop(&mut self) {
         if let Err(err) = self.daemon.unregister(&self.fullname) {
-            tracing::warn!(
-                "failed to unregister mDNS service {}: {err}",
-                self.fullname
-            );
+            tracing::warn!("failed to unregister mDNS service {}: {err}", self.fullname);
         }
     }
 }
@@ -235,7 +232,9 @@ async fn browse_mdns(kind: ServiceKind, timeout: Duration) -> Vec<ServiceInfo> {
     let receiver = match daemon.browse(SERVICE_TYPE) {
         Ok(receiver) => receiver,
         Err(err) => {
-            tracing::warn!("mDNS browse failed to start ({err}); falling back to static endpoints only");
+            tracing::warn!(
+                "mDNS browse failed to start ({err}); falling back to static endpoints only"
+            );
             let _ = daemon.shutdown();
             return Vec::new();
         }
@@ -268,7 +267,10 @@ async fn browse_mdns(kind: ServiceKind, timeout: Duration) -> Vec<ServiceInfo> {
 /// Convert a resolved mDNS `ServiceInfo` into our candidate type, filtering
 /// on the `service` TXT record (foreign `_uaa._tcp` instances) and skipping
 /// (with a warning) candidates whose `version` TXT does not parse as semver.
-fn resolved_to_candidate(kind: ServiceKind, resolved: &mdns_sd::ServiceInfo) -> Option<ServiceInfo> {
+fn resolved_to_candidate(
+    kind: ServiceKind,
+    resolved: &mdns_sd::ServiceInfo,
+) -> Option<ServiceInfo> {
     let service_txt = resolved.get_property_val_str("service")?;
     if service_txt != kind.as_txt() {
         return None;
@@ -463,9 +465,9 @@ mod tests {
         let union = union_candidates(mdns, statics);
 
         assert_eq!(union.len(), 2);
-        assert!(union
-            .iter()
-            .any(|c| c.source == Source::Static && c.host == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))));
+        assert!(union.iter().any(
+            |c| c.source == Source::Static && c.host == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))
+        ));
     }
 
     #[test]
@@ -527,8 +529,8 @@ mod tests {
 
     #[test]
     fn test_resolve_empty_union_is_error() {
-        let err = ensure_nonempty(ServiceKind::Control, Duration::from_secs(2), Vec::new())
-            .unwrap_err();
+        let err =
+            ensure_nonempty(ServiceKind::Control, Duration::from_secs(2), Vec::new()).unwrap_err();
 
         let message = err.to_string();
         assert!(message.contains("Control"));

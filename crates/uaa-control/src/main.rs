@@ -10,7 +10,10 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "uaa-control", about = "uaa constellation control daemon (spec C3)")]
+#[command(
+    name = "uaa-control",
+    about = "uaa constellation control daemon (spec C3)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/components/unlock_policy.rs
-// version: 1.0.0
+// version: 1.1.0
 // guid: c0ff669c-a00b-4be8-b4f2-9caf7b51a86e
-// last-edited: 2026-07-23
+// last-edited: 2026-08-02
 
 //! Authoring-time unlock-policy sub-struct (PS-UNLOCK-02).
 //!
@@ -26,6 +26,7 @@
 //! | `tpm2_pin.pcr_ids`                           | `tpm2_pcr_ids`                                  |
 //! | `tpm2_pin.enroll`                            | `enroll_tpm2`                                   |
 //! | `fido2_expected`                             | `expect_fido2`                                  |
+//! | `sss`                                        | `unlock_sss`                                    |
 //! | `tpm2_clevis_peer`                           | *(none — see below)*                            |
 //!
 //! `tpm2_clevis_peer` is authoring/validate-ONLY: it never lowers to a wire
@@ -35,6 +36,7 @@
 //! profile input.
 
 use crate::network::ssh_installer::config::TangServer;
+use crate::network::ssh_installer::unlock_sss::SssPolicy;
 use serde::{Deserialize, Serialize};
 
 /// Nested Tang/SSS authoring group — see the module-level mapping table.
@@ -71,6 +73,25 @@ pub struct Tpm2PinPartial {
 pub struct UnlockPolicyPartial {
     pub tang: Option<TangSssPartial>,
     pub tpm2_pin: Option<Tpm2PinPartial>,
+    /// EXPLICIT clevis SSS policy tree, lowering to `InstallationConfig::unlock_sss`.
+    ///
+    /// The concrete wire type is embedded directly rather than mirrored into a
+    /// `*Partial` — the `applications: Option<Vec<ApplicationSpec>>` precedent
+    /// on `InstallationConfigPartial`. Leaf-by-leaf merging a recursive tree is
+    /// meaningless (there is no sensible "leaf" of a shape mismatch), so this
+    /// resolves WHOLE-VALUE, host-tier-wins, like any other component leaf.
+    ///
+    /// ## Precedence: the tree WINS over `tang`
+    ///
+    /// When a host authors both `sss` and `tang`, the tree is what lowers to
+    /// `unlock_sss` and therefore what the installer binds; `tang` still lowers
+    /// to `tang_servers`/`tang_threshold` (which other things read — the
+    /// initramfs clevis package gate among them). `lower` is documented pure
+    /// and total, so this is a precedence rule, NOT an error. Cross-checking
+    /// that a co-authored `tang` agrees with the tree belongs to the validate
+    /// layer (PS-VALIDATE-14), as does clevis's `1 <= t <= share_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sss: Option<SssPolicy>,
     /// Authoring/validate-ONLY — never lowers to a wire field. See the
     /// module doc comment.
     pub tpm2_clevis_peer: Option<bool>,
@@ -126,6 +147,13 @@ mod tests {
             }),
             tpm2_clevis_peer: Some(true),
             fido2_expected: Some(false),
+            sss: Some(SssPolicy::tpm2_and_tang(
+                "7",
+                &[TangServer {
+                    url: "http://tang1.example.internal".to_string(),
+                }],
+                1,
+            )),
         };
 
         let json = serde_json::to_string(&partial).unwrap();
@@ -143,7 +171,134 @@ mod tests {
                 tpm2_pin: None,
                 tpm2_clevis_peer: None,
                 fido2_expected: None,
+                sss: None,
             }
+        );
+    }
+
+    /// The three policies the nested representation must express, authored the
+    /// way a profile author actually writes them: YAML.
+    #[test]
+    fn test_yaml_authors_the_three_required_policies() {
+        // 1. LEGACY: flat N-of-M Tang, authored with no `sss` at all. This is
+        //    len-serv-001/002's shape and it must stay expressible untouched.
+        let legacy: UnlockPolicyPartial = serde_yaml::from_str(
+            r#"
+tang:
+  servers:
+    - url: http://tang1.example.internal
+    - url: http://tang2.example.internal
+    - url: http://tang3.example.internal
+  threshold: 2
+"#,
+        )
+        .unwrap();
+        assert!(
+            legacy.sss.is_none(),
+            "a flat-authored host must carry no policy tree"
+        );
+        assert_eq!(legacy.tang.as_ref().unwrap().threshold, Some(2));
+
+        // 2. AND(tpm2, 2-of-3 tang): outer t=2 over exactly TWO shares,
+        //    because the tang group is nested and so collapses to one.
+        let and: UnlockPolicyPartial = serde_yaml::from_str(
+            r#"
+sss:
+  threshold: 2
+  pins:
+    - kind: tpm2
+      pcr_ids: "7"
+      pcr_bank: sha256
+    - kind: sss
+      threshold: 2
+      pins:
+        - kind: tang
+          url: http://tang1.example.internal
+        - kind: tang
+          url: http://tang2.example.internal
+        - kind: tang
+          url: http://tang3.example.internal
+"#,
+        )
+        .unwrap();
+        let tree = and.sss.as_ref().expect("tree must parse");
+        assert_eq!(tree.share_count(), 2, "AND must be 2-of-2, not 2-of-4");
+        assert_eq!(tree.threshold, 2);
+        assert_eq!(tree.tang_urls().len(), 3);
+        assert_eq!(
+            and,
+            UnlockPolicyPartial {
+                sss: Some(SssPolicy::tpm2_and_tang(
+                    "7",
+                    &[
+                        TangServer {
+                            url: "http://tang1.example.internal".to_string()
+                        },
+                        TangServer {
+                            url: "http://tang2.example.internal".to_string()
+                        },
+                        TangServer {
+                            url: "http://tang3.example.internal".to_string()
+                        },
+                    ],
+                    2,
+                )),
+                ..Default::default()
+            },
+            "the authored YAML must equal the constructor's tree"
+        );
+
+        // 3. An OR of several pkcs11 URIs, usable as ONE share inside an AND.
+        let or_group: UnlockPolicyPartial = serde_yaml::from_str(
+            r#"
+sss:
+  threshold: 2
+  pins:
+    - kind: sss
+      threshold: 1
+      pins:
+        - kind: pkcs11
+          uri: "pkcs11:token=yubi-a"
+        - kind: pkcs11
+          uri: "pkcs11:token=yubi-b"
+    - kind: tang
+      url: http://tang1.example.internal
+"#,
+        )
+        .unwrap();
+        let tree = or_group.sss.as_ref().unwrap();
+        assert_eq!(tree.share_count(), 2, "the pkcs11 OR counts as one share");
+        match &tree.pins[0] {
+            crate::network::ssh_installer::unlock_sss::UnlockPin::Sss(inner) => {
+                assert_eq!(inner.threshold, 1, "any-one-of");
+                assert_eq!(inner.share_count(), 2);
+            }
+            other => panic!("expected a nested pkcs11 group, got {}", other.kind()),
+        }
+
+        // and every one of the three survives a YAML round-trip
+        for policy in [legacy, and, or_group] {
+            let yaml = serde_yaml::to_string(&policy).unwrap();
+            let back: UnlockPolicyPartial = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(policy, back, "YAML round-trip must be lossless");
+        }
+    }
+
+    #[test]
+    fn test_absent_sss_key_is_omitted_from_serialization() {
+        // Same cross-version-rollback contract as `applications`: a host that
+        // authors no tree must not gain an `sss:` key.
+        let flat = UnlockPolicyPartial {
+            tang: Some(TangSssPartial {
+                servers: None,
+                threshold: Some(2),
+            }),
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&flat).unwrap();
+        assert!(
+            !yaml.contains("sss"),
+            "a tree-free policy must omit the key entirely, got:\n{yaml}"
         );
     }
 

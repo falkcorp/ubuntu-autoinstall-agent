@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/zfs_native.rs
-// version: 2.2.0
+// version: 2.3.0
 // guid: bca3258c-2a81-4e7d-a50b-50128c83b2cc
-// last-edited: 2026-07-29
+// last-edited: 2026-08-03
 
 //! ZFS **native-encryption** pool + keystore builder for
 //! [`StorageMode::NativeKeystore`] (U1 / the future server profile) — Phase 3's
@@ -33,6 +33,7 @@
 use super::config::InstallationConfig;
 use super::layout;
 use crate::network::CommandExecutor;
+use crate::security::luks::LUKS2_FORMAT_HEADER_FLAGS;
 use crate::Result;
 use std::collections::HashMap;
 use tracing::info;
@@ -170,13 +171,8 @@ impl<'a> ZfsNativeManager<'a> {
         );
         self.runner.execute(&write_key).await?;
 
-        self.log_and_execute(
-            "LUKS2 format keystore",
-            &format!(
-                "cryptsetup luksFormat --type luks2 --batch-mode --key-file {KEYSTORE_SETUP_KEY} {KEYSTORE_ZVOL}"
-            ),
-        )
-        .await?;
+        self.log_and_execute("LUKS2 format keystore", &build_keystore_luks_format_cmd())
+            .await?;
         self.log_and_execute(
             "Open keystore LUKS",
             &format!(
@@ -187,7 +183,9 @@ impl<'a> ZfsNativeManager<'a> {
         // Keyfile no longer needed — shred it (best-effort).
         let _ = self
             .runner
-            .execute(&format!("shred -u {KEYSTORE_SETUP_KEY} 2>/dev/null || rm -f {KEYSTORE_SETUP_KEY}"))
+            .execute(&format!(
+                "shred -u {KEYSTORE_SETUP_KEY} 2>/dev/null || rm -f {KEYSTORE_SETUP_KEY}"
+            ))
             .await;
 
         self.log_and_execute(
@@ -255,8 +253,11 @@ impl<'a> ZfsNativeManager<'a> {
 
         self.log_and_execute("Ensure /var/tmp exists", "mkdir -p /mnt/targetos/var/tmp")
             .await?;
-        self.log_and_execute("Setting /var/tmp permissions", "chmod 1777 /mnt/targetos/var/tmp")
-            .await?;
+        self.log_and_execute(
+            "Setting /var/tmp permissions",
+            "chmod 1777 /mnt/targetos/var/tmp",
+        )
+        .await?;
 
         // USERDATA is a second encryptionroot (directly under the unencrypted
         // rpool root, so it needs its own encryption=on).
@@ -317,6 +318,22 @@ impl<'a> ZfsNativeManager<'a> {
     }
 }
 
+/// The `cryptsetup luksFormat` command for the `rpool/keystore` zvol.
+///
+/// Pure and argument-free (every operand is a module constant) so the emitted
+/// flags are assertable without a command-recording harness.
+///
+/// **This is the volume the clevis policy binds to** on a `NativeKeystore`
+/// host: the LUKS container inside the keystore zvol is what holds the ZFS
+/// `system.key`, so its header is where the ~22 KB nested-`sss` JWE has to fit.
+/// The metadata area can only be sized at format time — see
+/// [`LUKS2_FORMAT_HEADER_FLAGS`].
+fn build_keystore_luks_format_cmd() -> String {
+    format!(
+        "cryptsetup luksFormat {LUKS2_FORMAT_HEADER_FLAGS} --batch-mode --key-file {KEYSTORE_SETUP_KEY} {KEYSTORE_ZVOL}"
+    )
+}
+
 /// Escape a value for embedding inside a single-quoted shell string
 /// (`'…'`) — closes the quote, inserts an escaped quote, reopens. Used for the
 /// LUKS passphrase so an arbitrary secret can't break the command.
@@ -364,7 +381,10 @@ mod tests {
     /// changes behaviour underneath us.
     #[test]
     fn vdev_spec_two_disks_renders_mirror_byte_identical() {
-        let disks = ["/dev/disk/by-id/ata-CRUCIAL_0", "/dev/disk/by-id/ata-CRUCIAL_1"];
+        let disks = [
+            "/dev/disk/by-id/ata-CRUCIAL_0",
+            "/dev/disk/by-id/ata-CRUCIAL_1",
+        ];
         assert_eq!(
             vdev_spec(&disks, 2),
             "mirror /dev/disk/by-id/ata-CRUCIAL_0-part2 /dev/disk/by-id/ata-CRUCIAL_1-part2"
@@ -382,7 +402,10 @@ mod tests {
         let disks = ["/dev/disk/by-id/nvme-WDC_ONLY"];
         let spec = vdev_spec(&disks, 3);
         assert_eq!(spec, "/dev/disk/by-id/nvme-WDC_ONLY-part3");
-        assert!(!spec.contains("mirror"), "single vdev must not say 'mirror': {spec}");
+        assert!(
+            !spec.contains("mirror"),
+            "single vdev must not say 'mirror': {spec}"
+        );
     }
 
     /// No Special disks → empty spec, so the caller omits the `special` vdev
@@ -397,7 +420,36 @@ mod tests {
     #[test]
     fn vdev_spec_three_disks_mirrors_all_members() {
         let disks = ["/dev/a", "/dev/b", "/dev/c"];
-        assert_eq!(vdev_spec(&disks, 1), "mirror /dev/a-part1 /dev/b-part1 /dev/c-part1");
+        assert_eq!(
+            vdev_spec(&disks, 1),
+            "mirror /dev/a-part1 /dev/b-part1 /dev/c-part1"
+        );
+    }
+
+    /// The keystore LUKS header must reserve a 1 MiB metadata area.
+    ///
+    /// The keystore zvol IS the clevis-bound volume on a NativeKeystore host,
+    /// and the metadata area is immutable after `luksFormat` — so a host built
+    /// without this flag cannot be repaired in place. Measured on cryptsetup
+    /// 2.8.4: a 22064-byte token import into a default (16 KiB) header fails
+    /// with `Failed to import token from file.` and succeeds at `1m`, with the
+    /// payload offset unchanged at 16 MiB.
+    #[test]
+    fn keystore_luks_format_reserves_a_1m_metadata_area() {
+        let cmd = build_keystore_luks_format_cmd();
+        assert!(
+            cmd.contains("--luks2-metadata-size 1m"),
+            "keystore luksFormat must reserve 1 MiB of metadata or the \
+             nested-sss binding will not fit: {cmd}"
+        );
+        // Regression guards on the operands the flag insertion sits between.
+        assert!(cmd.contains("--type luks2"), "{cmd}");
+        assert!(cmd.contains(KEYSTORE_ZVOL), "{cmd}");
+        assert!(cmd.contains(KEYSTORE_SETUP_KEY), "{cmd}");
+        assert!(
+            !cmd.contains("--luks2-keyslots-size"),
+            "raising the keyslots area moves the data offset for no benefit: {cmd}"
+        );
     }
 
     #[test]

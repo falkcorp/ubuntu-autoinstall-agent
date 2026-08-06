@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/profile/merge.rs
-// version: 1.3.0
+// version: 1.4.0
 // guid: 57838356-b351-42f5-aa90-c87c98761e81
-// last-edited: 2026-07-24
+// last-edited: 2026-08-02
 
 //! Merge logic for `InstallationConfigPartial` -> `InstallationConfig` (DS-PRF-02).
 //!
@@ -239,7 +239,10 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .seed_ip
             .clone()
             .unwrap_or_else(|| base.seed_ip.clone()),
-        cache: overrides.cache.clone().unwrap_or_else(|| base.cache.clone()),
+        cache: overrides
+            .cache
+            .clone()
+            .unwrap_or_else(|| base.cache.clone()),
         max_sql_memory: overrides
             .max_sql_memory
             .clone()
@@ -248,7 +251,10 @@ pub fn merge_cockroach(base: &CockroachSpec, overrides: &CockroachSpecPartial) -
             .locality
             .clone()
             .unwrap_or_else(|| base.locality.clone()),
-        store: overrides.store.clone().unwrap_or_else(|| base.store.clone()),
+        store: overrides
+            .store
+            .clone()
+            .unwrap_or_else(|| base.store.clone()),
         decommission: overrides
             .decommission
             .clone()
@@ -293,7 +299,10 @@ fn merge_single_luks(
         esp_size: host.esp_size.clone().or_else(|| group.esp_size.clone()),
         reset_size: host.reset_size.clone().or_else(|| group.reset_size.clone()),
         bpool_size: host.bpool_size.clone().or_else(|| group.bpool_size.clone()),
-        disk_device: host.disk_device.clone().or_else(|| group.disk_device.clone()),
+        disk_device: host
+            .disk_device
+            .clone()
+            .or_else(|| group.disk_device.clone()),
         reset_enabled: host.reset_enabled.or(group.reset_enabled),
     }
 }
@@ -329,7 +338,9 @@ fn resolve_disk_layout(
             Some(h.clone())
         }
         (None, Some(g)) => {
-            provenance.0.insert("disk-layout".to_string(), Source::Group);
+            provenance
+                .0
+                .insert("disk-layout".to_string(), Source::Group);
             Some(g.clone())
         }
         (Some(h), Some(g)) => {
@@ -410,6 +421,12 @@ fn resolve_unlock_policy(
     Some(UnlockPolicyPartial {
         tang,
         tpm2_pin,
+        // WHOLE-VALUE, not leaf-by-leaf: an SSS policy is a recursive tree
+        // whose share arithmetic only means anything as one unit. A host that
+        // authors a tree replaces the group's outright — half-inheriting a
+        // threshold from one tier and pins from another would silently
+        // manufacture a policy nobody authored.
+        sss: resolve_component_leaf(&h.sss, &g.sss, "unlock-policy.sss", provenance),
         tpm2_clevis_peer: resolve_component_leaf(
             &h.tpm2_clevis_peer,
             &g.tpm2_clevis_peer,
@@ -537,9 +554,7 @@ fn resolve_firmware_quirks(
     } else {
         Source::Default
     };
-    provenance
-        .0
-        .insert("firmware-quirks".to_string(), source);
+    provenance.0.insert("firmware-quirks".to_string(), source);
 
     Some(by_kind.into_values().collect())
 }
@@ -548,7 +563,10 @@ fn resolve_firmware_quirks(
 /// into a concrete `InstallationConfig`, plus the per-field `Provenance` of
 /// how it got there. See the module doc for precedence, the fail-closed
 /// scope, the double-`Option` trap, and the applications union.
-pub fn merge(group: &HostGroupProfile, host: &HostProfile) -> Result<(InstallationConfig, Provenance)> {
+pub fn merge(
+    group: &HostGroupProfile,
+    host: &HostProfile,
+) -> Result<(InstallationConfig, Provenance)> {
     let mut provenance = Provenance::default();
     let mut missing: Vec<String> = Vec::new();
 
@@ -845,7 +863,8 @@ mod tests {
             max_sql_memory: ".25".to_string(),
             locality: "region=us,cluster-unit=lenovo".to_string(),
             store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
-            decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
+            decommission:
+                crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
         }
     }
 
@@ -982,15 +1001,13 @@ mod tests {
         let mut group_only = base_group();
         group_only.applications = vec![cockroach.clone()];
         let host_none = base_host();
-        let (config, _provenance) =
-            merge(&group_only, &host_none).expect("merge should succeed");
+        let (config, _provenance) = merge(&group_only, &host_none).expect("merge should succeed");
         assert_eq!(config.applications, vec![cockroach.clone()]);
 
         let group_none = base_group();
         let mut host_only = base_host();
         host_only.applications = vec![cockroach.clone()];
-        let (config, _provenance) =
-            merge(&group_none, &host_only).expect("merge should succeed");
+        let (config, _provenance) = merge(&group_none, &host_only).expect("merge should succeed");
         assert_eq!(config.applications, vec![cockroach]);
     }
 
@@ -1128,5 +1145,69 @@ mod tests {
             Some(&Source::Host)
         );
         assert_eq!(provenance.0.get("disk-layout"), Some(&Source::Host));
+    }
+
+    /// The `sss` policy tree resolves WHOLE-VALUE: a host tree replaces the
+    /// group's outright rather than merging leaf-by-leaf, because half of one
+    /// threshold group grafted onto half of another is a policy nobody
+    /// authored — and a wrong share count is a machine that cannot unlock.
+    #[test]
+    fn test_sss_policy_tree_resolves_whole_value_host_wins() {
+        use crate::network::ssh_installer::config::TangServer;
+        use crate::network::ssh_installer::unlock_sss::SssPolicy;
+
+        let group_tree = SssPolicy::flat_tang(
+            &[
+                TangServer {
+                    url: "http://tang1.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang2.example.internal".to_string(),
+                },
+                TangServer {
+                    url: "http://tang3.example.internal".to_string(),
+                },
+            ],
+            2,
+        );
+        let host_tree = SssPolicy::tpm2_and_tang(
+            "7",
+            &[TangServer {
+                url: "http://tang9.example.internal".to_string(),
+            }],
+            1,
+        );
+
+        // Group only -> inherited.
+        let mut group = base_group();
+        group.defaults.unlock_policy = Some(UnlockPolicyPartial {
+            sss: Some(group_tree.clone()),
+            ..Default::default()
+        });
+        let (config, provenance) = merge(&group, &base_host()).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, Some(group_tree));
+        assert_eq!(provenance.0.get("unlock-policy.sss"), Some(&Source::Group));
+
+        // Host tree present -> replaces the group's entirely, including its
+        // threshold and every pin: no leaf-level blending.
+        let mut host = base_host();
+        host.overrides.unlock_policy = Some(UnlockPolicyPartial {
+            sss: Some(host_tree.clone()),
+            ..Default::default()
+        });
+        let (config, provenance) = merge(&group, &host).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, Some(host_tree));
+        assert_eq!(provenance.0.get("unlock-policy.sss"), Some(&Source::Host));
+        assert_eq!(
+            config.unlock_sss.as_ref().unwrap().tang_urls(),
+            vec!["http://tang9.example.internal"],
+            "no pin from the group's tree may survive"
+        );
+
+        // Neither tier authors one -> today's fleet: no tree at all.
+        let (config, provenance) =
+            merge(&base_group(), &base_host()).expect("merge should succeed");
+        assert_eq!(config.unlock_sss, None);
+        assert_eq!(provenance.0.get("unlock-policy.sss"), None);
     }
 }

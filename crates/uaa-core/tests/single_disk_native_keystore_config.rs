@@ -31,7 +31,11 @@ fn vm_native_keystore_config_parses_and_plans_single_disk() {
 
     let plan = plan_layout(&cfg.disks).expect("1 system + 0 special must be a valid roster");
     assert_eq!(plan.system_disks().count(), 1);
-    assert_eq!(plan.special_disks().count(), 0, "no special vdev on one disk");
+    assert_eq!(
+        plan.special_disks().count(),
+        0,
+        "no special vdev on one disk"
+    );
     assert_eq!(
         plan.system_disks().next().unwrap().partitions.len(),
         3,

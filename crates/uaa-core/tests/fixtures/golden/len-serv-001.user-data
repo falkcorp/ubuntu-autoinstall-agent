@@ -204,14 +204,23 @@ ZSHEOF
       fi
       echo "Found LUKS device: $LUKS_DEV"
       SSS='{"t":2,"pins":{"tang":[{"url":"http://172.16.2.45"},{"url":"http://172.16.2.46"},{"url":"http://172.16.2.47"}]}}'
-      if ! clevis luks list -d "$LUKS_DEV" 2>/dev/null | grep -qE 'sss|tang'; then
+      # Idempotency guard. Asks cryptsetup's OWN token listing whether a clevis
+      # token is bound — never `clevis luks list`, whose rendering of a nested
+      # policy drops shares and flattens arrays (measured: an authored
+      # {"t":2,"pins":{"null":[{}],"sss":[{...}]}} reads back as
+      # {"t":2,"pins":{"sss":{...}}}). Nothing here needs the policy CONTENTS,
+      # only its presence, and luksDump answers that authoritatively.
+      if ! cryptsetup luksDump "$LUKS_DEV" 2>/dev/null | grep -qE '^[[:space:]]+[0-9]+: clevis$'; then
         printf '%s' 'TANG_INITIAL_PASSPHRASE_REPLACE_WITH_CLEVIS' \
           | clevis luks bind -y -k - -d "$LUKS_DEV" sss "$SSS"
         echo "Clevis Tang binding complete"
       else
         echo "Clevis binding already present"
       fi
-      clevis luks list -d "$LUKS_DEV"
+      # Log the header itself, not clevis's rendering of it — an operator
+      # reading a misrendered policy out of the install log is exactly the trap
+      # this change exists to close.
+      cryptsetup luksDump "$LUKS_DEV"
 
       # --- Dracut config for network-based Tang unlock ---
       # rd.neednet=1 + ip=dhcp tells dracut to bring the NIC up in the initramfs

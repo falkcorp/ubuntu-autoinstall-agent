@@ -111,7 +111,10 @@ mod tests {
     fn test_addressing_static_missing_gateway_fails() {
         let json = r#"{"type":"static","address":"192.0.2.1/24"}"#;
         let result: Result<Addressing, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "missing gateway field must fail deserialization");
+        assert!(
+            result.is_err(),
+            "missing gateway field must fail deserialization"
+        );
     }
 
     #[test]
@@ -164,9 +167,6 @@ mod tests {
     fn test_network_config_partial_rejects_unknown_fields() {
         let json = r#"{"interface":"eth0","unknown_field":"value"}"#;
         let result: Result<NetworkConfigPartial, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "unknown field must fail deserialization"
-        );
+        assert!(result.is_err(), "unknown field must fail deserialization");
     }
 }

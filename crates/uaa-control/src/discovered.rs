@@ -29,7 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, response::Response, routing::post, Json, Router};
+use axum::{
+    extract::State, http::StatusCode, response::IntoResponse, response::Response, routing::post,
+    Json, Router,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -199,7 +202,10 @@ fn canonical_mac(raw: &str) -> Option<String> {
     if hex.len() != 12 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    let pairs: Vec<String> = (0..12).step_by(2).map(|i| hex[i..i + 2].to_string()).collect();
+    let pairs: Vec<String> = (0..12)
+        .step_by(2)
+        .map(|i| hex[i..i + 2].to_string())
+        .collect();
     Some(pairs.join(":"))
 }
 
@@ -238,7 +244,10 @@ fn build_ingest_router(store: Arc<DiscoveredStore>) -> Router {
         .with_state(store)
 }
 
-async fn handle_ingest(State(store): State<Arc<DiscoveredStore>>, Json(body): Json<IngestBody>) -> Response {
+async fn handle_ingest(
+    State(store): State<Arc<DiscoveredStore>>,
+    Json(body): Json<IngestBody>,
+) -> Response {
     if store.record(&body.mac, body.ip.as_deref(), body.hostname.as_deref()) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -279,7 +288,10 @@ mod tests {
         assert!(store.record("6C:4B:90:BC:39:B3", None, None)); // different case → same MAC
         let rows = store.list();
         assert_eq!(rows.len(), 1, "a returning MAC must not duplicate");
-        assert_eq!(rows[0].first_seen, first_seen, "first_seen must survive re-sighting");
+        assert_eq!(
+            rows[0].first_seen, first_seen,
+            "first_seen must survive re-sighting"
+        );
     }
 
     #[test]
@@ -290,7 +302,11 @@ mod tests {
         assert!(store.list()[0].hostname.is_none());
 
         // A later scan resolves it → named + ip attached.
-        assert!(store.record("6c:4b:90:bc:39:b3", Some("172.16.2.45"), Some("rpi-serv-001")));
+        assert!(store.record(
+            "6c:4b:90:bc:39:b3",
+            Some("172.16.2.45"),
+            Some("rpi-serv-001")
+        ));
         let row = store.list().into_iter().next().unwrap();
         assert_eq!(row.hostname.as_deref(), Some("rpi-serv-001"));
         assert_eq!(row.ip.as_deref(), Some("172.16.2.45"));
@@ -315,7 +331,10 @@ mod tests {
         store.record("aa:bb:cc:dd:ee:ff", None, None);
         let rows = store.list();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].dismissed, "dismiss must survive a later re-sighting");
+        assert!(
+            rows[0].dismissed,
+            "dismiss must survive a later re-sighting"
+        );
     }
 
     #[test]
@@ -335,8 +354,14 @@ mod tests {
 
     #[test]
     fn canonical_mac_normalizes_separators_and_case() {
-        assert_eq!(canonical_mac("6C4B90BC39B3").as_deref(), Some("6c:4b:90:bc:39:b3"));
-        assert_eq!(canonical_mac("6c-4b-90-bc-39-b3").as_deref(), Some("6c:4b:90:bc:39:b3"));
+        assert_eq!(
+            canonical_mac("6C4B90BC39B3").as_deref(),
+            Some("6c:4b:90:bc:39:b3")
+        );
+        assert_eq!(
+            canonical_mac("6c-4b-90-bc-39-b3").as_deref(),
+            Some("6c:4b:90:bc:39:b3")
+        );
         assert_eq!(canonical_mac("zz:zz:zz:zz:zz:zz"), None);
     }
 }

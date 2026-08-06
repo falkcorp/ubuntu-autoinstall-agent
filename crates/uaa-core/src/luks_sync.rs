@@ -111,7 +111,11 @@ pub fn build_payload(mac: &str, records: Vec<LuksCredentialRecord>) -> Result<Lu
 pub async fn post_sync(control_url: &str, payload: &LuksSyncPayload) -> Result<LuksSyncOutcome> {
     let url = format!("{}/luks-credentials", control_url.trim_end_matches('/'));
 
-    let response = reqwest::Client::new().post(&url).json(payload).send().await?;
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(payload)
+        .send()
+        .await?;
     let status = response.status();
     let body: serde_json::Value = response.json().await?;
 
