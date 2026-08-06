@@ -1,0 +1,126 @@
+#!ipxe
+# file: netboot/ipxe/menu.ipxe
+# version: 1.1.0
+# guid: 2d4f8a16-9b73-4c05-8e2a-6f1c93b40d7e
+# last-edited: 2026-08-05
+#
+# SOURCE OF TRUTH for /var/www/html/ipxe/menu.ipxe on U0 (172.16.2.30).
+# This file lived only on the server until 2026-08-05, which made every edit
+# to it unreviewable and un-revertable. Edit it HERE, then deploy.
+
+dhcp
+echo iPXE - ${net0/ip} (${mac})
+
+# Detect architecture
+cpuid --ext 29 && set arch amd64 || set arch arm64
+iseq ${buildarch} arm64 && set arch arm64 ||
+
+# Menu defaults
+set menu-timeout 5000
+isset ${menu-default} || set menu-default boot-local-disk
+
+:start
+menu Ubuntu Autoinstall - ${hostname} (${arch})
+item --gap --
+
+item --key i autoinstall      Install Ubuntu 26.04 (autoinstall)
+item --key d boot-local-disk  Boot local disk
+item --key l live             Ubuntu live / diagnostics
+item --key w winpe            WinPE - DASH provisioning (len-serv-003 only)
+item --gap --
+item shell                    iPXE shell
+item reboot                   Reboot
+item --key x exit             Exit to UEFI
+
+choose --timeout ${menu-timeout} --default ${menu-default} selected || goto cancel
+set menu-timeout 0
+goto ${selected}
+
+:cancel
+echo Cancelled - dropping to shell
+goto shell
+
+:shell
+echo Type 'exit' to return to menu
+shell
+goto start
+
+:reboot
+reboot
+
+:exit
+exit
+
+:boot-local-disk
+exit
+
+# ── Autoinstall (arch-aware) ───────────────────────────────────────────────
+:autoinstall
+iseq ${arch} arm64 && goto autoinstall-arm64 ||
+goto autoinstall-amd64
+
+:autoinstall-amd64
+set base-url http://172.16.2.30/ubuntu
+set iso-url http://172.16.2.30/isos
+isset ${hostname} || set hostname ubuntu-server
+echo Starting AMD64 autoinstall for ${hostname}
+kernel ${base-url}/casper/vmlinuz autoinstall boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=${net0/ip}::${net0/gateway}:${net0/netmask}:${hostname}:enp1s0f0:none:${net0/gateway}:1.1.1.1 netboot=http iso-url=${iso-url}/ubuntu-26.04-live-server-amd64.iso ds=nocloud;s=http://172.16.2.30/cloud-init/${mac:hexraw}/
+initrd ${base-url}/casper/initrd
+boot || goto failed
+
+:autoinstall-arm64
+set base-url http://172.16.2.30/ubuntu-arm64
+set iso-url http://172.16.2.30/isos
+isset ${hostname} || set hostname ubuntu-server
+echo Starting ARM64 autoinstall for ${hostname}
+kernel ${base-url}/casper/vmlinuz autoinstall boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=${net0/ip}::${net0/gateway}:${net0/netmask}:${hostname}:eth0:none:${net0/gateway}:1.1.1.1 netboot=http iso-url=${iso-url}/ubuntu-26.04-live-server-arm64.iso ds=nocloud;s=http://172.16.2.30/cloud-init/${mac:hexraw}/
+initrd ${base-url}/casper/initrd
+boot || goto failed
+
+# ── Aliases kept for per-MAC boot files ───────────────────────────────────
+:custom-autoinstall
+goto autoinstall-amd64
+
+:custom-autoinstall-amd64
+goto autoinstall-amd64
+
+:custom-autoinstall-arm64
+goto autoinstall-arm64
+
+# ── Live / diagnostics (arch-aware) ───────────────────────────────────────
+:live
+iseq ${arch} arm64 && goto live-arm64 ||
+goto live-amd64
+
+:live-amd64
+set base-url http://172.16.2.30/ubuntu
+set iso-url http://172.16.2.30/isos
+echo Starting Ubuntu 26.04 AMD64 live environment
+kernel ${base-url}/casper/vmlinuz boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp netboot=http iso-url=${iso-url}/ubuntu-26.04-live-server-amd64.iso ds=nocloud;s=http://172.16.2.30/cloud-init/live/
+initrd ${base-url}/casper/initrd
+boot || goto failed
+
+:live-arm64
+set base-url http://172.16.2.30/ubuntu-arm64
+set iso-url http://172.16.2.30/isos
+echo Starting Ubuntu 26.04 ARM64 live environment
+kernel ${base-url}/casper/vmlinuz boot=casper root=/dev/ram0 ramdisk_size=1500000 ip=dhcp netboot=http iso-url=${iso-url}/ubuntu-26.04-live-server-arm64.iso ds=nocloud;s=http://172.16.2.30/cloud-init/live/
+initrd ${base-url}/casper/initrd
+boot || goto failed
+
+:failed
+echo Boot failed - dropping to shell
+goto shell
+
+# -- WinPE: Realtek DASH provisioning ---------------------------------------
+# MAC-gated: provision.ps1 refuses to act on any machine whose NIC MAC is not
+# len-serv-003 (6c:4b:90:bc:f7:f4). DASH creds live in NIC firmware and survive
+# an OS wipe. wimboot is UNSIGNED - this entry needs Secure Boot OFF.
+:winpe
+echo Booting WinPE (DASH provisioning) - target gate: len-serv-003
+kernel http://172.16.2.30/ipxe/wimboot
+initrd http://172.16.2.30/isos/winpe/bootmgr    bootmgr
+initrd http://172.16.2.30/isos/winpe/BCD        BCD
+initrd http://172.16.2.30/isos/winpe/boot.sdi   boot.sdi
+initrd http://172.16.2.30/isos/winpe/boot.wim   boot.wim
+boot || goto start

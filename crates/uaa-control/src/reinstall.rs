@@ -342,7 +342,9 @@ pub async fn reinstall_machine(
 
     // Registry write: boot_target = custom-autoinstall (the single
     // authoritative field).
-    deps.registry.set_boot_target(mac, CUSTOM_AUTOINSTALL).await?;
+    deps.registry
+        .set_boot_target(mac, CUSTOM_AUTOINSTALL)
+        .await?;
 
     // Dual projection.
     let web_res = deps.web.flip_boot_target(mac, CUSTOM_AUTOINSTALL).await;
@@ -381,7 +383,9 @@ pub async fn reinstall_machine(
             pxe_res.as_ref().err().map(|e| e.to_string()),
         );
         tracing::error!("{reason}");
-        return Ok(ReinstallOutcome::Refused(RefusalReason::Unreconciled(reason)));
+        return Ok(ReinstallOutcome::Refused(RefusalReason::Unreconciled(
+            reason,
+        )));
     }
 
     // ── Drain cluster membership BEFORE the disk is wiped ───────────────────
@@ -499,9 +503,7 @@ async fn fail_safe_flip_back(
         tracing::error!("fail-safe flip-back: pxe layer failed for {hostname} ({mac}): {e}");
     }
     if let Err(e) = &registry_res {
-        tracing::error!(
-            "fail-safe flip-back: registry restore failed for {hostname} ({mac}): {e}"
-        );
+        tracing::error!("fail-safe flip-back: registry restore failed for {hostname} ({mac}): {e}");
     }
 
     let flip_back_ok = web_res.is_ok() && pxe_res.is_ok() && registry_res.is_ok();
@@ -782,7 +784,11 @@ mod tests {
             }
         }
 
-        fn with_shared_write_log(mac: &str, machine: RegistryMachine, write_calls: CallLog) -> Self {
+        fn with_shared_write_log(
+            mac: &str,
+            machine: RegistryMachine,
+            write_calls: CallLog,
+        ) -> Self {
             let mut m = HashMap::new();
             m.insert(mac.to_string(), machine);
             Self {
@@ -810,7 +816,8 @@ mod tests {
         }
 
         async fn set_boot_target(&self, mac: &str, target: &str) -> anyhow::Result<()> {
-            self.write_calls.push(format!("registry:set_boot_target:{target}"));
+            self.write_calls
+                .push(format!("registry:set_boot_target:{target}"));
             if let Some(m) = self.machines.lock().unwrap().get_mut(mac) {
                 m.boot_target = target.to_string();
             }
@@ -818,7 +825,8 @@ mod tests {
         }
 
         async fn stamp_reinstall(&self, mac: &str, at: SystemTime) -> anyhow::Result<()> {
-            self.write_calls.push("registry:stamp_reinstall".to_string());
+            self.write_calls
+                .push("registry:stamp_reinstall".to_string());
             if let Some(m) = self.machines.lock().unwrap().get_mut(mac) {
                 m.last_reinstall_at = Some(at);
             }
@@ -993,10 +1001,8 @@ mod tests {
         let power = MockPower::new(CallLog::default());
         let watch = MockWatch::always(CallLog::default(), Some(InstallStatus::Success));
         let clock = TickClock::new(SystemTime::now());
-        let drainer = MockDrainer::drains(
-            CallLog::default(),
-            Err(anyhow::anyhow!("node unreachable")),
-        );
+        let drainer =
+            MockDrainer::drains(CallLog::default(), Err(anyhow::anyhow!("node unreachable")));
 
         let deps = ReinstallDeps {
             drainer: &drainer,
@@ -1300,7 +1306,10 @@ mod tests {
         }
 
         // web was flipped forward then back; pxe only attempted (and failed) forward.
-        assert_eq!(web.log.calls(), vec!["web:custom-autoinstall", "web:local-disk"]);
+        assert_eq!(
+            web.log.calls(),
+            vec!["web:custom-autoinstall", "web:local-disk"]
+        );
         assert_eq!(pxe.log.calls(), vec!["pxe:custom-autoinstall"]);
         // Registry: forward write, then restore back to the prior value.
         assert_eq!(

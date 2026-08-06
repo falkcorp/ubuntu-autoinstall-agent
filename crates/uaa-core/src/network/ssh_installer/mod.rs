@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/mod.rs
-// version: 1.8.0
+// version: 1.9.0
 // guid: sshmod01-2345-6789-abcd-ef0123456789
-// last-edited: 2026-07-27
+// last-edited: 2026-08-02
 
 //! SSH-based Ubuntu installation with ZFS and LUKS
 //!
@@ -22,6 +22,7 @@ pub mod partitions;
 pub mod reset_partition;
 pub mod status;
 pub mod system_setup;
+pub mod unlock_sss;
 pub mod zfs_native;
 pub mod zfs_ops;
 

@@ -76,7 +76,11 @@ fn hex6_to_key(hex: &str) -> Option<u32> {
 /// The 24-bit OUI key of any MAC string (accepts `:`/`-`/`.`/no separators), or
 /// `None` if it lacks at least six leading hex digits.
 fn oui_key(mac: &str) -> Option<u32> {
-    let hex: String = mac.chars().filter(|c| c.is_ascii_hexdigit()).take(6).collect();
+    let hex: String = mac
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(6)
+        .collect();
     hex6_to_key(&hex)
 }
 
@@ -148,7 +152,7 @@ const MACHINE_VENDORS: &[&str] = &[
     "hewlett", // Hewlett Packard / Hewlett Packard Enterprise
     "asustek",
     "asrock",
-    "giga-byte", // IEEE spells it "GIGA-BYTE TECHNOLOGY"
+    "giga-byte",  // IEEE spells it "GIGA-BYTE TECHNOLOGY"
     "micro-star", // MSI
     "raspberry pi",
     "intel corp",
@@ -198,7 +202,10 @@ mod tests {
     #[test]
     fn known_oui_resolves_vendor() {
         // ac:1f:6b — U1's own Super Micro board (fleet ground truth).
-        assert_eq!(lookup_vendor("ac:1f:6b:40:fc:e2"), Some("Super Micro Computer, Inc."));
+        assert_eq!(
+            lookup_vendor("ac:1f:6b:40:fc:e2"),
+            Some("Super Micro Computer, Inc.")
+        );
         // Intel, Apple — high-volume prefixes.
         assert_eq!(lookup_vendor("00:1b:21:00:00:01"), Some("Intel Corporate"));
         assert_eq!(lookup_vendor("00:03:93:aa:bb:cc"), Some("Apple, Inc."));
@@ -222,21 +229,39 @@ mod tests {
     #[test]
     fn locally_administered_mac_is_non_machine_regardless_of_vendor() {
         // 0x02 bit set → randomized private MAC (phone/watch) even with no vendor.
-        assert_eq!(classify("02:11:22:33:44:55", None), DeviceCategory::NonMachine);
+        assert_eq!(
+            classify("02:11:22:33:44:55", None),
+            DeviceCategory::NonMachine
+        );
         // 0x06 also has the LAA bit → still NA.
-        assert_eq!(classify("06:aa:bb:cc:dd:ee", None), DeviceCategory::NonMachine);
+        assert_eq!(
+            classify("06:aa:bb:cc:dd:ee", None),
+            DeviceCategory::NonMachine
+        );
         // QEMU/KVM MACs (52:54:00) are locally-administered → NA (documented).
-        assert_eq!(classify("52:54:00:12:34:56", None), DeviceCategory::NonMachine);
+        assert_eq!(
+            classify("52:54:00:12:34:56", None),
+            DeviceCategory::NonMachine
+        );
     }
 
     #[test]
     fn universal_mac_classifies_by_vendor() {
         // ac:1f:6b is universal (0xac & 0x02 == 0) + Super Micro → Machine.
-        assert_eq!(classify("ac:1f:6b:40:fc:e2", Some("Super Micro Computer, Inc.")), DeviceCategory::Machine);
+        assert_eq!(
+            classify("ac:1f:6b:40:fc:e2", Some("Super Micro Computer, Inc.")),
+            DeviceCategory::Machine
+        );
         // Apple with a universal MAC → still NA (deliberate).
-        assert_eq!(classify("00:03:93:aa:bb:cc", Some("Apple, Inc.")), DeviceCategory::NonMachine);
+        assert_eq!(
+            classify("00:03:93:aa:bb:cc", Some("Apple, Inc.")),
+            DeviceCategory::NonMachine
+        );
         // Unknown vendor, universal MAC → Unknown (stays visible).
-        assert_eq!(classify("00:1b:21:00:00:01", Some("Some Unlisted Vendor Ltd")), DeviceCategory::Unknown);
+        assert_eq!(
+            classify("00:1b:21:00:00:01", Some("Some Unlisted Vendor Ltd")),
+            DeviceCategory::Unknown
+        );
     }
 
     #[test]
@@ -248,15 +273,28 @@ mod tests {
 
     #[test]
     fn category_serializes_lowercase_with_na_alias() {
-        assert_eq!(serde_json::to_string(&DeviceCategory::Machine).unwrap(), "\"machine\"");
-        assert_eq!(serde_json::to_string(&DeviceCategory::NonMachine).unwrap(), "\"na\"");
-        assert_eq!(serde_json::to_string(&DeviceCategory::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&DeviceCategory::Machine).unwrap(),
+            "\"machine\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DeviceCategory::NonMachine).unwrap(),
+            "\"na\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DeviceCategory::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn table_parses_the_whole_registry() {
         // Sanity: the embedded CSV parsed into a large table (guards a botched
         // regeneration that strips most rows).
-        assert!(table().len() > 30_000, "OUI table looks truncated: {}", table().len());
+        assert!(
+            table().len() > 30_000,
+            "OUI table looks truncated: {}",
+            table().len()
+        );
     }
 }

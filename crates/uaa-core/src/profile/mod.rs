@@ -28,7 +28,7 @@ use crate::network::ssh_installer::components::disk_layout::{
 };
 use crate::network::ssh_installer::components::firmware_quirks::FirmwareQuirk;
 use crate::network::ssh_installer::components::hooks::Hooks;
-use crate::network::ssh_installer::config::{Arch, ApplicationSpec, HostRole};
+use crate::network::ssh_installer::config::{ApplicationSpec, Arch, HostRole};
 use components::base_image::BaseImagePartial;
 use components::network::NetworkConfigPartial;
 use components::unlock_policy::UnlockPolicyPartial;
@@ -62,10 +62,18 @@ pub struct InstallationConfigPartial {
     pub network_renderer: Option<String>,
     /// Double Option: `None` = inherit, `Some(None)` = explicitly no release
     /// override, `Some(Some(r))` = this release.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
     pub debootstrap_release: Option<Option<String>>,
     /// Double Option — see `debootstrap_release`.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
     pub debootstrap_mirror: Option<Option<String>>,
     pub initramfs_type: Option<crate::network::ssh_installer::config::InitramfsType>,
     pub tang_servers: Option<Vec<crate::network::ssh_installer::config::TangServer>>,
@@ -76,7 +84,11 @@ pub struct InstallationConfigPartial {
     /// explicitly no PIN, `Some(Some(p))` = this PIN. A plain `Option<String>`
     /// here would make a host meant to have NO pin silently inherit the
     /// group's — this is the trap this type exists to prevent.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_double_option"
+    )]
     pub tpm2_pin: Option<Option<String>>,
     pub tpm2_pcr_ids: Option<String>,
     pub expect_fido2: Option<bool>,
@@ -267,41 +279,44 @@ mod tests {
     #[test]
     fn test_partial_all_none_is_legal() {
         let partial = InstallationConfigPartial::default();
-        assert_eq!(partial, InstallationConfigPartial {
-            hostname: None,
-            disk_device: None,
-            timezone: None,
-            luks_key: None,
-            root_password: None,
-            network_interface: None,
-            network_address: None,
-            network_gateway: None,
-            network_search: None,
-            network_nameservers: None,
-            network_renderer: None,
-            debootstrap_release: None,
-            debootstrap_mirror: None,
-            initramfs_type: None,
-            tang_servers: None,
-            tang_threshold: None,
-            ssh_authorized_keys: None,
-            enroll_tpm2: None,
-            tpm2_pin: None,
-            tpm2_pcr_ids: None,
-            expect_fido2: None,
-            install_ca_cert: None,
-            applications: None,
-            storage_mode: None,
-            disks: None,
-            disk_layout: None,
-            unlock_policy: None,
-            network: None,
-            base_image: None,
-            arch: None,
-            role: None,
-            firmware_quirks: None,
-            hooks: None,
-        });
+        assert_eq!(
+            partial,
+            InstallationConfigPartial {
+                hostname: None,
+                disk_device: None,
+                timezone: None,
+                luks_key: None,
+                root_password: None,
+                network_interface: None,
+                network_address: None,
+                network_gateway: None,
+                network_search: None,
+                network_nameservers: None,
+                network_renderer: None,
+                debootstrap_release: None,
+                debootstrap_mirror: None,
+                initramfs_type: None,
+                tang_servers: None,
+                tang_threshold: None,
+                ssh_authorized_keys: None,
+                enroll_tpm2: None,
+                tpm2_pin: None,
+                tpm2_pcr_ids: None,
+                expect_fido2: None,
+                install_ca_cert: None,
+                applications: None,
+                storage_mode: None,
+                disks: None,
+                disk_layout: None,
+                unlock_policy: None,
+                network: None,
+                base_image: None,
+                arch: None,
+                role: None,
+                firmware_quirks: None,
+                hooks: None,
+            }
+        );
     }
 
     #[test]
@@ -347,7 +362,8 @@ mod tests {
                 max_sql_memory: ".25".to_string(),
                 locality: "region=us,cluster-unit=lenovo".to_string(),
                 store: "path=/var/lib/cockroach/cockroach-data,attrs=ssd,size=.5".to_string(),
-                decommission: crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
+                decommission:
+                    crate::network::ssh_installer::config::DecommissionPolicy::cockroach_default(),
             })]),
             ..Default::default()
         };

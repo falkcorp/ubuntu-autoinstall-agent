@@ -499,12 +499,13 @@ mod tests {
             let matches: Vec<&String> = mock
                 .commands
                 .iter()
-                .filter(|c| {
-                    c.starts_with("ln -sf /dev/null")
-                        && c.rsplit('/').next() == Some(unit)
-                })
+                .filter(|c| c.starts_with("ln -sf /dev/null") && c.rsplit('/').next() == Some(unit))
                 .collect();
-            assert_eq!(matches.len(), 1, "expected exactly one mask command for {unit}");
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected exactly one mask command for {unit}"
+            );
         }
     }
 
@@ -558,7 +559,10 @@ mod tests {
             assert!(src.contains(unit), "mask unit {unit} missing from source");
         }
         for tool in REQUIRED_LIVE_TOOLS {
-            assert!(src.contains(tool), "required tool {tool} missing from source");
+            assert!(
+                src.contains(tool),
+                "required tool {tool} missing from source"
+            );
         }
     }
 

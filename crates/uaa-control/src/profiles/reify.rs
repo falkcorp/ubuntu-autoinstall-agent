@@ -56,9 +56,7 @@ use crate::profiles::store::ProfileStore;
 /// missing file; a corrupt snapshot (`SnapshotCorrupt`) or a permission error
 /// still propagates (and `put_group`'s own strict read would refuse a corrupt
 /// file anyway), so the fail-closed guarantee is preserved.
-fn tolerate_fresh_snapshot(
-    res: Result<Option<HostGroupRow>>,
-) -> Result<Option<HostGroupRow>> {
+fn tolerate_fresh_snapshot(res: Result<Option<HostGroupRow>>) -> Result<Option<HostGroupRow>> {
     match res {
         Ok(v) => Ok(v),
         Err(e) => match e.downcast_ref::<StoreError>() {
@@ -173,7 +171,10 @@ pub async fn register_from_config(
         None => {
             let id = Uuid::new_v4();
             store
-                .put_group(group_row(id, group_name, hostname_pattern, is_standalone), actor)
+                .put_group(
+                    group_row(id, group_name, hostname_pattern, is_standalone),
+                    actor,
+                )
                 .await?;
             id
         }
@@ -295,7 +296,12 @@ mod tests {
         .await
         .unwrap();
 
-        for host in ["len-serv-001", "len-serv-002", "len-serv-003", "unimatrixone"] {
+        for host in [
+            "len-serv-001",
+            "len-serv-002",
+            "len-serv-003",
+            "unimatrixone",
+        ] {
             let resolved = resolve_from_registry(&store, host)
                 .await
                 .unwrap_or_else(|e| panic!("resolving {host}: {e}"));
@@ -348,7 +354,11 @@ mod tests {
         );
 
         let profiles = store.list_profiles(group.id).await.unwrap();
-        assert_eq!(profiles.len(), 1, "unimatrixone is standalone: exactly one profile");
+        assert_eq!(
+            profiles.len(),
+            1,
+            "unimatrixone is standalone: exactly one profile"
+        );
         assert_eq!(
             profiles[0].schema_version, SCHEMA_VERSION_MAX,
             "reified unimatrixone profile row must carry schema_version=1"

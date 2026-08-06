@@ -30,8 +30,7 @@ use crate::profiles::store::ensure_schema_servable;
 /// refused with the fixed `schema version {n} exceeds binary max {MAX}` message
 /// (group-scoped) rather than mis-parsed against a shape this binary predates.
 pub(crate) fn group_row_to_profile(row: &HostGroupRow) -> Result<HostGroupProfile, String> {
-    ensure_schema_servable(row.schema_version)
-        .map_err(|e| format!("group {:?}: {e}", row.name))?;
+    ensure_schema_servable(row.schema_version).map_err(|e| format!("group {:?}: {e}", row.name))?;
     let defaults: InstallationConfigPartial = serde_json::from_value(row.defaults.clone())
         .map_err(|e| format!("group {:?}: stored defaults failed to parse: {e}", row.name))?;
     let applications: Vec<ApplicationSpec> = serde_json::from_value(row.applications.clone())
@@ -133,7 +132,10 @@ mod tests {
             0,
         );
         let profile = group_row_to_profile(&row).expect("component keys must deserialize");
-        assert_eq!(profile.defaults.arch, Some(uaa_core::network::ssh_installer::config::Arch::Arm64));
+        assert_eq!(
+            profile.defaults.arch,
+            Some(uaa_core::network::ssh_installer::config::Arch::Arm64)
+        );
         assert!(profile.defaults.base_image.is_some());
         assert_eq!(profile.defaults.firmware_quirks, Some(vec![]));
     }
@@ -147,7 +149,10 @@ mod tests {
         let row = group_row(serde_json::json!({ "not_a_real_field": true }), 0);
         let err = group_row_to_profile(&row).unwrap_err();
         assert!(err.contains("prod"), "error must name the group: {err}");
-        assert!(err.contains("unknown field"), "expected a deny_unknown_fields error: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "expected a deny_unknown_fields error: {err}"
+        );
     }
 
     #[test]
@@ -158,7 +163,10 @@ mod tests {
             err.contains("aa:bb:cc:dd:ee:ff"),
             "error must name the host identity: {err}"
         );
-        assert!(err.contains("unknown field"), "expected a deny_unknown_fields error: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "expected a deny_unknown_fields error: {err}"
+        );
     }
 
     #[test]
@@ -179,7 +187,10 @@ mod tests {
 
         let prow = profile_row(serde_json::json!({ "not_a_real_field": true }), 2);
         let perr = profile_row_to_profile(&prow, "prod").unwrap_err();
-        assert!(perr.contains("schema version 2 exceeds binary max 1"), "{perr}");
+        assert!(
+            perr.contains("schema version 2 exceeds binary max 1"),
+            "{perr}"
+        );
         assert!(!perr.contains("failed to parse"), "{perr}");
     }
 }

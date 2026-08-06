@@ -127,7 +127,9 @@ mod tests {
     #[test]
     fn test_rfc3339_timestamp_is_never_reported() {
         let now = 1_700_000_000_i64;
-        let ts = chrono::DateTime::from_timestamp(now - 60, 0).unwrap().to_rfc3339();
+        let ts = chrono::DateTime::from_timestamp(now - 60, 0)
+            .unwrap()
+            .to_rfc3339();
         assert_eq!(freshness(Some(&ts), now, MAC), Freshness::NeverReported);
     }
 

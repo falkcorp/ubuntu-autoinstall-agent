@@ -316,8 +316,7 @@ mod tests {
     fn test_build_ipmi_command_shape() {
         let cmd = build_ipmi_command("172.16.3.150", "ADMIN", "test-secret", PowerAction::On)
             .expect("valid password should build");
-        assert!(cmd
-            .contains("ipmitool -E -I lanplus -H 172.16.3.150 -U ADMIN chassis power on"));
+        assert!(cmd.contains("ipmitool -E -I lanplus -H 172.16.3.150 -U ADMIN chassis power on"));
         assert!(cmd.starts_with("IPMI_PASSWORD="));
         assert!(!cmd.contains("-P "));
     }
@@ -350,7 +349,13 @@ mod tests {
     #[tokio::test]
     async fn test_run_power_action_unknown_host() {
         let mut mock = MockExecutor::new(&[]);
-        let result = run_power_action(&mut mock, "nonexistent", PowerAction::Status, Some("test-secret")).await;
+        let result = run_power_action(
+            &mut mock,
+            "nonexistent",
+            PowerAction::Status,
+            Some("test-secret"),
+        )
+        .await;
         let err = result.expect_err("unknown host must fail");
         assert!(matches!(err, AutoInstallError::ConfigError(_)));
         assert!(err.to_string().contains("unimatrixone"));

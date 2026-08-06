@@ -28,12 +28,20 @@ pub struct BaseImagePartial {
     /// Ubuntu release codename (e.g., "jammy", "focal").
     /// Double Option: `None` = inherit, `Some(None)` = explicitly no release
     /// override, `Some(Some(r))` = this release.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::super::deserialize_double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::super::deserialize_double_option"
+    )]
     pub release: Option<Option<String>>,
 
     /// Debian mirror URL.
     /// Double Option — see `release`.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "super::super::deserialize_double_option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::super::deserialize_double_option"
+    )]
     pub mirror: Option<Option<String>>,
 
     /// Initramfs type (dracut or initramfs-tools).
@@ -76,7 +84,11 @@ mod tests {
         let null_json = r#"{"release":null}"#;
         let null: BaseImagePartial =
             serde_json::from_str(null_json).expect("deserialize null failed");
-        assert_eq!(null.release, Some(None), "explicit null should be Some(None)");
+        assert_eq!(
+            null.release,
+            Some(None),
+            "explicit null should be Some(None)"
+        );
 
         // Case 3: explicit value (Some(Some(value)))
         let value_json = r#"{"release":"jammy"}"#;
@@ -114,10 +126,7 @@ mod tests {
     fn test_initramfs_type_regenerate_cmd() {
         // Verify InitramfsType is reused correctly and has regenerate_cmd()
         let dracut = InitramfsType::Dracut;
-        assert_eq!(
-            dracut.regenerate_cmd(),
-            "dracut --regenerate-all --force"
-        );
+        assert_eq!(dracut.regenerate_cmd(), "dracut --regenerate-all --force");
 
         let initramfs_tools = InitramfsType::InitramfsTools;
         assert_eq!(

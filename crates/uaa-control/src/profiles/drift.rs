@@ -354,9 +354,12 @@ impl DriftScanner {
         let mut reports = Vec::new();
         let groups = store.list_groups().await?;
         for group in &groups {
-            if let Some(report) =
-                self.check(OBJECT_KIND_HOST_GROUP, group.id, &group.content_hash, &group_body(group))?
-            {
+            if let Some(report) = self.check(
+                OBJECT_KIND_HOST_GROUP,
+                group.id,
+                &group.content_hash,
+                &group_body(group),
+            )? {
                 reports.push(report);
             }
         }
@@ -553,8 +556,14 @@ pub async fn accept_drift(
     }
 
     // Evidence FIRST: preserve the drifted body as its own version row.
-    let evidence =
-        capture_version(store, target.object_kind(), object_id, &drifted_body, DRIFT_SOURCE).await?;
+    let evidence = capture_version(
+        store,
+        target.object_kind(),
+        object_id,
+        &drifted_body,
+        DRIFT_SOURCE,
+    )
+    .await?;
 
     // Adopt the drifted body as intended, with a fresh, correct hash.
     let adopted = next_version_row(
@@ -564,8 +573,15 @@ pub async fn accept_drift(
         evidence.version + 1,
         actor,
     )?;
-    append_review_version(store, audit, &target, adopted.clone(), actor, "registry.drift.accept")
-        .await?;
+    append_review_version(
+        store,
+        audit,
+        &target,
+        adopted.clone(),
+        actor,
+        "registry.drift.accept",
+    )
+    .await?;
     Ok(adopted)
 }
 
@@ -612,8 +628,14 @@ pub async fn revert_drift(
         .clone();
 
     // Evidence FIRST: preserve the drifted body as its own version row.
-    let evidence =
-        capture_version(store, target.object_kind(), object_id, &drifted_body, DRIFT_SOURCE).await?;
+    let evidence = capture_version(
+        store,
+        target.object_kind(),
+        object_id,
+        &drifted_body,
+        DRIFT_SOURCE,
+    )
+    .await?;
 
     // Restore the last-good body, with a fresh, correct hash.
     let restored = next_version_row(
@@ -623,8 +645,15 @@ pub async fn revert_drift(
         evidence.version + 1,
         actor,
     )?;
-    append_review_version(store, audit, &target, restored.clone(), actor, "registry.drift.revert")
-        .await?;
+    append_review_version(
+        store,
+        audit,
+        &target,
+        restored.clone(),
+        actor,
+        "registry.drift.revert",
+    )
+    .await?;
     Ok(restored)
 }
 
@@ -646,14 +675,12 @@ mod tests {
         // level into its own BTreeMap, independent of serde_json's
         // preserve_order feature (which happens to be off today but is a
         // global feature-unification hazard — see the module doc).
-        let a: serde_json::Value = serde_json::from_str(
-            r#"{"name":"len-serv","nested":{"z":1,"a":2},"active":true}"#,
-        )
-        .unwrap();
-        let b: serde_json::Value = serde_json::from_str(
-            r#"{"active":true,"nested":{"a":2,"z":1},"name":"len-serv"}"#,
-        )
-        .unwrap();
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"name":"len-serv","nested":{"z":1,"a":2},"active":true}"#)
+                .unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(r#"{"active":true,"nested":{"a":2,"z":1},"name":"len-serv"}"#)
+                .unwrap();
 
         let hash_a = content_hash(&a).unwrap();
         let hash_b = content_hash(&b).unwrap();
@@ -749,7 +776,11 @@ mod tests {
             .map(|v| v.version)
             .collect();
         versions.sort_unstable();
-        assert_eq!(versions, vec![1, 2, 3], "versions must be 1, 2, 3 with no gaps");
+        assert_eq!(
+            versions,
+            vec![1, 2, 3],
+            "versions must be 1, 2, 3 with no gaps"
+        );
     }
 
     #[tokio::test]
@@ -801,7 +832,12 @@ mod tests {
         }
     }
 
-    fn profile_row(id: Uuid, group_id: Uuid, apps: serde_json::Value, stored_hash: Vec<u8>) -> HostProfileRow {
+    fn profile_row(
+        id: Uuid,
+        group_id: Uuid,
+        apps: serde_json::Value,
+        stored_hash: Vec<u8>,
+    ) -> HostProfileRow {
         HostProfileRow {
             id,
             group_id,
@@ -837,7 +873,11 @@ mod tests {
     async fn test_drift_detected_on_out_of_band_edit() {
         let store = MemProfileStore::new();
         let id = Uuid::new_v4();
-        let drifted = group_row(id, serde_json::json!(["tampered"]), hash_of(&group_body_for(serde_json::json!(["original"]))));
+        let drifted = group_row(
+            id,
+            serde_json::json!(["tampered"]),
+            hash_of(&group_body_for(serde_json::json!(["original"]))),
+        );
         let body = group_body(&drifted);
 
         assert!(
@@ -861,15 +901,30 @@ mod tests {
         let group_id = Uuid::new_v4();
         let profile_id = Uuid::new_v4();
         // A clean group so the scan iterates into its profiles.
-        store.put_group(group_row(group_id, serde_json::json!([]), vec![]), "op").await.unwrap();
+        store
+            .put_group(group_row(group_id, serde_json::json!([]), vec![]), "op")
+            .await
+            .unwrap();
 
-        let clean_profile_body = profile_body(&profile_row(profile_id, group_id, serde_json::json!(["orig"]), vec![]));
+        let clean_profile_body = profile_body(&profile_row(
+            profile_id,
+            group_id,
+            serde_json::json!(["orig"]),
+            vec![],
+        ));
         let stale = hash_of(&clean_profile_body);
-        store.inject_profile_raw(profile_row(profile_id, group_id, serde_json::json!(["tampered"]), stale));
+        store.inject_profile_raw(profile_row(
+            profile_id,
+            group_id,
+            serde_json::json!(["tampered"]),
+            stale,
+        ));
 
         let reports = scan_drift(&store).await.unwrap();
         assert!(
-            reports.iter().any(|r| r.object_id == profile_id && r.object_kind == OBJECT_KIND_HOST_PROFILE),
+            reports
+                .iter()
+                .any(|r| r.object_id == profile_id && r.object_kind == OBJECT_KIND_HOST_PROFILE),
             "a drifted profile nobody read individually must still be reported"
         );
     }
@@ -884,15 +939,29 @@ mod tests {
 
         let v1_body = group_body_for(serde_json::json!(["v1"]));
         let v2_body = group_body_for(serde_json::json!(["v2"]));
-        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &v1_body, "op").await.unwrap();
-        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &v2_body, "op").await.unwrap();
+        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &v1_body, "op")
+            .await
+            .unwrap();
+        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &v2_body, "op")
+            .await
+            .unwrap();
 
         // Live row: v2's good hash, but a tampered body.
-        store.inject_group_raw(group_row(id, serde_json::json!(["TAMPERED"]), hash_of(&v2_body)));
+        store.inject_group_raw(group_row(
+            id,
+            serde_json::json!(["TAMPERED"]),
+            hash_of(&v2_body),
+        ));
 
         let restored = revert_drift(&store, &audit, id, "operator").await.unwrap();
-        assert_eq!(restored.body, v2_body, "revert must restore the LAST-good body (v2)");
-        assert_ne!(restored.body, v1_body, "a blind N-1 would have restored v1 — that is the bug");
+        assert_eq!(
+            restored.body, v2_body,
+            "revert must restore the LAST-good body (v2)"
+        );
+        assert_ne!(
+            restored.body, v1_body,
+            "a blind N-1 would have restored v1 — that is the bug"
+        );
         assert!(
             !is_drifted(&restored.content_hash, &restored.body).unwrap(),
             "the restored version must carry a fresh, correct hash"
@@ -906,8 +975,14 @@ mod tests {
         let id = Uuid::new_v4();
 
         let good_body = group_body_for(serde_json::json!(["good"]));
-        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &good_body, "op").await.unwrap();
-        store.inject_group_raw(group_row(id, serde_json::json!(["TAMPERED"]), hash_of(&good_body)));
+        capture_version(&store, OBJECT_KIND_HOST_GROUP, id, &good_body, "op")
+            .await
+            .unwrap();
+        store.inject_group_raw(group_row(
+            id,
+            serde_json::json!(["TAMPERED"]),
+            hash_of(&good_body),
+        ));
         let tampered_body = group_body_for(serde_json::json!(["TAMPERED"]));
 
         revert_drift(&store, &audit, id, "operator").await.unwrap();
@@ -917,7 +992,10 @@ mod tests {
             .iter()
             .find(|v| v.actor == DRIFT_SOURCE)
             .expect("a drift-source evidence version must exist after revert");
-        assert_eq!(evidence.body, tampered_body, "the evidence row must hold the tampered body");
+        assert_eq!(
+            evidence.body, tampered_body,
+            "the evidence row must hold the tampered body"
+        );
     }
 
     #[tokio::test]
@@ -930,7 +1008,10 @@ mod tests {
 
         let adopted = accept_drift(&store, &audit, id, "operator").await.unwrap();
 
-        assert_eq!(adopted.body, drifted_body, "accept adopts the drifted body as intended");
+        assert_eq!(
+            adopted.body, drifted_body,
+            "accept adopts the drifted body as intended"
+        );
         assert_eq!(
             adopted.content_hash,
             hash_of(&drifted_body),
@@ -940,7 +1021,9 @@ mod tests {
 
         let versions = store.list_versions(id).await.unwrap();
         assert!(
-            versions.iter().any(|v| v.actor == DRIFT_SOURCE && v.body == drifted_body),
+            versions
+                .iter()
+                .any(|v| v.actor == DRIFT_SOURCE && v.body == drifted_body),
             "the drifted body must survive as a drift-source evidence version"
         );
     }
@@ -987,7 +1070,8 @@ mod tests {
 
         let err = revert_drift(&store, &audit, id, "op").await.unwrap_err();
         assert!(
-            err.to_string().contains("schema version 2 exceeds binary max 1"),
+            err.to_string()
+                .contains("schema version 2 exceeds binary max 1"),
             "expected the version-gate message, got: {err}"
         );
     }
@@ -998,7 +1082,10 @@ mod tests {
         let audit = MemAuditStore::new();
         let id = Uuid::new_v4();
         // put_group recomputes the hash, so this live row is NOT drifted.
-        store.put_group(group_row(id, serde_json::json!(["clean"]), vec![]), "op").await.unwrap();
+        store
+            .put_group(group_row(id, serde_json::json!(["clean"]), vec![]), "op")
+            .await
+            .unwrap();
 
         assert!(
             accept_drift(&store, &audit, id, "operator").await.is_err(),
@@ -1021,8 +1108,15 @@ mod tests {
         let _ = scanner.scan(&store).await.unwrap();
         let third = scanner.scan(&store).await.unwrap();
 
-        assert_eq!(third.len(), 1, "the same drift is one report per scan, not a growing list");
-        assert_eq!(third[0].seen_count, 3, "a repeat is reported once with a rising count");
+        assert_eq!(
+            third.len(),
+            1,
+            "the same drift is one report per scan, not a growing list"
+        );
+        assert_eq!(
+            third[0].seen_count, 3,
+            "a repeat is reported once with a rising count"
+        );
     }
 
     #[tokio::test]
@@ -1033,22 +1127,42 @@ mod tests {
         let accept_store = MemProfileStore::new();
         let accept_id = Uuid::new_v4();
         inject_drifted_group(&accept_store, accept_id, serde_json::json!(["drifted"]));
-        accept_drift(&accept_store, &audit, accept_id, "op-accept").await.unwrap();
+        accept_drift(&accept_store, &audit, accept_id, "op-accept")
+            .await
+            .unwrap();
 
         let revert_store = MemProfileStore::new();
         let revert_id = Uuid::new_v4();
         let good_body = group_body_for(serde_json::json!(["good"]));
-        capture_version(&revert_store, OBJECT_KIND_HOST_GROUP, revert_id, &good_body, "op").await.unwrap();
-        revert_store.inject_group_raw(group_row(revert_id, serde_json::json!(["TAMPERED"]), hash_of(&good_body)));
-        revert_drift(&revert_store, &audit, revert_id, "op-revert").await.unwrap();
+        capture_version(
+            &revert_store,
+            OBJECT_KIND_HOST_GROUP,
+            revert_id,
+            &good_body,
+            "op",
+        )
+        .await
+        .unwrap();
+        revert_store.inject_group_raw(group_row(
+            revert_id,
+            serde_json::json!(["TAMPERED"]),
+            hash_of(&good_body),
+        ));
+        revert_drift(&revert_store, &audit, revert_id, "op-revert")
+            .await
+            .unwrap();
 
         let events = audit.list_events(0).await.unwrap();
         assert!(
-            events.iter().any(|e| e.actor == "op-accept" && e.action == "registry.drift.accept"),
+            events
+                .iter()
+                .any(|e| e.actor == "op-accept" && e.action == "registry.drift.accept"),
             "accept must append an audit event with the caller's actor"
         );
         assert!(
-            events.iter().any(|e| e.actor == "op-revert" && e.action == "registry.drift.revert"),
+            events
+                .iter()
+                .any(|e| e.actor == "op-revert" && e.action == "registry.drift.revert"),
             "revert must append an audit event with the caller's actor"
         );
     }
@@ -1064,12 +1178,18 @@ mod tests {
             row.name = format!("group-{i}");
             store.put_group(row, "op").await.unwrap();
             store
-                .put_profile(profile_row(Uuid::new_v4(), gid, serde_json::json!([{"p": i}]), vec![]), "op")
+                .put_profile(
+                    profile_row(Uuid::new_v4(), gid, serde_json::json!([{"p": i}]), vec![]),
+                    "op",
+                )
                 .await
                 .unwrap();
         }
 
         let reports = scan_drift(&store).await.unwrap();
-        assert!(reports.is_empty(), "a scan over untouched objects must return empty, not flag everything");
+        assert!(
+            reports.is_empty(),
+            "a scan over untouched objects must return empty, not flag everything"
+        );
     }
 }

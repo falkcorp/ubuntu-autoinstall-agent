@@ -1,0 +1,164 @@
+#!/bin/bash
+# file: clevis/clevis-luks-pkcs11-askpin
+# version: 1.0.0
+# guid: 8f2c60d4-51ab-4e77-b3a9-1c4d92e6f085
+# last-edited: 2026-08-03
+#
+# UAA FORK of clevis 23-1 /usr/libexec/clevis-luks-pkcs11-askpin.
+# Upstream sha256: 32396fe840bf4daf1e93176e3bfd6e5d823161358759770d7116552cb6bf2f73
+# Sole change: the 5-line single-PIN prompt below is deleted. See
+# docs/research/2026-08-03-clevis-pkcs11-multitoken-pin-fork.md.
+#
+#
+# Copyright (c) 2024 Red Hat, Inc.
+# Author: Sergio Arroutbi <sarroutb@redhat.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+. clevis-luks-common-functions
+. clevis-pkcs11-common
+
+pkcs11_device=""
+dracut_mode=false
+retry_mode=false
+too_many_errors=3
+
+while getopts ":dr" o; do
+    case "${o}" in
+        d) dracut_mode=true;;
+        r) retry_mode=true;;
+        *) ;;
+    esac
+done
+
+
+get_pkcs11_error() {
+    if journalctl -u clevis-luks-pkcs11-askpass.service -b 0 | tail -3 \
+      | egrep -E "A TPM2 device.{1,}needed" >/dev/null 2>&1;
+    then
+        echo "ERROR:TPM2 device not found. "
+    elif journalctl -u clevis-luks-pkcs11-askpass.service -b 0 | tail -3 \
+      | egrep -E "Error.{1,}server" >/dev/null 2>&1;
+    then
+        echo "ERROR:Tang communication error. "
+    elif journalctl -u clevis-luks-pkcs11-askpass.service -b 0 | tail -3 \
+      | grep "Invalid PIN" >/dev/null 2>&1;
+    then
+        echo "ERROR:Invalid PIN. "
+    else
+        echo "ERROR:Unknown error. "
+    fi
+    return 0
+}
+
+clevis_start_pcscd_server
+
+if [ "${dracut_mode}" != true ]; then
+    pkcs11-tool -L
+fi
+
+devices_array=()
+# Let's analyze all entries from /etc/crypttab that contain clevis-pkcs11.sock entries
+while read -r line;
+do
+    if echo "${line}" | grep -E "clevis-pkcs11.sock" 1>/dev/null;
+    then
+        next_device=0
+        errors=0
+        msg=""
+        # Store passphrases to send to control socket
+        systemd_device=$(echo "${line}" | awk '{print $1}')
+        while [ ${next_device} -ne 1 ]; do
+            uuid=$(echo "${line}" | awk '{print $2}')
+            if ! mapped_device=$(clevis_map_device "${uuid}"); then
+                echo "Could not check mapped device for UID:${uuid}"
+                next_device=1
+                continue
+            fi
+            if [ "${dracut_mode}" != true ]; then
+                if grep "${mapped_device}" /run/systemd/clevis-pkcs11-dracut.devices; then
+                    next_device=1
+                    continue
+                fi
+            fi
+            # If no PKCS#11 configuration, advance to next device
+            if ! clevis luks list -d "${mapped_device}" | grep pkcs11 >/dev/null 2>&1; then
+                echo "Device:${mapped_device} does not contain PKCS#11 configuration" >&2
+                # Send a wrong passphrase
+                echo -n "${systemd_device},NOPASSWORDFOR${systemd_device}" | socat UNIX-CONNECT:/run/systemd/clevis-pkcs11.control.sock -
+                next_device=1
+                continue
+            fi
+            if ! pkcs11_device=$(clevis_detect_pkcs11_device "${dracut_mode}" "${retry_mode}"); then
+                echo "No PKCS11 device detected" >&2
+                exit 0
+            else
+                echo "Detected PKCS11 device:${pkcs11_device}" >&2
+            fi
+            # Get configuration PKCS#11 URI
+            uri=$(clevis luks list -d "${mapped_device}" | awk -F '"uri":' '{print $2}' | awk -F '"' '{print $2}' | awk -F '"' '{print $1}')
+            slot_opt=""
+            if ! slot=$(clevis_get_pkcs11_final_slot_from_uri "${uri}"); then
+                echo "Could not find slot for uri:${uri}" >&2
+            else
+                slot_opt="--slot-index ${slot}"
+            fi
+            module_opt=""
+            module=$(clevis_get_module_path_from_uri "${uri}")
+            if [ -n "${module}" ]; then
+                module_opt="--module ${module}"
+            fi
+            echo "Device:${mapped_device}, slot_opt:${slot_opt}, module_opt:${module_opt}"
+            if ! pkcs11-tool -O ${module_opt} ${slot_opt} 2>/dev/null 1>/dev/null; then
+                echo "No objects on slot:${slot}, module_opt:${module_opt}" >&2
+                echo -n "${systemd_device},NOPASSWORDFOR${systemd_device}" | socat UNIX-CONNECT:/run/systemd/clevis-pkcs11.control.sock -
+                next_device=1
+                continue
+            fi
+            if ! model=$(clevis_get_model_from_uri "${uri}"); then
+                if ! model="device with serial number:$(clevis_get_serial_from_uri ${uri})"; then
+                    model=${pkcs11_device}
+                fi
+            fi
+            # UAA FORK: upstream prompted here for ONE PIN and wrote it to the
+            # shared /run/systemd/clevis-pkcs11.pin, which serves exactly one
+            # pkcs11 share per unlock. The forked clevis-decrypt-pkcs11 prompts
+            # per token instead, so this prompt is removed: leaving it would ask
+            # the operator for a PIN that is then silently discarded.
+            if ! passphrase=$(clevis_luks_unlock_device "${mapped_device}") || [ -z "${passphrase}" ]; then
+                echo "Could not unlock device:${mapped_device}" >&2
+                msg="$(get_pkcs11_error)"
+                ((errors++))
+                if [ ${errors} -eq ${too_many_errors} ]; then
+                    echo "Too many errors !!!" >&2
+                    next_device=1
+                fi
+                continue
+            fi
+            next_device=1
+            echo "Device:${mapped_device} unlocked successfully by clevis" >&2
+            if [ "${dracut_mode}" == true ]; then
+                echo "${mapped_device}" >> /run/systemd/clevis-pkcs11-dracut.devices
+            fi
+            # Store passphrases to send to control socket
+            devices_array+=("${systemd_device},${passphrase}")
+        done
+    fi
+done < <(grep -v "^#" /etc/crypttab)
+
+# Send passphrases to control socket
+for ((ix=${#devices_array[*]}-1; ix>=0; ix--))
+do
+    echo -n "${devices_array[$ix]}" | socat UNIX-CONNECT:/run/systemd/clevis-pkcs11.control.sock -
+done

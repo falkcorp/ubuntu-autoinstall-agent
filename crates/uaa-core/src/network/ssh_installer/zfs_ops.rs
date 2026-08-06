@@ -18,7 +18,10 @@ pub struct ZfsManager<'a> {
 }
 
 impl<'a> ZfsManager<'a> {
-    pub fn new(runner: &'a mut dyn CommandExecutor, variables: &'a mut HashMap<String, String>) -> Self {
+    pub fn new(
+        runner: &'a mut dyn CommandExecutor,
+        variables: &'a mut HashMap<String, String>,
+    ) -> Self {
         Self { runner, variables }
     }
 

@@ -83,7 +83,10 @@ pub struct DiscoveredMacRow {
     /// Device class derived from the MAC (see [`crate::oui`]). Lets the SPA
     /// bucket phones/watches/IoT (`"na"`) out of the machine triage view.
     /// Also derived on read; `Unknown` is skipped so it never persists.
-    #[serde(default, skip_serializing_if = "crate::oui::DeviceCategory::is_unknown")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::oui::DeviceCategory::is_unknown"
+    )]
     pub category: crate::oui::DeviceCategory,
     pub first_seen: String,
     pub last_seen: String,

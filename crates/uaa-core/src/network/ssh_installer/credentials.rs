@@ -131,7 +131,9 @@ pub fn format_credentials_report(
     let mut out = String::new();
     out.push_str(&format!("host: {host_label} ({address})\n"));
     out.push_str(&format!("generated: {generated_at}\n"));
-    out.push_str("# random per-host passwords — keep this file 0600; rotate via `passwd` if leaked\n");
+    out.push_str(
+        "# random per-host passwords — keep this file 0600; rotate via `passwd` if leaked\n",
+    );
     for c in creds {
         out.push_str(&format!("{}: {}\n", c.account, c.password));
     }

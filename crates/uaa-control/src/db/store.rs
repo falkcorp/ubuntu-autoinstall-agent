@@ -528,7 +528,8 @@ mod tests {
         let paths = StatePaths::under(dir.path());
         let err = read_snapshot_strict(&paths).expect_err("missing snapshot must be Err");
         assert!(
-            err.to_string().contains(&paths.snapshot.display().to_string()),
+            err.to_string()
+                .contains(&paths.snapshot.display().to_string()),
             "error must name the path: {err}"
         );
     }
@@ -542,7 +543,8 @@ mod tests {
 
         let err = read_snapshot_strict(&paths).expect_err("corrupt snapshot must be Err");
         assert!(
-            err.to_string().contains(&paths.snapshot.display().to_string()),
+            err.to_string()
+                .contains(&paths.snapshot.display().to_string()),
             "error must name the path: {err}"
         );
     }
@@ -572,7 +574,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = StatePaths::under(dir.path());
         let doc = read_snapshot(&paths);
-        assert!(doc.machines.is_empty(), "read_snapshot must still fail open");
+        assert!(
+            doc.machines.is_empty(),
+            "read_snapshot must still fail open"
+        );
     }
 
     /// Backward-compatibility guard (DS-REG-01): an existing on-disk snapshot

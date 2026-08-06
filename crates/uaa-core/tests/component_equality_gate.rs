@@ -170,5 +170,6 @@ fn test_unimatrixone_merge_output_passes_validate_resolved() {
     let fixture = load_fixture("unimatrixone");
     let (resolved, _provenance) =
         merge(&fixture.group, &fixture.host).expect("unimatrixone fixture must merge");
-    validate_resolved(&resolved).expect("unimatrixone merge()+lower() output must be validate-clean");
+    validate_resolved(&resolved)
+        .expect("unimatrixone merge()+lower() output must be validate-clean");
 }

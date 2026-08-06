@@ -1,0 +1,28 @@
+#!ipxe
+# file: netboot/ipxe/boot/mac-6c4b90bcf7f4.ipxe
+# version: 2.0.0
+# guid: fb049c82-0a2e-5248-bb5b-3e98468f1e7d
+# last-edited: 2026-08-05
+echo
+echo Booting len-serv-003 - WinPE (DASH provisioning)
+#
+# menu-default was `boot-local-disk` until 2026-08-05. len-serv-003 is being
+# handed to the hardware track (DASH provisioning -> firmware -> Secure Boot),
+# so it must land in WinPE without anyone at the console.
+#
+# Preconditions VERIFIED 2026-08-05 before this flip:
+#   - CockroachDB: .96 is NOT a cluster member. Live nodes are 172.16.2.30,
+#     172.16.3.92, 172.16.3.94, 172.16.2.35; ranges_under_3_replicas = 0.
+#   - Secure Boot: DISABLED, platform in Setup Mode (`mokutil --sb-state` on
+#     the host). wimboot is UNSIGNED, so this entry requires exactly that.
+#   - Artifacts staged on U0: ipxe/wimboot, isos/winpe/{bootmgr,BCD,boot.sdi,
+#     boot.wim}.
+#
+# Deliberately NOT `autoinstall`: the seed at cloud-init/6c4b90bcf7f4/ is still
+# the OLD PlainLuks/LVM layout, so netbooting the installer here would rebuild
+# the wrong thing. Use len-serv-003-native-keystore.yaml via ssh-install.
+#
+# To hand the box back to Ubuntu, set menu-default to boot-local-disk.
+set menu-default winpe
+set hostname len-serv-003
+chain --replace --autofree ${menu-url}

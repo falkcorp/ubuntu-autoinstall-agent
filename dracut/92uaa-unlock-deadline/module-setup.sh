@@ -1,0 +1,107 @@
+#!/bin/bash
+# file: dracut/92uaa-unlock-deadline/module-setup.sh
+# version: 1.1.0
+# guid: 8b2f6d14-0e77-4a3c-9d51-6f4c8a2b7e93
+# last-edited: 2026-08-03
+#
+# BOUNDS THE INITRAMFS. Ships a drop-in that puts a hard deadline on the
+# whole initrd, with a REBOOT as the action.
+#
+# WHY (all measured in the root-LUKS gate VM on U0, 2026-08-03; see
+# docs/research/2026-08-03-clevis-initramfs-bounded-failclosed.md):
+#
+#   A clevis unlock that cannot be satisfied does not FAIL. systemd sits on an
+#   ask-password query, contentedly, forever. Nothing enters an error path, so
+#   every "action" knob (rd.emergency, systemd.crash_reboot, panic=) has
+#   nothing to fire on. The console literally prints the reason:
+#
+#       (1 of 3) Job dracut-initqueue.service/start running (36s / no limit)
+#
+#   `systemctl show dracut-initqueue.service` reports TimeoutStartUSec=infinity
+#   and JobTimeoutUSec=infinity. The clevis PIN prompt runs INSIDE that job
+#   (the 50clevis-pin-pkcs11 dracut hooks), not inside
+#   systemd-cryptsetup@root.service — which is why `crypttab timeout=`,
+#   `rd.luks.options=timeout=` and `x-systemd.device-timeout=` govern the wrong
+#   unit and bounded nothing (a 902 s hang was measured with both set).
+#
+#   So the deadline is attached to initrd.target's JOB: that job stays queued
+#   until every initrd unit finishes, so one knob covers a hang anywhere in the
+#   initramfs -- the clevis PIN prompt, the plain passphrase fallback, or a
+#   device that never appears.
+#
+# ON A HOST WITH NO REMOTE POWER the action must be reboot, never a shell:
+# Tang may simply have come back, and an unattended retry is the only thing
+# that helps. reboot-force is also FAIL-CLOSED -- it resets the machine, it can
+# never fall through to an unlocked or degraded boot.
+#
+# REQUIRED COMPANION on the kernel cmdline:  rd.shell=0 rd.emergency=reboot
+#   Without rd.shell=0, dracut's emergency shell can pre-empt this deadline:
+#   measured run B3 dropped to "Press Enter for system maintenance" at ~304 s
+#   and the 600 s job deadline then never fired, because emergency.target
+#   cancels the initrd.target job. With rd.shell=0 the same scenario rebooted
+#   on schedule (run B4: "Forcibly rebooting: job timed out, proceeding in 5s"
+#   -> "reboot: Restarting system" at 909.7 s, then the next boot re-armed the
+#   PIN prompt -- an unattended retry loop).
+#
+# HONEST LIMITATION: JobTimeoutSec is a fixed wall clock measured from the
+# initrd.target job start. It CANNOT be reset by "a human is typing".
+#
+# That turns out not to matter, because it is never the constraint a human hits
+# first. `clevis-luks-pkcs11-askpin` calls systemd-ask-password with no
+# --timeout, whose default is 90 s; an expired query returns empty and clevis
+# counts it against too_many_errors=3. Measured with ZERO keystrokes sent
+# (run B7): failures at 99 s / 191 s / 283 s, ~92 s apart, then
+# "Too many errors !!!". So an operator gets ~90 s per prompt (120 s under the
+# UAA clevis-decrypt-pkcs11 fork) regardless of this deadline, and an
+# unattended host exhausts clevis in ~283 s and then falls through to the
+# UNBOUNDED plain-passphrase prompt -- which is exactly what this module
+# catches. Sizing the deadline above the whole inner budget is sufficient;
+# making it adaptive would buy nothing. See the research doc.
+
+# Deadline in seconds. Override from dracut.conf.d with
+#   uaa_unlock_deadline_sec=600
+# See the research doc for why 900 is the default: it must exceed clevis's own
+# inner budget (3 prompts x systemd-ask-password's 90 s default = ~283 s
+# measured; ~540 s worst case with the UAA clevis-decrypt-pkcs11 fork's 120 s
+# per-prompt timeout and flock -w 300), or the outer bound pre-empts the very
+# recovery it exists to protect.
+: "${uaa_unlock_deadline_sec:=900}"
+
+# dracut hook: decide whether to include this module.
+check() {
+    # No host prerequisites -- a deadline is useful on any encrypted root.
+    # 255 == "usable, but never pulled in by default": the module lands ONLY
+    # when something asks for it. VERIFIED on dracut 110-11, because a module
+    # that auto-included itself would silently put a reboot deadline into every
+    # len-serv rebuild, which must stay byte-identical:
+    #   hostonly="no"  build, module present on disk, not requested -> absent
+    #   hostonly="yes" build, module present on disk, not requested -> absent
+    #   -a uaa-unlock-deadline                                      -> present,
+    #     and 10-uaa-unlock-deadline.conf is in the image
+    return 255
+}
+
+# dracut hook: module dependencies.
+depends() {
+    # The drop-in is only meaningful in a systemd-driven initramfs; without
+    # systemd there is no initrd.target and no job to time out.
+    echo systemd
+    return 0
+}
+
+# dracut hook: write the drop-in straight into the initramfs.
+install() {
+    local dir="${initdir}/usr/lib/systemd/system/initrd.target.d"
+    mkdir -p "$dir"
+    cat > "${dir}/10-uaa-unlock-deadline.conf" <<EOF
+# Generated by dracut/92uaa-unlock-deadline. Do not edit in the initramfs.
+#
+# JobTimeoutAction=reboot-force is a hard reset (no unmount, no shutdown
+# transaction) -- correct here, because at this point the real root is not
+# mounted and there is nothing to flush.
+[Unit]
+JobTimeoutSec=${uaa_unlock_deadline_sec}
+JobTimeoutAction=reboot-force
+EOF
+    return 0
+}

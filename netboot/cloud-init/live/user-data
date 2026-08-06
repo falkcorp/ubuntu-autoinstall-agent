@@ -1,0 +1,52 @@
+#cloud-config
+# file: netboot/cloud-init/live/user-data
+# version: 1.0.0
+# guid: 5c8e1b93-47af-4d20-a6f1-9e3b2c07d485
+# last-edited: 2026-08-05
+#
+# Seed for the iPXE `:live` entries — the DIAGNOSTIC boot, not an install.
+#
+# ── THERE IS DELIBERATELY NO `autoinstall:` KEY IN THIS FILE ────────────────
+# The obvious way to give the live boot an sshd is to point its `ds=` at the
+# per-MAC autoinstall seed, because that seed already carries the operator's
+# keys. Doing so would hand subiquity an `autoinstall:` document and the
+# "diagnostic" boot would silently repartition the disk — with the OLD
+# PlainLuks/LVM layout still seeded for len-serv-003, which is not even the
+# layout we now build. A live boot must be able to look at a machine without
+# changing it, so it gets its own seed and this file must never grow an
+# `autoinstall:` key.
+#
+# Deployed to http://172.16.2.30/cloud-init/live/ alongside `meta-data`.
+
+hostname: uaa-live
+
+# The live session is reached over SSH by key only; nothing here sets or
+# unlocks a password.
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - name: jdfalk
+    groups: [adm, sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    # No password hash at all: key-only, and `lock_passwd` keeps the account
+    # from being reachable any other way.
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOq0x6/0fA+vn0EdNJvBuadOo4rZ1IwkCWbBOWCwvId5 jdfalk@Norn.lan
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4PPvBh1cCMdh8S5Uqz/1cONHxhc78TfWLt0fx76B/G jdfalk@JohnathsMacBook.jf.local
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPghsb0DAzQX5LfLgb1Q11LJJhppTM1r093TWCTjxjdb eddsa-key-20220820
+
+packages:
+  - openssh-server
+
+# The casper live image ships ssh masked/disabled; enable it explicitly rather
+# than assuming `packages:` alone starts it. Without this the whole point of
+# the seed — being able to `uaa ssh-install` into a netbooted host — is lost,
+# which was the gap this file closes.
+runcmd:
+  - [systemctl, unmask, ssh.service]
+  - [systemctl, enable, --now, ssh.service]
+
+final_message: "uaa live diagnostic environment ready — sshd up, disk untouched"
