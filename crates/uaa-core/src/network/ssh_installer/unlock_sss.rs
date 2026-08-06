@@ -1,7 +1,7 @@
 // file: crates/uaa-core/src/network/ssh_installer/unlock_sss.rs
-// version: 1.5.0
+// version: 1.6.0
 // guid: 08434a81-e744-40ab-a281-e34e41973bac
-// last-edited: 2026-08-03
+// last-edited: 2026-08-06
 
 //! Composable clevis SSS unlock policy — the shared wire type.
 //!
@@ -384,9 +384,39 @@ impl SssPolicy {
                 .collect(),
         };
 
-        // Group 1: peers, optionally ANDed with tpm2 (lenserv only).
+        // Group 1: peers, ANDed with a second factor that is ALWAYS present at
+        // boot — tpm2 where there is a TPM, the chassis-resident nano where
+        // there is not.
+        //
+        // The `None` arm previously emitted a bare `tang_group(peer_threshold)`.
+        // That scored two shares and passed the share-count floor, but both
+        // shares were Tang: anyone holding `peer_threshold` Tang keys decrypted
+        // the volume, and since the outer policy is a `t=1` OR, that one branch
+        // made the WHOLE policy Tang-satisfiable. It is the flat-policy bug in a
+        // different costume, and it applied to exactly the hosts least able to
+        // afford it — the Raspberry Pi Tang servers, which have no TPM
+        // (`/dev/tpm*` absent, measured 2026-08-06) and are therefore the only
+        // hosts that ever took this arm.
+        //
+        // The nano is the right substitute because it plays the same structural
+        // role a TPM does: permanently seated, so it is available at boot with
+        // no human present. A thief with the chassis now holds that share and
+        // still needs a Tang key from another encrypted host.
+        //
+        // Caveat carried by `todo.d/2026-08-06-rpi-tang-selfunlock-and-touch-sudo.md`:
+        // serving this share unattended requires the PIN to be readable from the
+        // (unencrypted) initramfs, so the PIN is not what protects a stolen
+        // chassis here — the second factor is. Whether a stored-PIN pkcs11 share
+        // functions at root unlock at all is still unproven on hardware.
+        let nano_pin = || UnlockPin::Pkcs11(Pkcs11Pin {
+            uri: nano_uri.to_string(),
+            mechanism: default_pkcs11_mechanism(),
+        });
         let group_one = match tpm2_pcr_ids {
-            None => tang_group(peer_threshold),
+            None => SssPolicy {
+                threshold: 2,
+                pins: vec![nano_pin(), UnlockPin::Sss(tang_group(peer_threshold))],
+            },
             Some(pcr_ids) => SssPolicy {
                 threshold: 2,
                 pins: vec![

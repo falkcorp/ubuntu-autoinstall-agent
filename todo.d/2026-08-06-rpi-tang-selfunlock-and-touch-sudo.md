@@ -1,5 +1,5 @@
 <!-- file: todo.d/2026-08-06-rpi-tang-selfunlock-and-touch-sudo.md -->
-<!-- version: 1.0.0 -->
+<!-- version: 2.0.0 -->
 <!-- guid: 7e41b9d2-8c05-4f36-a1e7-3b962d05c8f4 -->
 <!-- last-edited: 2026-08-06 -->
 
@@ -40,10 +40,23 @@ misrenders nested policies (drops shares, collapses arrays into bare objects).
 
 ### Target policy — `sss t=1` over two groups
 
-- [ ] **Online group:** `tang` over `.45/.46/.47` at `t=2`. For a given RPi's
-      own boot it is itself locked, so this means the other two must be up.
-      Fine for rolling reboots, and stealing one RPi yields nothing — an
-      attacker would need two more boxes on the LAN.
+- [x] **Online group:** `t=2 { pkcs11(chassis nano), sss{ tang t=1 } }` —
+      **NOT** a bare `tang t=2`, which is what was originally drafted here and
+      what the emitter actually shipped. A bare Tang group scores two shares
+      and clears the share-count floor, but both shares are Tang, so two Tang
+      keys decrypt the volume; with the outer `t=1` OR that made the WHOLE
+      policy Tang-satisfiable. The nano fills the structural role a TPM plays
+      on a lenserv: always seated, so available at boot with no human.
+
+      Fixed in `SssPolicy::fleet_three_group`'s `None` arm and enforced by
+      `verify::satisfiable_with_only` — see the changelog fragment
+      `verifier-rejects-single-factor-kind.md`.
+
+      Dropping the tang sub-threshold to `t=1` also answers the cold-start
+      question: with `t=2` you must manually unlock **two** RPis before the
+      third chains up (unlock #1; #2 still sees only one peer since it is
+      itself locked and #3 is down; unlock #2; #3 then sees two). At `t=1`
+      it is **one** manual unlock and the other two follow.
 - [ ] **Cold-start group:** `t=2 { pkcs11(chassis nano), pkcs11(carried key) }`.
       **Two** token shares, not one. A permanently-seated nano is a factor a
       thief gets for free with the chassis; under nano+PIN alone a stolen RPi
@@ -51,6 +64,32 @@ misrenders nested policies (drops shares, collapses arrays into bare objects).
       yields one share and is useless without a key from the operator's pocket.
       Same shape as the len servers' G2 group; multi-share PIN handling already
       exists (the `clevis-decrypt-pkcs11` fork, #9).
+
+### Token roster and rotation (operator, 2026-08-06)
+
+Additional carried keys are planned, threshold stays at `t=2`, and one carried
+key goes to an **offsite vault** as backup. Consequences that are easy to get
+wrong:
+
+- [ ] **Enrol the vault key BEFORE it leaves.** sss shares are fixed when the
+      JWE is created; there is no way to add a share later without regenerating
+      the keyslot. Bind the full set (nano + carried + vault) in one operation.
+- [ ] **Binding with a token absent does not error.** It silently collapses the
+      shares onto whichever tokens are present — `rc=0`, empty stderr. Binding
+      while the vault key is already offsite therefore yields a weaker policy
+      than intended and nothing says so. Run
+      `uaa verify-policy --device <dev>` after every bind.
+- [ ] **Keep the roster small.** With the nano permanently seated, the chassis
+      always contributes one of the two required shares, so every additional
+      token is another single item that completes the set for whoever holds the
+      box. Three or four total, deliberately chosen.
+- [ ] **Revoking a lost key is also a re-bind**, with the same all-tokens-present
+      requirement — i.e. a trip to the vault. Decide now whether the vault key is
+      backup-only or routine; it changes how often that trip happens.
+- [ ] Known gap: `verify-policy` has **no notion of factor independence within a
+      kind**. It now rejects tang-only and tpm2-only policies, but it cannot tell
+      that one of two `pkcs11` shares is a token living permanently inside the
+      machine. That judgement stays with the operator.
 
 **A LUKS passphrase cannot be AND-ed into this.** The operator asked for
 "YubiKey + PIN + password". There is no passphrase pin in clevis — a passphrase
