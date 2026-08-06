@@ -23,6 +23,11 @@ pub struct MachineRow {
     /// Last known address for this machine (`ip`, falling back to `last_ip`).
     /// A MAC alone does not tell an operator which box they are looking at.
     pub ip: Option<String>,
+    /// IEEE OUI-resolved manufacturer, derived from the MAC at read time (see
+    /// [`crate::oui`]). Lets an operator confirm at a glance that a row is the
+    /// server they think it is — and spot a non-target that slipped through
+    /// classification, since the filter can only act on OUIs it recognizes.
+    pub vendor: Option<String>,
     /// Whether the host's agent is actually reporting, derived at read time by
     /// [`crate::machine_plane::staleness::freshness`]: `"reporting"`, `"stale"`,
     /// or `"never"`.

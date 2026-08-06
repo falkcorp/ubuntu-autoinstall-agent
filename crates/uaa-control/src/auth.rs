@@ -1122,6 +1122,7 @@ async fn role_guard(
 pub async fn auth_status_handler(
     Extension(state): Extension<Arc<AuthState>>,
     Extension(bootstrap): Extension<Arc<BootstrapTokenState>>,
+    cf: Option<Extension<Arc<crate::cf_access::CfAccessState>>>,
     headers: HeaderMap,
 ) -> Response {
     let cookie_value = extract_session_cookie(&headers);
@@ -1129,9 +1130,21 @@ pub async fn auth_status_handler(
         Some(v) => verify_session(&state.hmac_key, &v, unix_now()).is_some(),
         None => false,
     };
+    // Whether the Cloudflare Access login is configured at all. Without this the
+    // failure mode of a bad/missing env config is a browser silently redirected
+    // to `/auth/login`, which builds a GitHub authorize URL from an EMPTY
+    // client_id — a broken page rather than a diagnosable one. Reporting the
+    // configured state lets the login page say which methods actually exist.
+    let cf_enabled = cf.as_ref().is_some_and(|Extension(c)| c.enabled());
+    let cf_team_domain = cf
+        .as_ref()
+        .map(|Extension(c)| c.config().team_domain.clone())
+        .filter(|d| !d.is_empty());
     Json(json!({
         "authenticated": authenticated,
         "bootstrap_token_enabled": bootstrap.enabled(),
+        "cf_access_enabled": cf_enabled,
+        "cf_access_team_domain": cf_team_domain,
     }))
     .into_response()
 }
