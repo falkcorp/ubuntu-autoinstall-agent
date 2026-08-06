@@ -1,14 +1,14 @@
 // file: crates/uaa-control/src/operator/api_types.rs
-// version: 1.6.0
+// version: 1.7.0
 // guid: e0032c3d-53bf-4791-bad1-c20dfdcc0e96
-// last-edited: 2026-07-23
+// last-edited: 2026-08-05
 
 //! Operator API response DTOs — field-for-field mirrors of
 //! `web/src/api/types.ts` (CT-08's SPA, which pre-declared these shapes
 //! against a not-yet-landed CT-07). These are deliberately NOT
 //! `crate::db::MachineRow` etc. re-exported: the SPA's `MachineRow` is a
-//! reduced+augmented view (adds `consistent`, drops the WAL-only fields),
-//! not the full persisted row.
+//! reduced+augmented view (adds the derived `agent` liveness, drops the
+//! WAL-only fields), not the full persisted row.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,13 +20,24 @@ pub struct MachineRow {
     pub status: String,
     pub boot_target: String,
     pub tpm_ek: Option<String>,
-    /// True when every provisioning layer for this machine agrees.
+    /// Last known address for this machine (`ip`, falling back to `last_ip`).
+    /// A MAC alone does not tell an operator which box they are looking at.
+    pub ip: Option<String>,
+    /// Whether the host's agent is actually reporting, derived at read time by
+    /// [`crate::machine_plane::staleness::freshness`]: `"reporting"`, `"stale"`,
+    /// or `"never"`.
     ///
-    /// PLACEHOLDER for this slice: always `true`. Real cross-layer
-    /// consistency checking (registry vs. placed config vs. iPXE boot
-    /// target vs. install history) is unimplemented — flagged here rather
-    /// than silently faked as a TODO comment nobody greps for.
-    pub consistent: bool,
+    /// This replaced a `consistent: bool` field that was hardcoded `true` in
+    /// `handlers::to_view` — every machine rendered a green "consistent" badge
+    /// regardless of its actual state, including machines that had never once
+    /// checked in. A field that is always `true` carries no information but
+    /// looks like it does, which is worse than showing nothing: cross-layer
+    /// consistency checking was never implemented, so the UI was asserting a
+    /// property nothing had verified. `agent` reports something measured.
+    pub agent: String,
+    /// Unix-epoch seconds of the last contact of any kind, or `""` if never
+    /// seen. `agent` says whether that contact is recent enough to mean
+    /// anything.
     pub last_seen: String,
 }
 
@@ -159,9 +170,12 @@ pub struct AllocationView {
 // drift or select a restore target — see `handlers.rs`'s drift section doc.
 
 /// One row from `GET /api/drift` — a currently-drifted group or profile,
-/// mirrored from `crate::profiles::drift::DriftReport`. Aligns with the
-/// SPA's existing `MachineRow.consistent` vocabulary: this row exists
-/// precisely when that boolean would read `false` for the object named here.
+/// mirrored from `crate::profiles::drift::DriftReport`.
+///
+/// This is where real drift information lives, and always has been. The
+/// `MachineRow.consistent` boolean this doc used to point at was never wired
+/// to it — it was hardcoded `true` — so the SPA showed every machine as
+/// consistent while the actual drift data sat unread on this endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriftView {
     pub object_kind: String,

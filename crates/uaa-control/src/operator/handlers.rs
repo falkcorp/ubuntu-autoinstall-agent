@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/operator/handlers.rs
-// version: 1.10.1
+// version: 1.11.0
 // guid: e94ff17e-4e1b-4672-8940-1fe111b56861
-// last-edited: 2026-07-23
+// last-edited: 2026-08-05
 
 //! Operator API request handlers (`:15000`, mounted under `/api/*` ahead of
 //! [`super::web_ui`]'s SPA fallback).
@@ -360,14 +360,26 @@ fn internal_error(what: &str) -> Response {
 }
 
 fn to_view(row: &DbMachineRow) -> MachineRow {
+    use crate::machine_plane::staleness::{freshness, Freshness};
+
+    let now = now_epoch_string().parse::<i64>().unwrap_or(0);
+    let agent = match freshness(row.last_app_status_at.as_deref(), now, &row.mac) {
+        Freshness::Fresh => "reporting",
+        Freshness::Stale => "stale",
+        Freshness::NeverReported => "never",
+    };
     MachineRow {
         mac: row.mac.clone(),
         hostname: row.hostname.clone(),
         status: row.status.clone().into(),
         boot_target: row.boot_target.clone().into(),
         tpm_ek: row.tpm_ek.clone(),
-        // PLACEHOLDER — see api_types::MachineRow::consistent doc.
-        consistent: true,
+        // `ip` is the address on record; `last_ip` is where it was actually
+        // last observed. Prefer the former, fall back to the latter, so a
+        // machine that has only ever been seen (never registered with an
+        // address) still shows something an operator can ping.
+        ip: row.ip.clone().or_else(|| row.last_ip.clone()),
+        agent: agent.to_string(),
         last_seen: row.last_seen.clone().unwrap_or_default(),
     }
 }
@@ -675,6 +687,11 @@ fn build_router(
         .merge(admin_routes)
         .layer(Extension(auth_state))
         .layer(Extension(bootstrap_state))
+        // Cloudflare Access identity for `uaa.jdfalk.com`. Layered
+        // unconditionally; `CfAccessState::enabled` decides at request time
+        // whether the path does anything, so an unconfigured deployment carries
+        // an inert extension rather than a differently-shaped router.
+        .layer(Extension(Arc::new(crate::cf_access::CfAccessState::from_env())))
 }
 
 /// `GET /healthz` — matched here (ahead of `web_ui`'s SPA catch-all

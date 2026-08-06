@@ -36,6 +36,16 @@ ssh2 = { version = "0.9", default-features = false, features = ["vendored-openss
 
 # Cryptography
 ring = "0.17"
+# Cloudflare Access JWT verification (crates/uaa-control/src/cf_access.rs).
+# `rust_crypto` is a REQUIRED, load-bearing feature, not a preference: jsonwebtoken
+# 11 resolves its crypto backend at runtime and PANICS on the first verification if
+# neither `rust_crypto` nor `aws_lc_rs` is selected — it compiles fine either way.
+# Pure Rust is chosen over aws-lc-rs so the arm64/musl cross-builds need no C
+# toolchain.
+jsonwebtoken = { version = "11", default-features = false, features = [
+  "use_pem",
+  "rust_crypto",
+] }
 sha2 = "0.10"
 
 # File Operations

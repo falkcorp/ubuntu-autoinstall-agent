@@ -28,6 +28,7 @@ pub mod oui; // MAC→vendor (OUI) lookup + device classification for discovery
 pub mod audit; // CT-04
 pub mod auth; // CT-03
 pub mod ca; // PK-01, then PK-03 (serialized)
+pub mod cf_access; // Cloudflare Access JWT identity for the :15000 operator plane
 pub mod drain; // the real NodeDrainer behind reinstall's seam
 pub mod enroll; // PK-01
 pub mod import_export; // CT-02

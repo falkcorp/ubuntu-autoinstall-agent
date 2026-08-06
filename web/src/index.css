@@ -1,7 +1,7 @@
 /* file: web/src/index.css */
-/* version: 2.1.0 */
+/* version: 2.2.0 */
 /* guid: eda64990-a578-4026-b133-dee17e5db539 */
-/* last-edited: 2026-07-23 */
+/* last-edited: 2026-08-05 */
 
 :root {
   color-scheme: light dark;
@@ -413,6 +413,27 @@ table button + button {
   border-color: transparent;
   background: var(--success-soft);
   color: var(--success);
+}
+
+/* Agent liveness. Only "reporting" is green: `stale` and `never` mean the
+   server does not know the machine's state, which is neither healthy nor
+   unhealthy, so neither gets a success OR a danger colour. */
+.badge-agent-reporting {
+  border-color: transparent;
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.badge-agent-stale,
+.badge-agent-never {
+  border-color: var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+}
+
+/* A device an operator has marked as not-a-target stays visible but recedes. */
+.row--not-target {
+  opacity: 0.55;
 }
 
 /* ── Banners / cards / states ──────────────────────────────────────────── */

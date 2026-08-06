@@ -1,7 +1,7 @@
 // file: web/src/pages/Machines.tsx
-// version: 1.1.0
+// version: 1.2.0
 // guid: a19e686a-0212-4f7a-a751-25d7d67e6acf
-// last-edited: 2026-07-22
+// last-edited: 2026-08-05
 
 import { useCallback, useState } from "react";
 import { approveMachine, listMachines, reinstallMachine } from "../api/client";
@@ -17,6 +17,24 @@ function formatSeen(epoch: string): string {
   }
   return new Date(secs * 1000).toLocaleString();
 }
+
+/**
+ * Agent-liveness wording. "stale" and "never" are deliberately NOT rendered as
+ * failures: neither means the machine is unhealthy, only that nothing recent
+ * has been reported. Claiming more than that is what the old always-true
+ * "consistent" badge did.
+ */
+const AGENT_LABEL: Record<MachineRow["agent"], string> = {
+  reporting: "reporting",
+  stale: "stale",
+  never: "no agent",
+};
+
+const AGENT_TITLE: Record<MachineRow["agent"], string> = {
+  reporting: "Checked in within the last 15 minutes.",
+  stale: "Has reported before, but not recently — current state unknown.",
+  never: "Has never reported. Either the agent is not installed, or it has never run.",
+};
 
 const REINSTALL_COOLDOWN_WARNING =
   "Reinstalling wipes and re-provisions this machine from scratch. A machine " +
@@ -78,10 +96,11 @@ export default function Machines(): JSX.Element {
           <thead>
             <tr>
               <th>Hostname</th>
+              <th>IP</th>
               <th>MAC</th>
               <th>Status</th>
               <th>Boot target</th>
-              <th>Consistent</th>
+              <th>Agent</th>
               <th>Last seen</th>
               <th>Actions</th>
             </tr>
@@ -90,17 +109,16 @@ export default function Machines(): JSX.Element {
             {state.data.map((machine: MachineRow) => (
               <tr key={machine.mac}>
                 <td>{machine.hostname}</td>
+                <td>{machine.ip ?? "—"}</td>
                 <td>{machine.mac}</td>
                 <td>
                   <span className={`badge badge-${machine.status}`}>{machine.status}</span>
                 </td>
                 <td>{machine.boot_target}</td>
                 <td>
-                  {machine.consistent ? (
-                    <span className="badge badge-consistent">consistent</span>
-                  ) : (
-                    <span className="badge badge-drift">drift</span>
-                  )}
+                  <span className={`badge badge-agent-${machine.agent}`} title={AGENT_TITLE[machine.agent]}>
+                    {AGENT_LABEL[machine.agent]}
+                  </span>
                 </td>
                 <td>{formatSeen(machine.last_seen)}</td>
                 <td>
