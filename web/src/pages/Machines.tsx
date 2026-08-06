@@ -98,6 +98,7 @@ export default function Machines(): JSX.Element {
               <th>Hostname</th>
               <th>IP</th>
               <th>MAC</th>
+              <th>Vendor</th>
               <th>Status</th>
               <th>Boot target</th>
               <th>Agent</th>
@@ -110,7 +111,10 @@ export default function Machines(): JSX.Element {
               <tr key={machine.mac}>
                 <td>{machine.hostname}</td>
                 <td>{machine.ip ?? "—"}</td>
-                <td>{machine.mac}</td>
+                <td>
+                  <code>{machine.mac}</code>
+                </td>
+                <td>{machine.vendor ?? "—"}</td>
                 <td>
                   <span className={`badge badge-${machine.status}`}>{machine.status}</span>
                 </td>

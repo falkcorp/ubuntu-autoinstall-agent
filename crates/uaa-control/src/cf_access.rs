@@ -62,7 +62,6 @@
 //! confirmed working, so that enabling one door closes another rather than
 //! leaving both open.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -463,14 +462,6 @@ fn decode_rs256(token: &str, key: &JwkRsa, aud: &str, iss: &str) -> Result<CfCla
     let data = decode::<CfClaims>(token, &decoding, &validation)
         .map_err(|e| anyhow!("token rejected: {e}"))?;
     Ok(data.claims)
-}
-
-/// Role-name rendering for the login page / status endpoint.
-pub fn describe(config: &CfAccessConfig) -> HashMap<&'static str, String> {
-    let mut out = HashMap::new();
-    out.insert("enabled", config.enabled().to_string());
-    out.insert("team_domain", config.team_domain.clone());
-    out
 }
 
 #[cfg(test)]

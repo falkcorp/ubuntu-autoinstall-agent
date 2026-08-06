@@ -18,6 +18,10 @@ export interface MachineRow {
   /** Last known address (`ip`, falling back to `last_ip`). A MAC alone doesn't
    *  tell an operator which physical box a row refers to. */
   ip?: string | null;
+  /** IEEE OUI-resolved manufacturer, derived from the MAC server-side. Lets an
+   *  operator confirm a row is the box they think it is, and spot a non-target
+   *  that slipped past classification. */
+  vendor?: string | null;
   /**
    * Whether the host's agent is actually reporting, computed server-side from
    * `last_app_status_at`:
@@ -91,6 +95,12 @@ export interface ApiErrorBody {
 export interface AuthStatus {
   authenticated: boolean;
   bootstrap_token_enabled: boolean;
+  /** Whether the Cloudflare Access login is configured. When false, a redirect
+   *  to /auth/login builds a GitHub authorize URL from an empty client_id —
+   *  i.e. a broken page — so the login view should say so rather than offer it. */
+  cf_access_enabled?: boolean;
+  /** The configured Access team domain, or null when unset. */
+  cf_access_team_domain?: string | null;
 }
 
 /** Thrown by apiFetch for any non-2xx, non-401, non-403 response. */

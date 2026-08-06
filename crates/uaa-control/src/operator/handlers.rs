@@ -379,6 +379,7 @@ fn to_view(row: &DbMachineRow) -> MachineRow {
         // machine that has only ever been seen (never registered with an
         // address) still shows something an operator can ping.
         ip: row.ip.clone().or_else(|| row.last_ip.clone()),
+        vendor: crate::oui::enrich(&row.mac).0,
         agent: agent.to_string(),
         last_seen: row.last_seen.clone().unwrap_or_default(),
     }
@@ -720,7 +721,37 @@ async fn handle_list_machines(State(state): State<AppState>) -> Response {
 
     let mut machines = state.registry.list_machines().await;
     machines.sort_by(|a, b| a.mac.cmp(&b.mac));
-    let views: Vec<MachineRow> = machines.iter().map(to_view).collect();
+    // Drop auto-promoted non-machines at READ time, not just at promotion time.
+    //
+    // `backfill_discovered_named` already refuses to promote a `NonMachine`
+    // MAC, but that filter only guards the write path, and a registry row is
+    // permanent once written. Every phone, watch and speaker promoted BEFORE
+    // that filter existed is still a row here, and the fleet list showed all of
+    // them — which is why an operator scanning for install targets was reading
+    // past iPhones and HomePods. Filtering on the way out fixes those rows
+    // retroactively, with no migration.
+    //
+    // The `Seen` condition is load-bearing and must not be dropped for
+    // "simplicity". `DeviceCategory::NonMachine` is assigned to any
+    // LOCALLY-ADMINISTERED MAC (the `& 0x02` bit) — that bit is how randomized
+    // iPhone addresses get caught without vendor data, but bonded interfaces,
+    // VMs and MAC-failover setups set it too, and those ARE install targets.
+    // Filtering on category alone would silently hide real, deliberately
+    // registered machines, which is a far worse failure than showing one extra
+    // phone. `Seen` means "auto-promoted by the backfill, never confirmed by a
+    // human", so anything an operator actually registered or approved survives
+    // regardless of what its MAC looks like.
+    //
+    // `Unknown` is likewise never filtered: an unrecognized OUI is not evidence
+    // that something isn't a machine.
+    let views: Vec<MachineRow> = machines
+        .iter()
+        .filter(|m| {
+            m.status != MachineStatus::Seen
+                || crate::oui::enrich(&m.mac).1 != crate::oui::DeviceCategory::NonMachine
+        })
+        .map(to_view)
+        .collect();
     json_response(StatusCode::OK, views)
 }
 
@@ -1685,6 +1716,66 @@ mod tests {
         // Persisted, not just returned — a second call must not duplicate it.
         let row = registry.get_machine("ac:1f:6b:40:fc:e2").await.unwrap();
         assert_eq!(row.status, MachineStatus::Seen);
+    }
+
+    /// A phone auto-promoted into the registry BEFORE `backfill_discovered_named`
+    /// learned to skip non-machines is still a permanent row. The fleet list must
+    /// not show it — that clutter is what sent an operator scanning past iPhones
+    /// and HomePods looking for install targets.
+    #[tokio::test]
+    async fn seen_non_machines_are_filtered_out_of_the_fleet_list() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(MockRegistry::default());
+        // Apple OUI, universally administered — unambiguously a NonMachine by
+        // vendor, not merely by the locally-administered bit.
+        registry
+            .upsert_machine(base_machine(
+                "00:03:93:aa:bb:cc",
+                "johns-iphone",
+                MachineStatus::Seen,
+            ))
+            .await;
+        let state = test_state(dir.path().to_path_buf(), registry.clone());
+
+        let body = body_json(handle_list_machines(State(state)).await).await;
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            0,
+            "an auto-promoted phone must not appear in the fleet list"
+        );
+        // Filtered from the VIEW only. The row is still on record, so nothing is
+        // destroyed and no migration is needed to undo this.
+        assert!(registry.get_machine("00:03:93:aa:bb:cc").await.is_some());
+    }
+
+    /// The other half of the rule, and the one that actually protects the fleet:
+    /// `DeviceCategory::NonMachine` is assigned to ANY locally-administered MAC,
+    /// which includes bonded interfaces, VMs and MAC-failover setups. Those are
+    /// real install targets, and hiding one is far worse than showing an extra
+    /// phone — so operator-confirmed rows survive whatever their MAC looks like.
+    #[tokio::test]
+    async fn an_approved_machine_survives_even_with_a_locally_administered_mac() {
+        let dir = tempdir().unwrap();
+        let registry = Arc::new(MockRegistry::default());
+        // `0xaa & 0x02 != 0` — locally administered, so `oui::classify` calls
+        // this a NonMachine on the bit alone.
+        registry
+            .upsert_machine(base_machine(
+                "aa:bb:cc:dd:ee:ff",
+                "bonded-server",
+                MachineStatus::Approved,
+            ))
+            .await;
+        let state = test_state(dir.path().to_path_buf(), registry.clone());
+
+        let body = body_json(handle_list_machines(State(state)).await).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "a machine an operator approved must never be hidden by MAC heuristics"
+        );
+        assert_eq!(arr[0]["hostname"], "bonded-server");
     }
 
     #[tokio::test]
