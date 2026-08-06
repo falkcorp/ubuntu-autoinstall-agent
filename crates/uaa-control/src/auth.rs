@@ -1,7 +1,7 @@
 // file: crates/uaa-control/src/auth.rs
-// version: 1.2.1
+// version: 1.3.0
 // guid: af3dc9c0-def6-46ff-9892-90e54716fe21
-// last-edited: 2026-07-14
+// last-edited: 2026-08-05
 
 //! RBAC + operator authentication: GitHub OAuth web flow + org/team role mapping
 //! (spec Decision 8, component C3 "Operator plane").
@@ -1010,25 +1010,82 @@ where
 {
     router.route_layer(axum::middleware::from_fn(
         move |Extension(state): Extension<Arc<AuthState>>,
+              cf: Option<Extension<Arc<crate::cf_access::CfAccessState>>>,
               req: axum::extract::Request,
-              next: Next| async move { role_guard(state, min, req, next).await },
+              next: Next| async move {
+            role_guard(state, cf.map(|Extension(c)| c), min, req, next).await
+        },
     ))
 }
 
 async fn role_guard(
     state: Arc<AuthState>,
+    cf: Option<Arc<crate::cf_access::CfAccessState>>,
     min: Role,
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let is_api_path = req.uri().path().starts_with("/api/");
     let cookie_value = extract_session_cookie(req.headers());
-    let decision = check_access(&state, min, cookie_value.as_deref(), unix_now()).await;
-    match decision {
+    let mut decision = check_access(&state, min, cookie_value.as_deref(), unix_now()).await;
+
+    // No usable `uaa_session` cookie? Before bouncing the caller to a login page,
+    // see whether Cloudflare Access already authenticated them at the edge and
+    // forwarded a signed assertion. This is the ONLY other way into a session —
+    // see `crate::cf_access`'s module doc for why it exists and what bounds it.
+    //
+    // Deliberately only on `Unauthenticated`: a valid session that is merely
+    // under-privileged stays `Forbidden`. Re-deriving a role from the edge on a
+    // 403 would let a Viewer escalate by presenting the same Access token that
+    // produced their Viewer session in the first place.
+    let mut minted_cookie = None;
+    if matches!(decision, AccessDecision::Unauthenticated) {
+        if let Some(cf) = cf.as_ref().filter(|c| c.enabled()) {
+            match cf.identify(req.headers()).await {
+                Ok(identity) => {
+                    tracing::info!(
+                        email = %identity.email,
+                        role = ?identity.role,
+                        "cf-access: accepted edge identity"
+                    );
+                    // Mint the ordinary signed session cookie so every
+                    // subsequent request takes the cheap HMAC path instead of
+                    // re-verifying against the JWKS, and so the rest of the
+                    // stack sees one session shape regardless of how it began.
+                    let now = unix_now();
+                    minted_cookie = Some(mint_session(
+                        &state.hmac_key,
+                        &identity.email,
+                        identity.role,
+                        now,
+                    ));
+                    state.cache_role(&identity.email, identity.role);
+                    if identity.role >= min {
+                        decision = AccessDecision::Allow(Session {
+                            login: identity.email,
+                            role: identity.role,
+                            is_bootstrap: false,
+                        });
+                    } else {
+                        decision = AccessDecision::Forbidden;
+                    }
+                }
+                Err(reject) => {
+                    // Logged at the decision point, without the token, so
+                    // `journalctl -u uaa-control` shows WHICH check failed. A
+                    // verifier whose failures are indistinguishable is one
+                    // nobody can debug at 2am.
+                    tracing::debug!(reason = %reject, "cf-access: no edge identity");
+                }
+            }
+        }
+    }
+
+    let mut response = match decision {
         AccessDecision::Allow(session) => {
             // Lets downstream handlers attribute mutations to the real
-            // logged-in principal (GitHub login, or `BOOTSTRAP_ADMIN_LOGIN`)
-            // instead of a placeholder actor string.
+            // logged-in principal (GitHub login, the Cloudflare Access email,
+            // or `BOOTSTRAP_ADMIN_LOGIN`) instead of a placeholder actor string.
             req.extensions_mut().insert(session);
             next.run(req).await
         }
@@ -1046,7 +1103,17 @@ async fn role_guard(
         AccessDecision::Forbidden => {
             (StatusCode::FORBIDDEN, Json(json!({"error": "forbidden"}))).into_response()
         }
+    };
+
+    if let Some(cookie) = minted_cookie {
+        let header_value = format!(
+            "{SESSION_COOKIE_NAME}={cookie}; Path=/; Max-Age={SESSION_TTL_SECS}; Secure; HttpOnly; SameSite=Lax"
+        );
+        if let Ok(value) = HeaderValue::from_str(&header_value) {
+            response.headers_mut().append(header::SET_COOKIE, value);
+        }
     }
+    response
 }
 
 /// `GET /api/auth/status` — public (no role required): tells the SPA whether a

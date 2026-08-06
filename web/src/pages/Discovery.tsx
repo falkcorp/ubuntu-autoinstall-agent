@@ -1,7 +1,7 @@
 // file: web/src/pages/Discovery.tsx
-// version: 1.1.0
+// version: 1.2.0
 // guid: 4f6e1cfc-fb79-4c90-80d6-1e70e2d29c33
-// last-edited: 2026-07-23
+// last-edited: 2026-08-05
 
 import { useCallback, useMemo, useState } from "react";
 import { dismissDiscovered, listDiscovered } from "../api/client";
@@ -43,7 +43,15 @@ export default function Discovery(): JSX.Element {
   );
 
   const handleDismiss = async (mac: string): Promise<void> => {
-    if (!window.confirm(`Dismiss discovered MAC ${mac} from the inbox?`)) {
+    if (
+      !window.confirm(
+        `Mark ${mac} as NOT an install target?\n\n` +
+          "This is recorded on the server, so it stays marked across restarts. " +
+          "The device is not forgotten — if it keeps appearing on the segment " +
+          "its last-seen time still updates, so a marked device behaving " +
+          "unexpectedly is still visible.",
+      )
+    ) {
       return;
     }
     setActionError(null);
@@ -76,13 +84,12 @@ export default function Discovery(): JSX.Element {
               checked={hideNa}
               onChange={(event) => setHideNa(event.target.checked)}
             />{" "}
-            Hide non-machine (NA) devices
+            Hide auto-detected non-targets (phones, watches, speakers, IoT)
           </label>
           {naCount > 0 && (
             <span className="discovery-filter__count">
-              {hideNa
-                ? `${naCount} NA device${naCount === 1 ? "" : "s"} hidden`
-                : `${naCount} NA device${naCount === 1 ? "" : "s"} shown`}
+              {naCount} device{naCount === 1 ? "" : "s"} auto-classified as
+              non-targets from their MAC vendor — {hideNa ? "hidden" : "shown"}
             </span>
           )}
         </div>
@@ -100,13 +107,13 @@ export default function Discovery(): JSX.Element {
         <table>
           <thead>
             <tr>
+              <th>Hostname</th>
+              <th>IP</th>
               <th>MAC</th>
               <th>Vendor</th>
-              <th>Category</th>
-              <th>Hostname</th>
+              <th>Target?</th>
               <th>First seen</th>
               <th>Last seen</th>
-              <th>Dismissed</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -114,18 +121,35 @@ export default function Discovery(): JSX.Element {
             {rows.map((row: DiscoveredMacRow) => {
               const category = categoryOf(row);
               return (
-                <tr key={row.mac}>
-                  <td>{row.mac}</td>
+                <tr key={row.mac} className={row.dismissed ? "row--not-target" : undefined}>
+                  <td>{row.hostname ?? "—"}</td>
+                  <td>{row.ip ?? "—"}</td>
+                  <td>
+                    <code>{row.mac}</code>
+                  </td>
                   <td>{row.vendor ?? "—"}</td>
                   <td>
-                    <span className={`category-chip category-chip--${category}`}>
-                      {categoryLabel(category)}
-                    </span>
+                    {row.dismissed ? (
+                      <span className="category-chip category-chip--na" title="Marked by an operator.">
+                        Not a target (marked)
+                      </span>
+                    ) : (
+                      <span
+                        className={`category-chip category-chip--${category}`}
+                        title={
+                          category === "na"
+                            ? `Auto-classified from the MAC's OUI${row.vendor ? ` (${row.vendor})` : ""} — phones, watches, speakers and IoT are never install targets.`
+                            : category === "machine"
+                              ? "Auto-classified as a provisionable machine from the MAC's OUI."
+                              : "The MAC's OUI is unknown or randomized, so this could not be classified either way."
+                        }
+                      >
+                        {categoryLabel(category)}
+                      </span>
+                    )}
                   </td>
-                  <td>{row.hostname ?? "—"}</td>
                   <td>{row.first_seen}</td>
                   <td>{row.last_seen}</td>
-                  <td>{row.dismissed ? "yes" : "no"}</td>
                   <td>
                     <button
                       type="button"
@@ -134,7 +158,7 @@ export default function Discovery(): JSX.Element {
                         void handleDismiss(row.mac);
                       }}
                     >
-                      Dismiss
+                      {row.dismissed ? "Marked" : "Not a target"}
                     </button>
                   </td>
                 </tr>

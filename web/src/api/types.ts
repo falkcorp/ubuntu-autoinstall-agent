@@ -1,7 +1,7 @@
 // file: web/src/api/types.ts
-// version: 1.3.0
+// version: 1.4.0
 // guid: b7bd1fea-0d99-4db5-a81c-6d6b2a8e9100
-// last-edited: 2026-07-23
+// last-edited: 2026-08-05
 
 // Typed DTOs mirroring CT-07's operator API responses. Names are kept
 // identical to CT-07's api_types.rs (MachineRow, EnrollmentRow,
@@ -15,8 +15,22 @@ export interface MachineRow {
   status: string;
   boot_target: string;
   tpm_ek: string | null;
-  /** True when every provisioning layer for this machine agrees; false = drift. */
-  consistent: boolean;
+  /** Last known address (`ip`, falling back to `last_ip`). A MAC alone doesn't
+   *  tell an operator which physical box a row refers to. */
+  ip?: string | null;
+  /**
+   * Whether the host's agent is actually reporting, computed server-side from
+   * `last_app_status_at`:
+   * - `"reporting"` — checked in within the staleness window (15 min).
+   * - `"stale"`     — has reported before, but not recently. NOT the same as
+   *                   unhealthy: it means we don't know.
+   * - `"never"`     — has never reported. Also not unhealthy.
+   *
+   * Replaces a `consistent: boolean` that the server hardcoded to `true`, so
+   * every machine rendered a green "consistent" badge whether or not anything
+   * had ever verified it.
+   */
+  agent: "reporting" | "stale" | "never";
   last_seen: string;
 }
 

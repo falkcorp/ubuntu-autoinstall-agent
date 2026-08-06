@@ -57,6 +57,7 @@ futures = { workspace = true }
 # Wave-4 fillers: OAuth/RBAC (CT-03), audit chain (CT-04), parity endpoints (IP-01/02)
 reqwest = { workspace = true }
 ring = { workspace = true }
+jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
